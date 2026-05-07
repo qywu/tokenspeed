@@ -176,14 +176,26 @@ class Qwen3Attention(nn.Module):
             layer_id=layer_id,
         )
 
+    @staticmethod
+    def _rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+        """Pure-PyTorch RMSNorm — used in eager/LoRA mode to avoid JIT-cached kernels."""
+        orig = x.dtype
+        x32 = x.float()
+        rms = x32.pow(2).mean(-1, keepdim=True).add(eps).rsqrt()
+        return (x32 * rms * weight.float()).to(orig)
+
     def _apply_qk_norm(
         self, q: torch.Tensor, k: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         q_by_head = q.reshape(-1, self.head_dim)
-        q_by_head = self.q_norm(q_by_head)
+        q_by_head = self._rms_norm(
+            q_by_head, self.q_norm.weight, self.q_norm.variance_epsilon
+        )
         q = q_by_head.view(q.shape)
         k_by_head = k.reshape(-1, self.head_dim)
-        k_by_head = self.k_norm(k_by_head)
+        k_by_head = self._rms_norm(
+            k_by_head, self.k_norm.weight, self.k_norm.variance_epsilon
+        )
         k = k_by_head.view(k.shape)
         return q, k
 

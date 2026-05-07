@@ -258,9 +258,7 @@ class LoraManager:
     def get_id(self, name: str) -> int | None:
         return self._name_to_id.get(name)
 
-    def prepare_loras(
-        self, lora_ids: list[int]
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def prepare_loras(self, lora_ids: list[int]) -> tuple[torch.Tensor, torch.Tensor]:
         """Ensure all adapters in *lora_ids* are in GPU slots.
 
         Returns
@@ -386,10 +384,10 @@ class LoraManager:
 
         # Module → (A shape per slot, B shape per slot)
         shape_map = {
-            "q_proj":  ((r, h),  (q,    r)),  # column-parallel
-            "k_proj":  ((r, h),  (kv,   r)),  # column-parallel
-            "v_proj":  ((r, h),  (kv,   r)),  # column-parallel
-            "o_proj":  ((r, o_in), (h,   r)),  # row-parallel; A sharded
+            "q_proj": ((r, h), (q, r)),  # column-parallel
+            "k_proj": ((r, h), (kv, r)),  # column-parallel
+            "v_proj": ((r, h), (kv, r)),  # column-parallel
+            "o_proj": ((r, o_in), (h, r)),  # row-parallel; A sharded
         }
 
         for mod, (a_shape, b_shape) in shape_map.items():
@@ -463,9 +461,7 @@ class LoraManager:
                 # Write into the pre-allocated buffer at this slot
                 r = min(actual_rank, self.max_lora_rank)
                 self.A_buffers[mod][layer_id][slot, :r].copy_(lora_A_shard[:r])
-                self.B_buffers[mod][layer_id][slot, :, :r].copy_(
-                    lora_B_shard[:, :r]
-                )
+                self.B_buffers[mod][layer_id][slot, :, :r].copy_(lora_B_shard[:, :r])
 
         logger.debug("Loaded adapter '%s' into GPU slot %d (rank=%d)", name, slot, rank)
 
@@ -513,9 +509,7 @@ class LoraManager:
             # column-parallel: shard B along output dimension
             out_total = lora_B.shape[0]
             out_per = out_total // self.tp_size
-            lora_B_shard = lora_B[
-                self.tp_rank * out_per : (self.tp_rank + 1) * out_per
-            ]
+            lora_B_shard = lora_B[self.tp_rank * out_per : (self.tp_rank + 1) * out_per]
             return lora_A, lora_B_shard
         else:
             # row-parallel (o_proj): shard A along input dimension
@@ -555,7 +549,7 @@ class LoraManager:
         """
         A_buf = self.A_buffers[module][layer_id]  # [slots, r, h]
         B_buf = self.B_buffers[module][layer_id]  # [slots, out, r]
-        scale = scalings[w_idx]                    # [tokens]
+        scale = scalings[w_idx]  # [tokens]
 
         # Gather per-token A/B rows
         A_sel = A_buf[w_idx]  # [tokens, r, h]
@@ -565,7 +559,7 @@ class LoraManager:
         lora_a = torch.bmm(A_sel, x.unsqueeze(-1)).squeeze(-1)
         # lora_b: [tokens, out] = einsum('tri,ti->tr', B_sel, lora_a)
         delta = torch.bmm(B_sel, lora_a.unsqueeze(-1)).squeeze(-1)
-        return delta * scale.unsqueeze(-1)
+        return delta * scale.unsqueeze(-1).to(delta.dtype)
 
     def _apply_row_parallel_lora(
         self,
@@ -597,7 +591,7 @@ class LoraManager:
             dist.all_reduce(lora_a, group=self.tp_group)
 
         delta = torch.bmm(B_sel, lora_a.unsqueeze(-1)).squeeze(-1)  # [tokens, h]
-        return delta * scale.unsqueeze(-1)
+        return delta * scale.unsqueeze(-1).to(delta.dtype)
 
     def set_adapter_scaling(self, name: str, scaling: float) -> None:
         """Override the scaling factor for a loaded adapter."""

@@ -549,6 +549,21 @@ class ServerArgs:
             )
 
     def resolve_disaggregation(self):
+        # LoRA adapter serving requires eager mode: the LoRA delta is injected
+        # between CUDA graph nodes, so the captured graph cannot see it.
+        if self.enable_lora:
+            if not self.enforce_eager:
+                self.enforce_eager = True
+                logger.warning(
+                    "CUDA graph disabled because --enable-lora is set. "
+                    "LoRA weight injection is applied between graph nodes and is "
+                    "incompatible with static graph replay."
+                )
+            # Also disable PDL: the TVM-JIT RMSNorm kernel (rmsnorm_cute) is
+            # compiled on first call with a fixed dtype and cannot handle the
+            # bfloat16↔float32 casting that eager LoRA mode requires.
+            self.disable_pdl = True
+
         # PD disaggregation
         if self.disaggregation_mode == "prefill":
             self.enforce_eager = True
