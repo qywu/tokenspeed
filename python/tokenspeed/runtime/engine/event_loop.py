@@ -289,6 +289,8 @@ class EventLoop:
             send_func=self.send_to_tokenizer,
             get_load_fn=self._get_load,
             architectures=self.model_config.hf_config.architectures,
+            load_lora_fn=self.load_lora_adapter,
+            unload_lora_fn=self.unload_lora_adapter,
         )
 
         self.output_processor = OutputProcesser(
@@ -341,6 +343,72 @@ class EventLoop:
             )
         else:
             self.pd_kv_transfer = None
+
+        # ── LoRA ─────────────────────────────────────────────────────────────
+        self._lora_manager = None  # LoraManager (lazy init)
+        self._lora_path_to_id: dict[str, int] = {}  # name → integer lora_id
+        self._request_lora_ids: dict[str, int] = {}  # rid → lora_id
+
+        if server_args.enable_lora:
+            self._init_lora_manager()
+
+    def _init_lora_manager(self) -> None:
+        """Create the LoraManager and attach it to the model executor."""
+        from tokenspeed.runtime.lora.lora_manager import LoraManager
+
+        model = self.model_executor.model_runner.model
+        device = next(model.parameters()).device
+        dtype = next(model.parameters()).dtype
+        tp_rank = self.attn_tp_rank
+        tp_size = self.attn_tp_size
+        tp_group = (
+            pg_manager.get_process_group("nccl", self.server_args.mapping.attn.tp_group)
+            if tp_size > 1
+            else None
+        )
+
+        self._lora_manager = LoraManager(
+            model_config=self.model_config.hf_config,
+            max_loras=self.server_args.max_loras,
+            max_lora_rank=self.server_args.max_lora_rank,
+            dtype=dtype,
+            device=device,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            tp_group=tp_group,
+        )
+        # Inject into the model executor so ForwardContext gets it
+        self.model_executor.lora_manager = self._lora_manager
+        self.model_executor.request_lora_ids = self._request_lora_ids
+        logger.info(
+            "LoraManager initialized (max_loras=%d)", self.server_args.max_loras
+        )
+
+    def load_lora_adapter(
+        self, lora_name: str, lora_path: str, pinned: bool = False
+    ) -> int:
+        """Load a PEFT LoRA adapter and make it available for serving.
+
+        Returns the integer lora_id to use in GenerateReqInput.lora_path.
+        """
+        if not self.server_args.enable_lora:
+            raise ValueError(
+                "Server was not started with --enable-lora. "
+                "Restart with --enable-lora to use LoRA adapters."
+            )
+        if self._lora_manager is None:
+            self._init_lora_manager()
+        lora_id = self._lora_manager.load_adapter(lora_name, lora_path, pinned)
+        self._lora_path_to_id[lora_name] = lora_id
+        logger.info("Loaded LoRA adapter '%s' → lora_id=%d", lora_name, lora_id)
+        return lora_id
+
+    def unload_lora_adapter(self, lora_name: str) -> None:
+        """Unload a LoRA adapter and free its GPU slot."""
+        if self._lora_manager is None:
+            raise KeyError(f"No LoRA adapters loaded; '{lora_name}' not found.")
+        self._lora_manager.unload_adapter(lora_name)
+        self._lora_path_to_id.pop(lora_name, None)
 
     def _setup_pd_layerwise_transfer(self, interval: int) -> None:
         if not isinstance(self.pd_kv_transfer, DisaggPrefillExecutor):
@@ -700,6 +768,9 @@ class EventLoop:
                     spec.rolling_hashes = hashes
                     spec.storage_hit_pages = hit_pages
             admitted_specs.append(spec)
+            # Track lora_id per request for forward-pass injection
+            if spec.lora_id != 0:
+                self._request_lora_ids[spec.request_id] = spec.lora_id
 
         if admitted_specs:
             self.scheduler.submit_requests(admitted_specs)

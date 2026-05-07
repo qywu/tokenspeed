@@ -170,6 +170,10 @@ class ModelExecutor:
         self.draft_attn_backend = draft_attn_backend
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
 
+        # LoRA (injected by EventLoop after construction)
+        self.lora_manager = None
+        self.request_lora_ids: dict[str, int] = {}
+
         if config.spec_algo is not None:
             max_num_pages_per_req = (
                 config.context_len + config.spec_num_tokens + config.block_size - 1
@@ -824,6 +828,17 @@ class ModelExecutor:
                     keep_full_logits=forward_mode.is_decode_or_idle()
                     or forward_mode.is_target_verify(),
                 )
+                # Inject LoRA info when adapters are active
+                if self.lora_manager is not None and bs > 0:
+                    lora_ids = [
+                        self.request_lora_ids.get(rid, 0)
+                        for rid in forward_op.request_ids
+                    ]
+                    if any(lid != 0 for lid in lora_ids):
+                        w_idx, scalings = self.lora_manager.prepare_loras(lora_ids)
+                        ctx.lora_weight_indices = w_idx
+                        ctx.lora_scalings = scalings
+                        ctx.lora_manager = self.lora_manager
                 if self.config.data_parallel_size > 1:
                     if dp_global_num_tokens is None:
                         raise RuntimeError(

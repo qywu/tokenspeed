@@ -429,6 +429,8 @@ class TokenizedGenerateReqInput:
 
     input_multi_ids: list[list[int]] = None
     input_extra_infos: list[dict] | None = None
+    # Integer lora_id resolved from lora_path (0 = base model)
+    lora_id: int = 0
 
 
 @dataclass
@@ -903,6 +905,31 @@ class RpcReqInput:
 class RpcReqOutput:
     success: bool
     message: str
+
+
+@dataclass
+class LoadLoraReqInput:
+    lora_name: str
+    lora_path: str
+    pinned: bool = False
+
+
+@dataclass
+class LoadLoraReqOutput:
+    success: bool
+    lora_id: int = 0
+    message: str = ""
+
+
+@dataclass
+class UnloadLoraReqInput:
+    lora_name: str
+
+
+@dataclass
+class UnloadLoraReqOutput:
+    success: bool
+    message: str = ""
 
 
 @dataclass

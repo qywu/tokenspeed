@@ -88,37 +88,24 @@ class EngineBase(ABC):
         lora_name: str,
         lora_path: str,
         pinned: bool = False,
-    ) -> None:
-        """Load a LoRA adapter into GPU memory and register it under ``lora_name``.
+    ) -> int:
+        """Load a PEFT LoRA adapter and make it available for serving.
 
         Args:
-            lora_name: Short identifier used in subsequent requests
-                       (``GenerateReqInput.lora_path = lora_name``).
-            lora_path: Filesystem path to the PEFT adapter directory containing
-                       ``adapter_config.json`` and ``adapter_model.safetensors``.
-            pinned:    If True the adapter is never evicted from GPU memory even
-                       when ``max_loras`` resident adapters are exceeded.
+            lora_name: Short identifier used in GenerateReqInput.lora_path.
+            lora_path: Filesystem path to the PEFT adapter directory.
+            pinned:    Never evict from GPU memory.
 
-        Raises:
-            NotImplementedError: Until the full implementation is complete.
-            ValueError:          If the server was not started with --enable-lora.
+        Returns:
+            Integer lora_id assigned to this adapter.
         """
         raise NotImplementedError(
-            "LoRA adapter loading is not yet implemented. "
-            "Track progress at https://github.com/qywu/tokenspeed/pull/2"
+            "load_lora_adapter() is not implemented on this engine type. "
+            "Use the tokenspeed serve engine."
         )
 
     def unload_lora_adapter(self, lora_name: str) -> None:
-        """Unload a previously loaded LoRA adapter and free its GPU memory.
-
-        Args:
-            lora_name: The name used when the adapter was loaded.
-
-        Raises:
-            NotImplementedError: Until the full implementation is complete.
-            KeyError:            If ``lora_name`` is not currently loaded.
-        """
+        """Unload a previously loaded LoRA adapter and free its GPU slot."""
         raise NotImplementedError(
-            "LoRA adapter unloading is not yet implemented. "
-            "Track progress at https://github.com/qywu/tokenspeed/pull/2"
+            "unload_lora_adapter() is not implemented on this engine type."
         )

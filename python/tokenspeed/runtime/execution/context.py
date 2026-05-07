@@ -20,8 +20,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -33,6 +33,7 @@ from tokenspeed.runtime.execution.forward_batch_info import (
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
     from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
+    from tokenspeed.runtime.lora.lora_manager import LoraManager
 
 
 @dataclass
@@ -59,3 +60,11 @@ class ForwardContext:
 
     # --- logits processor ---
     keep_full_logits: bool = False
+
+    # --- LoRA ---
+    # Per-request GPU slot index (0 = no adapter).  Shape [bs].
+    lora_weight_indices: Optional[torch.Tensor] = None
+    # Per-slot scaling factor.  Shape [n_slots].
+    lora_scalings: Optional[torch.Tensor] = None
+    # Reference to the LoraManager (not a tensor — used in forward pass).
+    lora_manager: Optional["LoraManager"] = None

@@ -465,6 +465,33 @@ class Engine(EngineBase):
         assert isinstance(recv_req, RpcReqOutput)
         assert recv_req.success, recv_req.message
 
+    def load_lora_adapter(
+        self,
+        lora_name: str,
+        lora_path: str,
+        pinned: bool = False,
+    ) -> int:
+        """Load a PEFT LoRA adapter. Returns the integer lora_id."""
+        success, lora_id, message = self.llm.run(
+            self.tokenizer_manager.load_lora_adapter(lora_name, lora_path, pinned)
+        )
+        if not success:
+            raise RuntimeError(f"Failed to load LoRA adapter '{lora_name}': {message}")
+        # Update the local path→id registry so future requests resolve correctly
+        self.tokenizer_manager._lora_path_to_id[lora_name] = lora_id
+        return lora_id
+
+    def unload_lora_adapter(self, lora_name: str) -> None:
+        """Unload a previously loaded LoRA adapter."""
+        success, message = self.llm.run(
+            self.tokenizer_manager.unload_lora_adapter(lora_name)
+        )
+        if not success:
+            raise RuntimeError(
+                f"Failed to unload LoRA adapter '{lora_name}': {message}"
+            )
+        self.tokenizer_manager._lora_path_to_id.pop(lora_name, None)
+
     def save_remote_model(self, **kwargs):
         self.collective_rpc("save_remote_model", **kwargs)
 
