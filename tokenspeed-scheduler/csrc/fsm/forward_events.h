@@ -102,10 +102,12 @@ private:
 struct SchedulePrefillEvent : InvalidTransitionHandler<SchedulePrefillEvent> {
     using InvalidTransitionHandler<SchedulePrefillEvent>::operator();
     SchedulePrefillEvent(std::int32_t tokens_this_round, std::int32_t reserve_num_tokens_in_next_schedule_event,
-                         HybridPrefixCache* hybrid_prefix_cache = nullptr)
+                         HybridPrefixCache* hybrid_prefix_cache = nullptr,
+                         std::int32_t lora_id = kLoraNone)
         : tokens_this_round_(tokens_this_round),
           reserve_num_tokens_in_next_schedule_event_(reserve_num_tokens_in_next_schedule_event),
-          hybrid_prefix_cache_(hybrid_prefix_cache) {}
+          hybrid_prefix_cache_(hybrid_prefix_cache),
+          lora_id_(lora_id) {}
 
     // Returns PrefillDone (last chunk) or Prefilling (more chunks remain).
     std::variant<PrefillDone, Prefilling> operator()(Prefilling&& state);
@@ -114,13 +116,16 @@ private:
     std::int32_t tokens_this_round_{};
     std::int32_t reserve_num_tokens_in_next_schedule_event_{};
     HybridPrefixCache* hybrid_prefix_cache_{};
+    std::int32_t lora_id_{kLoraNone};
 };
 
 struct ScheduleDecodeEvent : InvalidTransitionHandler<ScheduleDecodeEvent> {
     using InvalidTransitionHandler<ScheduleDecodeEvent>::operator();
 
-    ScheduleDecodeEvent(std::int32_t decode_input_tokens, HybridPrefixCache* hybrid_prefix_cache = nullptr)
-        : decode_input_tokens_(decode_input_tokens), hybrid_prefix_cache_(hybrid_prefix_cache) {}
+    ScheduleDecodeEvent(std::int32_t decode_input_tokens, HybridPrefixCache* hybrid_prefix_cache = nullptr,
+                        std::int32_t lora_id = kLoraNone)
+        : decode_input_tokens_(decode_input_tokens), hybrid_prefix_cache_(hybrid_prefix_cache),
+          lora_id_(lora_id) {}
 
     Decoding operator()(PrefillDone&& state);
     Decoding operator()(Decoding&& state);
@@ -128,6 +133,7 @@ struct ScheduleDecodeEvent : InvalidTransitionHandler<ScheduleDecodeEvent> {
 private:
     std::int32_t decode_input_tokens_;
     HybridPrefixCache* hybrid_prefix_cache_{};
+    std::int32_t lora_id_{kLoraNone};
 };
 
 struct ScheduleDecodeFromRetractedEvent : InvalidTransitionHandler<ScheduleDecodeFromRetractedEvent> {

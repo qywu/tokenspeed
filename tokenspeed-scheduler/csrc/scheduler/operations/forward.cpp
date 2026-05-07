@@ -58,7 +58,7 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
     Request* request, std::int32_t remaining, std::int32_t decode_input_tokens, bool disable_l2_cache) {
     if (req_pool_allocator_.AvailableSlots() == 0) return {};
     MatchResult match_result = hybrid_prefix_cache_
-                                  ? hybrid_prefix_cache_->Match(request->GetFullPagedTokens(true))
+                                  ? hybrid_prefix_cache_->Match(request->GetFullPagedTokens(true), request->LoraId())
                                   : kv_prefix_cache_.Match(request->GetFullPagedTokens(true), request->LoraId());
     std::int32_t loadback_tokens = 0;
     std::int32_t unscheduled = 0;
@@ -123,7 +123,8 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
     }
 
     return fsm::SchedulePrefillEvent{tokens_this_round, reserve_num_tokens_in_next_schedule_event,
-                                     hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr};
+                                     hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr,
+                                     request->LoraId()};
 }
 
 std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(Request* request) {
@@ -136,7 +137,8 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(Request* reque
     }
 
     return fsm::ScheduleDecodeEvent{config_.decode_input_tokens,
-                                    hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr};
+                                    hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr,
+                                    request->LoraId()};
 }
 
 std::optional<fsm::ScheduleDecodeFromRetractedEvent> Scheduler::scheduleDecodeFromRetracted(Request* request) {
