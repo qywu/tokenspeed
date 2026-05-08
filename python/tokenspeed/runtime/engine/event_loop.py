@@ -775,6 +775,26 @@ class EventLoop:
                         self._lora_manager.prefetch(name)
 
         if admitted_specs:
+            # Optional ``pack`` policy: cluster admissions by lora_id so
+            # adapter-shared requests batch together at the C++ scheduler.
+            # Reduces GPU/CPU eviction churn under heavy mixed-adapter
+            # traffic (multiple distinct adapters > max_loras).
+            #
+            # Sort is stable: requests for the same adapter keep their
+            # arrival order, base-model (lora_id == 0) requests stay
+            # together at the front (their slot is the no-op sentinel).
+            #
+            # The benchmark in benchmark/test_lora_eviction_latency.py
+            # shows that CPU↔GPU promotion is essentially free; the
+            # only meaningful eviction cost is CPU→disk re-read (~30 ms).
+            # ``pack`` therefore mainly helps when ``working_set >
+            # max_loras_cpu`` and incoming traffic is bursty enough that
+            # multiple cold requests arrive in one event-loop iteration.
+            if (
+                self._lora_manager is not None
+                and self.server_args.lora_scheduling_policy == "pack"
+            ):
+                admitted_specs.sort(key=lambda s: s.lora_id)
             self.scheduler.submit_requests(admitted_specs)
 
     @nvtx_range("loop:commit", color="rapids")

@@ -1423,8 +1423,15 @@ class ServerArgs:
             "--lora-scheduling-policy",
             type=str,
             default=ServerArgs.lora_scheduling_policy,
-            choices=["lru"],
-            help="Scheduler-side LoRA scheduling policy (extensible).",
+            choices=["lru", "pack"],
+            help=(
+                "Scheduler-side LoRA scheduling policy. ``lru`` (default) "
+                "submits requests in arrival order and relies on the "
+                "manager's LRU pool. ``pack`` sorts the admission queue "
+                "by lora_id so adapter-shared requests cluster, reducing "
+                "eviction churn when working_set > max_loras_cpu and "
+                "traffic is bursty."
+            ),
         )
 
         prefix_cache_group = parser.add_mutually_exclusive_group()
