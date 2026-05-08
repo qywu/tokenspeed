@@ -176,27 +176,19 @@ class Qwen3Attention(nn.Module):
             layer_id=layer_id,
         )
 
-    @staticmethod
-    def _rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
-        """Pure-PyTorch RMSNorm — used in eager/LoRA mode to avoid JIT-cached kernels."""
-        orig = x.dtype
-        x32 = x.float()
-        rms = x32.pow(2).mean(-1, keepdim=True).add(eps).rsqrt()
-        return (x32 * rms * weight.float()).to(orig)
-
     def _apply_qk_norm(
         self, q: torch.Tensor, k: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        q_by_head = q.reshape(-1, self.head_dim)
-        q_by_head = self._rms_norm(
-            q_by_head, self.q_norm.weight, self.q_norm.variance_epsilon
-        )
-        q = q_by_head.view(q.shape)
-        k_by_head = k.reshape(-1, self.head_dim)
-        k_by_head = self._rms_norm(
-            k_by_head, self.k_norm.weight, self.k_norm.variance_epsilon
-        )
-        k = k_by_head.view(k.shape)
+        # Per-head RMSNorm via the fused flashinfer kernel.  An earlier
+        # ``--enable-lora`` workaround dispatched a pure-PyTorch RMSNorm
+        # here to dodge a JIT-dtype mismatch in the rmsnorm_cute (PDL)
+        # path; that's now obsolete because ``--enable-lora`` forces
+        # ``disable_pdl=True`` so the fused flashinfer rmsnorm is used.
+        # The pure-PyTorch path cost ~138 us / layer in eager decode (24%
+        # of step time) due to many small kernel launches per call.
+        q_shape, k_shape = q.shape, k.shape
+        q = self.q_norm(q.reshape(-1, self.head_dim)).view(q_shape)
+        k = self.k_norm(k.reshape(-1, self.head_dim)).view(k_shape)
         return q, k
 
     def _rotate_half(self, x):
