@@ -379,6 +379,15 @@ class GenerateReqInput:
             bootstrap_room=(
                 self.bootstrap_room[i] if self.bootstrap_room is not None else None
             ),
+            # ``lora_path`` may be a list (one entry per batched request) or
+            # a single str/None applied to every request.  Without this
+            # propagation each per-request sub-object would silently lose
+            # its adapter binding and run as base model.
+            lora_path=(
+                self.lora_path[i]
+                if isinstance(self.lora_path, list)
+                else self.lora_path
+            ),
         )
         sub.rid = self.rid[i]
         return sub
