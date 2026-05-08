@@ -62,6 +62,7 @@ import torch
 
 from tokenspeed.runtime.distributed.comm_ops import all_reduce as comm_all_reduce
 from tokenspeed.runtime.lora.triton_ops import (
+    gate_up_lora_b_fwd,
     qkv_lora_b_fwd,
     sgemm_lora_a_fwd,
     sgemm_lora_b_fwd,
@@ -71,6 +72,7 @@ from tokenspeed.runtime.utils import get_colorful_logger
 logger = get_colorful_logger(__name__)
 
 _PEFT_ATTN_MODULES = ("q_proj", "k_proj", "v_proj", "o_proj")
+_PEFT_MLP_MODULES = ("gate_proj", "up_proj", "down_proj")
 
 
 # ── Batch info ──────────────────────────────────────────────────────────────
@@ -113,10 +115,17 @@ def _load_safetensors(path: str) -> dict[str, torch.Tensor]:
 def _parse_adapter_weights(
     tensors: dict[str, torch.Tensor],
 ) -> dict[int, dict[str, tuple[torch.Tensor, torch.Tensor]]]:
-    """``{layer_id: {module_name: (lora_A, lora_B)}}`` (CPU, fp32 from PEFT)."""
+    """``{layer_id: {module_name: (lora_A, lora_B)}}`` (CPU, fp32 from PEFT).
+
+    Matches both attention (``self_attn.{q,k,v,o}_proj``) and MLP
+    (``mlp.{gate,up,down}_proj``) modules.  Attention modules are stored
+    keyed by ``q_proj`` etc.; MLP modules by ``gate_proj`` etc.
+    """
     pattern = re.compile(
-        r"base_model\.model\.model\.layers\.(\d+)\.self_attn\."
-        r"(q_proj|k_proj|v_proj|o_proj)\.lora_(A|B)\.weight"
+        r"base_model\.model\.model\.layers\.(\d+)\."
+        r"(?:self_attn|mlp)\."
+        r"(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)\."
+        r"lora_(A|B)\.weight"
     )
     weights: dict[int, dict[str, dict[str, torch.Tensor]]] = {}
     for key, tensor in tensors.items():
@@ -182,6 +191,14 @@ class LoraManager:
         self.o_in_per_tp: int = self.q_size_per_tp
         self.hidden_size: int = hidden
 
+        # MLP runs un-sharded in this codebase (qwen3 ``Qwen3MLP`` does
+        # not pass tp args to ``MergedColumnParallelLinear`` / ``RowParallelLinear``,
+        # so each rank holds the full intermediate weight).  Match that
+        # for MLP LoRA buffers — no sharding, no per-step all-reduce.
+        self.intermediate_size: int = getattr(
+            model_config, "intermediate_size", 4 * hidden
+        )
+
         # CPU-side flag: True when at least one segment in the current
         # batch_info uses a real adapter (slot != 0).  CudaGraphWrapper
         # reads this to pick the with-LoRA vs no-LoRA captured graph.
@@ -241,14 +258,24 @@ class LoraManager:
         )
 
         # ── GPU weight buffers ─────────────────────────────────────────────
-        # qkv_A_buffers: (n_slots, 3 * max_rank, hidden) — stacked q/k/v A.
-        # qkv_B_buffers: (n_slots, q_per_tp + 2 * kv_per_tp, max_rank).
-        # o_A_buffers:   (n_slots, max_rank, o_in_per_tp).
-        # o_B_buffers:   (n_slots, hidden, max_rank).
+        # Attention:
+        #   qkv_A_buffers: (n_slots, 3 * max_rank, hidden) — stacked q/k/v A.
+        #   qkv_B_buffers: (n_slots, q_per_tp + 2 * kv_per_tp, max_rank).
+        #   o_A_buffers:   (n_slots, max_rank, o_in_per_tp).
+        #   o_B_buffers:   (n_slots, hidden, max_rank).
+        # MLP (un-sharded):
+        #   gate_up_A_buffers: (n_slots, 2 * max_rank, hidden).
+        #   gate_up_B_buffers: (n_slots, 2 * intermediate_size, max_rank).
+        #   down_A_buffers:    (n_slots, max_rank, intermediate_size).
+        #   down_B_buffers:    (n_slots, hidden, max_rank).
         self.qkv_A_buffers: list[torch.Tensor] = []
         self.qkv_B_buffers: list[torch.Tensor] = []
         self.o_A_buffers: list[torch.Tensor] = []
         self.o_B_buffers: list[torch.Tensor] = []
+        self.gate_up_A_buffers: list[torch.Tensor] = []
+        self.gate_up_B_buffers: list[torch.Tensor] = []
+        self.down_A_buffers: list[torch.Tensor] = []
+        self.down_B_buffers: list[torch.Tensor] = []
 
         # Cumulative output offsets [0, q, q+kv, q+2*kv] for qkv_lora_b.
         self._qkv_output_offset = torch.tensor(
@@ -459,6 +486,65 @@ class LoraManager:
         sgemm_lora_b_fwd(lora_a, B_buf, bi, base_output=o_output)
         return o_output
 
+    def apply_gate_up_lora(
+        self,
+        hidden_states: torch.Tensor,
+        gate_up: torch.Tensor,
+        layer_id: int,
+    ) -> torch.Tensor:
+        """Fused gate/up LoRA delta: ``gate_up += B @ A @ x * scaling``.
+
+        ``hidden_states``: ``(s, hidden)``.
+        ``gate_up``:       ``(s, 2 * intermediate_size)`` — output of
+        ``gate_up_proj`` (un-sharded in this codebase).  Updated in place
+        via the kernel's fused-add.
+        """
+        if hidden_states.shape[0] == 0:
+            return gate_up
+        bi = self._batch_info
+        if bi.bs == 0:
+            return gate_up
+
+        A_buf = self.gate_up_A_buffers[layer_id]
+        B_buf = self.gate_up_B_buffers[layer_id]
+        # lora_a: (s, 2 * max_rank) — gate's lora_a in [:, :r], up's in [:, r:].
+        lora_a = sgemm_lora_a_fwd(hidden_states, A_buf, bi, stack_num=2)
+        gate_up_lora_b_fwd(
+            lora_a,
+            B_buf,
+            bi,
+            self.intermediate_size,
+            base_output=gate_up,
+        )
+        return gate_up
+
+    def apply_down_lora(
+        self,
+        x: torch.Tensor,
+        down_output: torch.Tensor,
+        layer_id: int,
+    ) -> torch.Tensor:
+        """Down-projection LoRA delta (un-sharded in this codebase).
+
+        ``x``:           ``(s, intermediate_size)`` — input to ``down_proj``.
+        ``down_output``: ``(s, hidden)`` — output of ``down_proj``.  Updated
+        in place.
+
+        MLP runs at tp_size=1 here, so no internal all-reduce is needed
+        (vs ``apply_o_lora`` which is row-parallel under attn TP).
+        """
+        if x.shape[0] == 0:
+            return down_output
+        bi = self._batch_info
+        if bi.bs == 0:
+            return down_output
+
+        A_buf = self.down_A_buffers[layer_id]
+        B_buf = self.down_B_buffers[layer_id]
+        lora_a = sgemm_lora_a_fwd(x, A_buf, bi, stack_num=1)
+        sgemm_lora_b_fwd(lora_a, B_buf, bi, base_output=down_output)
+        return down_output
+
     def set_adapter_scaling(self, name: str, scaling: float) -> None:
         slot = self._name_to_slot.get(name)
         if slot is not None:
@@ -472,9 +558,11 @@ class LoraManager:
         q = self.q_size_per_tp
         kv = self.kv_size_per_tp
         o_in = self.o_in_per_tp
+        i = self.intermediate_size
         n = self._n_slots
 
         for _ in range(self.n_layers):
+            # ── attention ─────────────────────────────────────────────────
             # qkv_A: stack q/k/v along dim 1.  All three see the full input.
             self.qkv_A_buffers.append(
                 torch.zeros((n, 3 * r, h), dtype=self.dtype, device=self.device)
@@ -487,6 +575,21 @@ class LoraManager:
                 torch.zeros((n, r, o_in), dtype=self.dtype, device=self.device)
             )
             self.o_B_buffers.append(
+                torch.zeros((n, h, r), dtype=self.dtype, device=self.device)
+            )
+            # ── MLP (un-sharded) ──────────────────────────────────────────
+            # gate_up_A: stack gate/up along dim 1; both see the full input.
+            self.gate_up_A_buffers.append(
+                torch.zeros((n, 2 * r, h), dtype=self.dtype, device=self.device)
+            )
+            # gate_up_B: stack gate/up along dim 1, output dim per projection.
+            self.gate_up_B_buffers.append(
+                torch.zeros((n, 2 * i, r), dtype=self.dtype, device=self.device)
+            )
+            self.down_A_buffers.append(
+                torch.zeros((n, r, i), dtype=self.dtype, device=self.device)
+            )
+            self.down_B_buffers.append(
                 torch.zeros((n, h, r), dtype=self.dtype, device=self.device)
             )
 
@@ -536,22 +639,45 @@ class LoraManager:
                 )
                 r = min(actual_rank, self.max_lora_rank)
 
+                # Stacked LoRA-A: pack at ``stack_idx * actual_rank``
+                # (contiguous), NOT at multiples of ``max_lora_rank``.
+                # The sgemm_lora_a kernel writes only the first
+                # ``rank * stack_num`` columns of its output and the
+                # downstream qkv_lora_b / gate_up_lora_b kernel reads
+                # ``x[:, stack_id * rank]``.  Both ends use ``rank`` (the
+                # adapter's actual rank, not max_rank), so stacks must be
+                # contiguous in the buffer — gaps would be read as zero
+                # and silently kill the k/v / up deltas.
                 if mod in ("q_proj", "k_proj", "v_proj"):
                     qkv_idx = ("q_proj", "k_proj", "v_proj").index(mod)
-                    rank_off = qkv_idx * self.max_lora_rank
+                    rank_off = qkv_idx * r
                     out_off, out_size = self._qkv_b_slice(mod)
-                    # A — stack along rank dim: rows [qkv_idx*max_rank:+r] hold
-                    # the actual (rank, hidden) of this projection.
                     self.qkv_A_buffers[layer_id][
                         slot, rank_off : rank_off + r, :
                     ].copy_(lora_A_shard[:r])
-                    # B — stack along output dim with its sharded out size.
+                    # B layout: kernel uses ``min(K, rank)`` so cols beyond
+                    # actual_rank are never read; just write [:, :r].
                     self.qkv_B_buffers[layer_id][
                         slot, out_off : out_off + out_size, :r
                     ].copy_(lora_B_shard[:, :r])
-                else:  # o_proj
+                elif mod == "o_proj":
                     self.o_A_buffers[layer_id][slot, :r, :].copy_(lora_A_shard[:r])
                     self.o_B_buffers[layer_id][slot, :, :r].copy_(lora_B_shard[:, :r])
+                elif mod in ("gate_proj", "up_proj"):
+                    gate_up_idx = 0 if mod == "gate_proj" else 1
+                    rank_off = gate_up_idx * r
+                    out_off = gate_up_idx * self.intermediate_size
+                    self.gate_up_A_buffers[layer_id][
+                        slot, rank_off : rank_off + r, :
+                    ].copy_(lora_A_shard[:r])
+                    self.gate_up_B_buffers[layer_id][
+                        slot, out_off : out_off + self.intermediate_size, :r
+                    ].copy_(lora_B_shard[:, :r])
+                else:  # down_proj
+                    self.down_A_buffers[layer_id][slot, :r, :].copy_(lora_A_shard[:r])
+                    self.down_B_buffers[layer_id][slot, :, :r].copy_(
+                        lora_B_shard[:, :r]
+                    )
 
         logger.debug("Loaded adapter '%s' into GPU slot %d (rank=%d)", name, slot, rank)
 
@@ -565,8 +691,13 @@ class LoraManager:
 
     def _get_rank_for(self, name: str) -> int:
         cpu_weights = self._cpu_cache.get(name, {})
-        if cpu_weights and 0 in cpu_weights and "q_proj" in cpu_weights[0]:
-            return cpu_weights[0]["q_proj"][0].shape[0]
+        if not cpu_weights or 0 not in cpu_weights:
+            return self.max_lora_rank
+        # Read the rank from whichever module is present in layer 0 — the
+        # adapter may target attention only, MLP only, or both.
+        for mod in (*_PEFT_ATTN_MODULES, *_PEFT_MLP_MODULES):
+            if mod in cpu_weights[0]:
+                return cpu_weights[0][mod][0].shape[0]
         return self.max_lora_rank
 
     def _get_scaling_for(self, name: str, rank: int) -> float:
@@ -590,6 +721,10 @@ class LoraManager:
         lora_A: torch.Tensor,
         lora_B: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # MLP modules run un-sharded in this codebase (qwen3 ``Qwen3MLP``
+        # builds the linears with tp_size=1).  No sharding for them.
+        if module in _PEFT_MLP_MODULES:
+            return lora_A, lora_B
         if self.tp_size == 1:
             return lora_A, lora_B
         if module in ("q_proj", "k_proj", "v_proj"):
@@ -616,6 +751,10 @@ class LoraManager:
                 self.qkv_B_buffers[layer_id][slot].zero_()
                 self.o_A_buffers[layer_id][slot].zero_()
                 self.o_B_buffers[layer_id][slot].zero_()
+                self.gate_up_A_buffers[layer_id][slot].zero_()
+                self.gate_up_B_buffers[layer_id][slot].zero_()
+                self.down_A_buffers[layer_id][slot].zero_()
+                self.down_B_buffers[layer_id][slot].zero_()
             self._lora_ranks[slot] = 0
             self._scalings[slot] = 0.0
         self._lru.pop(name, None)

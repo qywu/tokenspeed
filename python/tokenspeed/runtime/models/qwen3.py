@@ -61,8 +61,10 @@ class Qwen3MLP(nn.Module):
         intermediate_size: int,
         hidden_act: str,
         quant_config: QuantizationConfig | None = None,
+        layer_id: int = 0,
     ) -> None:
         super().__init__()
+        self.layer_id = layer_id
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
@@ -83,11 +85,17 @@ class Qwen3MLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
 
-    def forward(self, x):
+    def forward(self, x, ctx: ForwardContext | None = None):
         gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
-        return x
+        # LoRA delta on the fused gate/up output (added before SiluAndMul,
+        # matching PEFT semantics).
+        if ctx is not None and ctx.lora_manager is not None:
+            gate_up = ctx.lora_manager.apply_gate_up_lora(x, gate_up, self.layer_id)
+        intermediate = self.act_fn(gate_up)
+        out, _ = self.down_proj(intermediate)
+        if ctx is not None and ctx.lora_manager is not None:
+            out = ctx.lora_manager.apply_down_lora(intermediate, out, self.layer_id)
+        return out
 
 
 class Qwen3Attention(nn.Module):
@@ -271,6 +279,7 @@ class Qwen3DecoderLayer(nn.Module):
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
             quant_config=quant_config,
+            layer_id=layer_id,
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -330,7 +339,7 @@ class Qwen3DecoderLayer(nn.Module):
                 residual,
             )
             hidden_states, residual = _fused[0], _fused[1]
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states, ctx)
         return hidden_states, residual
 
 
