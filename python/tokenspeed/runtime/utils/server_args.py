@@ -97,6 +97,8 @@ class ServerArgs:
     # special kv cache
     mamba_ssm_dtype: str = "float32"
     mamba_track_interval: int = 256
+    max_mamba_cache_size: int | None = None
+    mamba_full_memory_ratio: float = 0.9
 
     # Other runtime options
     stream_interval: int = 1
@@ -187,6 +189,11 @@ class ServerArgs:
     attention_use_fp4_indexer_cache: bool | None = None
     use_trtllm_ragged_deepseek_prefill: bool | None = None
 
+    # DeepSeek V4
+    disable_deepseek_v4_fast_mhc: bool = False
+    deepseek_v4_mega_moe_max_num_tokens: int = 0
+    deepseek_v4_indexer_prefill_max_logits_mb: int = 512
+
     # Grammar backend
     grammar_backend: str = "none"
     grammar_compile_timeout_secs: float = 30.0
@@ -203,9 +210,9 @@ class ServerArgs:
     speculative_algorithm: str | None = None
     speculative_draft_model_path: str | None = None
     speculative_draft_model_quantization: str | None = None
-    speculative_num_steps: int = 5
-    speculative_eagle_topk: int = 4
-    speculative_num_draft_tokens: int = 8
+    speculative_num_steps: int = 3
+    speculative_eagle_topk: int = 1
+    speculative_num_draft_tokens: int | None = None
     eagle3_layers_to_capture: str | None = None
     # Logprob support flags — all OFF by default. Enabling extends the
     # captured CUDA-graph footprint; requests asking for logprobs on a
@@ -312,28 +319,29 @@ class ServerArgs:
         if self.use_trtllm_ragged_deepseek_prefill is not None:
             self.mla_disable_ragged = not self.use_trtllm_ragged_deepseek_prefill
 
-        if self.speculative_config is None:
-            return
+        if self.speculative_config is not None:
+            try:
+                config = json.loads(self.speculative_config)
+            except json.JSONDecodeError as exc:
+                raise ValueError("--speculative-config must be valid JSON") from exc
 
-        try:
-            config = json.loads(self.speculative_config)
-        except json.JSONDecodeError as exc:
-            raise ValueError("--speculative-config must be valid JSON") from exc
+            if not isinstance(config, dict):
+                raise ValueError("--speculative-config must be a JSON object")
 
-        if not isinstance(config, dict):
-            raise ValueError("--speculative-config must be a JSON object")
+            method = config.get("method")
+            if method is not None and self.speculative_algorithm is None:
+                self.speculative_algorithm = str(method).upper()
 
-        method = config.get("method")
-        if method is not None and self.speculative_algorithm is None:
-            self.speculative_algorithm = str(method).upper()
+            draft_model = config.get("model")
+            if draft_model is not None and self.speculative_draft_model_path is None:
+                self.speculative_draft_model_path = str(draft_model)
 
-        draft_model = config.get("model")
-        if draft_model is not None and self.speculative_draft_model_path is None:
-            self.speculative_draft_model_path = str(draft_model)
+            num_speculative_tokens = config.get("num_speculative_tokens")
+            if num_speculative_tokens is not None:
+                self.speculative_num_draft_tokens = int(num_speculative_tokens)
 
-        num_speculative_tokens = config.get("num_speculative_tokens")
-        if num_speculative_tokens is not None:
-            self.speculative_num_draft_tokens = int(num_speculative_tokens)
+        if self.speculative_num_draft_tokens is None:
+            self.speculative_num_draft_tokens = self.speculative_num_steps + 1
 
     def resolve_memory_and_scheduling(self):
         if current_platform().is_amd:
@@ -913,6 +921,18 @@ class ServerArgs:
             default=ServerArgs.mamba_track_interval,
             help="The interval to track the mamba state during decode.",
         )
+        parser.add_argument(
+            "--max-mamba-cache-size",
+            type=int,
+            default=ServerArgs.max_mamba_cache_size,
+            help="The maximum number of Mamba cache chunks. If unset, the pool size is profiled from available memory.",
+        )
+        parser.add_argument(
+            "--mamba-full-memory-ratio",
+            type=float,
+            default=ServerArgs.mamba_full_memory_ratio,
+            help="Memory ratio used to split cache budget between Mamba state chunks and full-attention KV cache.",
+        )
 
         parser.add_argument(
             "--max-prefill-tokens",
@@ -1241,6 +1261,34 @@ class ServerArgs:
             const=True,
             default=ServerArgs.use_trtllm_ragged_deepseek_prefill,
             help="Use ragged prefill for DeepSeek MLA attention.",
+        )
+        parser.add_argument(
+            "--disable-deepseek-v4-fast-mhc",
+            action="store_true",
+            default=ServerArgs.disable_deepseek_v4_fast_mhc,
+            help=(
+                "Disable the DeepSeek V4 fast multi-head capture (mHC) layer. "
+                "Falls back to the PyTorch reference when set or when nvcc is "
+                "not available."
+            ),
+        )
+        parser.add_argument(
+            "--deepseek-v4-mega-moe-max-num-tokens",
+            type=int,
+            default=ServerArgs.deepseek_v4_mega_moe_max_num_tokens,
+            help=(
+                "DeepSeek V4 MegaMoE staging-buffer cap on tokens per forward "
+                "(0 = derive from chunked-prefill / cuda-graph budgets)."
+            ),
+        )
+        parser.add_argument(
+            "--deepseek-v4-indexer-prefill-max-logits-mb",
+            type=int,
+            default=ServerArgs.deepseek_v4_indexer_prefill_max_logits_mb,
+            help=(
+                "DeepSeek V4 sparse indexer prefill workspace cap (MiB) for the "
+                "softplus_sqrt logits buffer."
+            ),
         )
         parser.add_argument(
             "--grammar-backend",

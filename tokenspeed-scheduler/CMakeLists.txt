@@ -114,6 +114,7 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
         tests/cpp/test_mamba_cache.cpp
         tests/cpp/test_mamba_integration.cpp
         tests/cpp/test_eviction_lru.cpp
+        tests/cpp/test_host_node_ref_lifetime.cpp
     )
 
     target_link_libraries(tokenspeed_scheduler_tests
