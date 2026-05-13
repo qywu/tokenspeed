@@ -1,3 +1,8 @@
+# Adapted from meituan-longcat/SGLang-FluentLLM.
+# This file has been modified for this repository.
+# This file may incorporate material from ModelTC/lightllm,
+# vllm-project/vllm, and sgl-project/sglang, as identified in
+# python/THIRDPARTYNOTICES.
 # Copyright (c) 2026 LightSeek Foundation
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -78,3 +83,34 @@ class EngineBase(ABC):
     @abstractmethod
     def shutdown(self) -> None:
         """Shutdown the engine and clean up resources."""
+
+    # ------------------------------------------------------------------
+    # LoRA adapter management
+    # ------------------------------------------------------------------
+
+    def load_lora_adapter(
+        self,
+        lora_name: str,
+        lora_path: str,
+        pinned: bool = False,
+    ) -> int:
+        """Load a PEFT LoRA adapter and make it available for serving.
+
+        Args:
+            lora_name: Short identifier used in GenerateReqInput.lora_path.
+            lora_path: Filesystem path to the PEFT adapter directory.
+            pinned:    Never evict from GPU memory.
+
+        Returns:
+            Integer lora_id assigned to this adapter.
+        """
+        raise NotImplementedError(
+            "load_lora_adapter() is not implemented on this engine type. "
+            "Use the tokenspeed serve engine."
+        )
+
+    def unload_lora_adapter(self, lora_name: str) -> None:
+        """Unload a previously loaded LoRA adapter and free its GPU slot."""
+        raise NotImplementedError(
+            "unload_lora_adapter() is not implemented on this engine type."
+        )

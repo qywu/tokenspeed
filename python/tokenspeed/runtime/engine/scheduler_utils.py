@@ -42,10 +42,11 @@ _CACHE_EVENT_TYPES = {
 _TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
 
 
-def make_spec(rid: str, tokens: list[int]) -> RequestSpec:
+def make_spec(rid: str, tokens: list[int], lora_id: int = 0) -> RequestSpec:
     spec = RequestSpec()
     spec.request_id = rid
     spec.tokens = tokens
+    spec.lora_id = lora_id
     return spec
 
 
@@ -59,6 +60,7 @@ def make_config(
     enable_l3_storage: bool,
     prefetch_threshold: int,
     role: str,
+    enable_kv_cache_events: bool = False,
     decode_input_tokens: int = 1,
     disable_prefix_cache: bool = False,
     enable_mamba: bool = False,
@@ -75,6 +77,7 @@ def make_config(
     cfg.num_host_pages = num_host_pages
     cfg.enable_l3_storage = enable_l3_storage
     cfg.prefetch_threshold = prefetch_threshold
+    cfg.enable_kv_cache_events = enable_kv_cache_events
 
     if role == "prefill":
         cfg.role = SchedulerConfig.Role.P

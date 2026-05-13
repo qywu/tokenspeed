@@ -41,18 +41,21 @@ from tokenspeed.runtime.engine.io_struct import (
     GetInternalStateReqOutput,
     GetLoadReqInput,
     GetLoadReqOutput,
+    LoadLoraReqInput,
+    LoadLoraReqOutput,
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
     SetInternalStateReq,
     SetInternalStateReqOutput,
     TokenizedGenerateReqInput,
+    UnloadLoraReqInput,
+    UnloadLoraReqOutput,
 )
 from tokenspeed.runtime.engine.request_types import FINISH_ABORT
 from tokenspeed.runtime.engine.scheduler_utils import make_spec
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.grammar.grammar_manager import GrammarManager
-from tokenspeed.runtime.inputs.reasoning_parser import ReasoningParser
 from tokenspeed.runtime.pd.base import BootstrapInfo
 from tokenspeed.runtime.utils import broadcast_pyobj
 from tokenspeed.runtime.utils.dispatch import TypeBasedDispatcher
@@ -81,6 +84,8 @@ class RequestHandler:
         send_func,
         get_load_fn=None,
         architectures: list[str] | None = None,
+        load_lora_fn=None,
+        unload_lora_fn=None,
     ) -> None:
 
         self.forward_ct = 0
@@ -98,6 +103,8 @@ class RequestHandler:
         self.max_req_len = max_req_len
         self.vocab_size = vocab_size
         self.get_load_fn = get_load_fn
+        self.load_lora_fn = load_lora_fn
+        self.unload_lora_fn = unload_lora_fn
 
         self.tokenizer = get_tokenizer(
             server_args.tokenizer,
@@ -106,16 +113,6 @@ class RequestHandler:
             revision=server_args.revision,
             architectures=architectures,
         )
-
-        # Set reasoning_parser and think_end_id if --reasoning_parser is enabled
-        if self.server_args.reasoning_parser and self.tokenizer:
-            reasoning_parser = ReasoningParser(
-                model_type=self.server_args.reasoning_parser, stream_reasoning=False
-            )
-
-            self.tokenizer.think_end_id = self.tokenizer.encode(
-                reasoning_parser.detector.think_end_token, add_special_tokens=False
-            )[0]
 
         self.recv_func = recv_func
         self.send_func = send_func
@@ -187,6 +184,34 @@ class RequestHandler:
                     self.send_func.send_pyobj(self.get_load_fn())
                 else:
                     self.send_func.send_pyobj(GetLoadReqOutput())
+            elif isinstance(recv_req, LoadLoraReqInput):
+                try:
+                    if self.load_lora_fn is not None:
+                        lora_id = self.load_lora_fn(
+                            recv_req.lora_name, recv_req.lora_path, recv_req.pinned
+                        )
+                        self.send_func.send_pyobj(
+                            LoadLoraReqOutput(success=True, lora_id=lora_id)
+                        )
+                    else:
+                        self.send_func.send_pyobj(
+                            LoadLoraReqOutput(
+                                success=False, message="LoRA not enabled on this server"
+                            )
+                        )
+                except Exception as e:
+                    self.send_func.send_pyobj(
+                        LoadLoraReqOutput(success=False, message=str(e))
+                    )
+            elif isinstance(recv_req, UnloadLoraReqInput):
+                try:
+                    if self.unload_lora_fn is not None:
+                        self.unload_lora_fn(recv_req.lora_name)
+                    self.send_func.send_pyobj(UnloadLoraReqOutput(success=True))
+                except Exception as e:
+                    self.send_func.send_pyobj(
+                        UnloadLoraReqOutput(success=False, message=str(e))
+                    )
             else:
                 raise NotImplementedError(f"Unsupported request type: {type(recv_req)}")
         return new_req_specs, req_states, bootstrap_infos, abort_rids
@@ -201,6 +226,7 @@ class RequestHandler:
         req_spec = make_spec(
             rid=recv_req.rid,
             tokens=recv_req.input_ids,
+            lora_id=getattr(recv_req, "lora_id", 0),
         )
         req_state = RequestState.from_recv_req(
             recv_req,

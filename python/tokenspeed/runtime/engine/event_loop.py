@@ -19,7 +19,9 @@
 # SOFTWARE.
 
 import faulthandler
+import os
 import signal
+import time
 from collections import OrderedDict
 from dataclasses import dataclass
 
@@ -68,6 +70,13 @@ from tokenspeed.runtime.pd.decode_executor import DisaggDecodeExecutor
 from tokenspeed.runtime.pd.factory import (
     create_pd_kv_transfer,
     get_kv_args,
+)
+from tokenspeed.runtime.pd.kv_events import (
+    EventPublisherFactory,
+    KVEventBatch,
+    NullEventPublisher,
+    drain_scheduler_kv_events,
+    scheduler_kv_events_to_wire_events,
 )
 from tokenspeed.runtime.pd.mooncake.entities import ManagerArgs
 from tokenspeed.runtime.pd.prefill_executor import DisaggPrefillExecutor
@@ -252,6 +261,10 @@ class EventLoop:
         # req_pool_slots based on this value, so it must match the
         # per-DP-rank budget (same division used in cuda_graph_wrapper).
         per_rank_max_batch = server_args.max_num_seqs // max(self.dp_size, 1)
+        self._kv_events_enabled = (
+            EventPublisherFactory.is_enabled(server_args.kv_events_config)
+            and attn_tp_rank == 0
+        )
         if enable_mamba_radix_cache and server_args.max_mamba_cache_size is None:
             logger.info(
                 f"Mamba radix cache enabled without explicit max_mamba_cache_size. "
@@ -269,6 +282,7 @@ class EventLoop:
             enable_l3_storage=server_args.kvstore_storage_backend is not None,
             prefetch_threshold=4,  # Keep this hard-coded until it becomes configurable.
             role=server_args.disaggregation_mode,
+            enable_kv_cache_events=self._kv_events_enabled,
             decode_input_tokens=(
                 server_args.speculative_num_draft_tokens
                 if server_args.speculative_algorithm is not None
@@ -296,6 +310,13 @@ class EventLoop:
             mamba_pool_total_chunks,
         )
         self.scheduler = Scheduler(scheduler_cfg)
+        if attn_tp_rank == 0:
+            self.kv_event_publisher = EventPublisherFactory.create(
+                server_args.kv_events_config,
+                attn_dp_rank=dp_rank,
+            )
+        else:
+            self.kv_event_publisher = NullEventPublisher(attn_dp_rank=dp_rank)
 
         self._init_interprocess_comm()
 
@@ -321,6 +342,8 @@ class EventLoop:
             send_func=self.send_to_tokenizer,
             get_load_fn=self._get_load,
             architectures=self.model_config.hf_config.architectures,
+            load_lora_fn=self.load_lora_adapter,
+            unload_lora_fn=self.unload_lora_adapter,
         )
 
         self.output_processor = OutputProcesser(
@@ -376,6 +399,62 @@ class EventLoop:
         else:
             self.pd_kv_transfer = None
 
+        # ── LoRA ─────────────────────────────────────────────────────────────
+        self._lora_manager = None  # LoraManager (lazy init)
+        self._lora_path_to_id: dict[str, int] = {}  # name → integer lora_id
+        self._request_lora_ids: dict[str, int] = {}  # rid → lora_id
+
+        if server_args.enable_lora:
+            self._init_lora_manager()
+
+    def _init_lora_manager(self) -> None:
+        """Bind to the LoraManager owned by the model executor.
+
+        The model executor creates the manager during its own ``__init__`` so
+        that the CUDA-graph capture sees a live manager (and bakes the LoRA
+        delta path into the captured graphs).  The event loop only borrows
+        the reference and shares its request-id → lora-id map.
+        """
+        self._lora_manager = self.model_executor.lora_manager
+        if self._lora_manager is None:
+            raise RuntimeError(
+                "Model executor was not configured with --enable-lora; "
+                "cannot initialize LoRA support."
+            )
+        self.model_executor.request_lora_ids = self._request_lora_ids
+        logger.info("LoraManager bound (max_loras=%d)", self.server_args.max_loras)
+
+    def load_lora_adapter(
+        self, lora_name: str, lora_path: str, pinned: bool = False
+    ) -> int:
+        """Load a PEFT LoRA adapter and make it available for serving.
+
+        Returns the integer lora_id to use in GenerateReqInput.lora_path.
+        """
+        if not self.server_args.enable_lora:
+            raise ValueError(
+                "Server was not started with --enable-lora. "
+                "Restart with --enable-lora to use LoRA adapters."
+            )
+        if self._lora_manager is None:
+            self._init_lora_manager()
+        lora_id = self._lora_manager.load_adapter(lora_name, lora_path, pinned)
+        self._lora_path_to_id[lora_name] = lora_id
+        logger.info("Loaded LoRA adapter '%s' → lora_id=%d", lora_name, lora_id)
+        return lora_id
+
+    def unload_lora_adapter(self, lora_name: str) -> None:
+        """Unload a LoRA adapter and free its GPU slot."""
+        if self._lora_manager is None:
+            raise KeyError(f"No LoRA adapters loaded; '{lora_name}' not found.")
+        lora_id = self._lora_path_to_id.get(lora_name)
+        self._lora_manager.unload_adapter(lora_name)
+        self._lora_path_to_id.pop(lora_name, None)
+        # Proactively evict the KV cache namespace for this adapter so pages
+        # are freed immediately rather than waiting for LRU eviction pressure.
+        if lora_id is not None:
+            self.scheduler.evict_lora_namespace(lora_id)
+
     def _setup_pd_layerwise_transfer(self, interval: int) -> None:
         if not isinstance(self.pd_kv_transfer, DisaggPrefillExecutor):
             return
@@ -425,6 +504,23 @@ class EventLoop:
             ec.add_event(e)
         self.scheduler.advance(ec)
         logger.debug("[cache_poll] scheduler.advance() done")
+        self._publish_scheduler_kv_events()
+
+    def _publish_scheduler_kv_events(self) -> None:
+        raw_events = drain_scheduler_kv_events(
+            self.scheduler,
+            enabled=self._kv_events_enabled,
+        )
+        if not raw_events:
+            return
+
+        events = scheduler_kv_events_to_wire_events(raw_events)
+        if not events:
+            return
+
+        self.kv_event_publisher.publish(
+            KVEventBatch(ts=time.time(), events=events, attn_dp_rank=self.dp_rank)
+        )
 
     def _pop_ready_cache_event_payloads(self) -> list[dict]:
         local_payloads = list(self._pending_cache_event_payloads.values())
@@ -734,8 +830,42 @@ class EventLoop:
                     spec.rolling_hashes = hashes
                     spec.storage_hit_pages = hit_pages
             admitted_specs.append(spec)
+            # Track lora_id per request for forward-pass injection
+            if spec.lora_id != 0:
+                self._request_lora_ids[spec.request_id] = spec.lora_id
+                # Async-prefetch the adapter into the CPU pool so the
+                # disk read is overlapped with the previous forward step
+                # rather than blocking ``prepare_loras`` of the step that
+                # actually consumes it.  No-op when already CPU-resident.
+                if (
+                    self._lora_manager is not None
+                    and os.environ.get("TOKENSPEED_LORA_PREFETCH", "1") == "1"
+                ):
+                    name = self._lora_manager._id_to_name.get(spec.lora_id)
+                    if name is not None:
+                        self._lora_manager.prefetch(name)
 
         if admitted_specs:
+            # Optional ``pack`` policy: cluster admissions by lora_id so
+            # adapter-shared requests batch together at the C++ scheduler.
+            # Reduces GPU/CPU eviction churn under heavy mixed-adapter
+            # traffic (multiple distinct adapters > max_loras).
+            #
+            # Sort is stable: requests for the same adapter keep their
+            # arrival order, base-model (lora_id == 0) requests stay
+            # together at the front (their slot is the no-op sentinel).
+            #
+            # The benchmark in benchmark/test_lora_eviction_latency.py
+            # shows that CPU↔GPU promotion is essentially free; the
+            # only meaningful eviction cost is CPU→disk re-read (~30 ms).
+            # ``pack`` therefore mainly helps when ``working_set >
+            # max_loras_cpu`` and incoming traffic is bursty enough that
+            # multiple cold requests arrive in one event-loop iteration.
+            if (
+                self._lora_manager is not None
+                and self.server_args.lora_scheduling_policy == "pack"
+            ):
+                admitted_specs.sort(key=lambda s: s.lora_id)
             self.scheduler.submit_requests(admitted_specs)
 
     @nvtx_range("loop:commit", color="rapids")
@@ -889,6 +1019,7 @@ class EventLoop:
             self._process_new_requests()
             self._commit_cache_results()
             execution_plan = self.scheduler.next_execution_plan()
+            self._publish_scheduler_kv_events()
             self._submit_cache_ops(execution_plan)
 
             forward_op = self._get_forward_op(execution_plan)
@@ -937,6 +1068,7 @@ class EventLoop:
 
             if request_changes:
                 advance_forward(self.scheduler, request_changes)
+                self._publish_scheduler_kv_events()
 
             self._record_scheduler_iteration_metrics(stats, num_iter_tokens)
 
@@ -1000,6 +1132,7 @@ class EventLoop:
             self._process_new_requests()
             self._commit_cache_results()
             execution_plan = self.scheduler.next_execution_plan()
+            self._publish_scheduler_kv_events()
 
             self._submit_cache_ops(execution_plan)
 
@@ -1030,6 +1163,7 @@ class EventLoop:
                             prev_forward_op, prev_results
                         )
                         advance_forward(self.scheduler, request_changes)
+                        self._publish_scheduler_kv_events()
                         prev_results = None
                         prev_forward_op = None
                     self.model_executor.execute_idle_forward(
@@ -1099,6 +1233,7 @@ class EventLoop:
 
             if request_changes:
                 advance_forward(self.scheduler, request_changes)
+                self._publish_scheduler_kv_events()
 
             self._record_scheduler_iteration_metrics(stats, num_iter_tokens)
 

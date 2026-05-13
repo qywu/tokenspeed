@@ -34,6 +34,7 @@
 #include "scheduler/request.h"
 #include "scheduler/execution_plan.h"
 #include "scheduler/execution_event.h"
+#include "scheduler/kv_cache_events.h"
 
 #include "resource/allocator/page_allocator.h"
 #include "resource/allocator/paged_cache_group.h"
@@ -63,6 +64,7 @@ public:
     ExecutionPlan NextExecutionPlan();
 
     void Advance(const ExecutionEvent& event);
+    std::vector<KvCacheEvent> DrainKvEvents();
 
     std::size_t WaitingSize() const;
     std::size_t DecodingSize() const;
@@ -81,6 +83,10 @@ public:
     // logical page returned here). 0 for full-history groups and unseen
     // request/group pairs. Tests use this to address compact tables.
     std::int32_t GetRequestPagedCacheBaseLogicalPage(const std::string& request_id, const std::string& group_id) const;
+
+    // Evict all KV pages cached under the given LoRA adapter's namespace and
+    // remove its virtual root from the prefix tree. Call on adapter unload.
+    void EvictLoraNamespace(std::int32_t lora_id);
 
 private:
     // Second element is LoadBackOperation list (normal path) or WriteBackOperation list (retract triggered).
@@ -160,6 +166,7 @@ private:
 private:
     std::unordered_map<std::string, std::unique_ptr<Request>> requests_;
     std::unordered_map<cache_op_id, CacheOpSpec> cache_op_tracker_;
+    std::vector<KvCacheEvent> kv_events_;
     // Stats
     SchedulerStats stats_;
 };
