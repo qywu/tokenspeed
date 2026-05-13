@@ -163,7 +163,12 @@ void ResourceManager<RType>::EvictSubtree(const std::vector<TreeNode*>& nodes) {
         const auto& res = GetResource<RType>(node);
         if (!res.IsEvictable()) continue;  // skip locked nodes; freed when request finishes
 
-        leaves_.erase(node);
+        auto it = node_time_.find(node);
+        if (it != node_time_.end()) {
+            lru_leaves_.erase({it->second, node});
+            node_time_.erase(it);
+            GetResource<RType>(node).ClearEvictableNotifier();
+        }
         auto resource_ptr = node->DetachResource<RType>();
         if (eviction_callback_) {
             eviction_callback_(node);

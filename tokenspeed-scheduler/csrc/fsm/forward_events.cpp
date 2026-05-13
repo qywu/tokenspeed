@@ -63,8 +63,7 @@ namespace tokenspeed::fsm {
 void InsertHybridCache(HybridPrefixCache* hybrid_cache,
                        const std::vector<std::span<const std::int32_t>>& full_paged_tokens,
                        std::unique_ptr<DeviceNodeRef>& device_node_ref, LocalKVAllocator* local_kv_allocator,
-                       LocalMambaAllocator* local_mamba_allocator,
-                       std::int32_t lora_id = kLoraNone) {
+                       LocalMambaAllocator* local_mamba_allocator, std::int32_t lora_id = kLoraNone) {
     if (hybrid_cache == nullptr) return;
 
     std::vector<std::int32_t> prefix_pages = DevicePagesFromRoot(device_node_ref->Node());

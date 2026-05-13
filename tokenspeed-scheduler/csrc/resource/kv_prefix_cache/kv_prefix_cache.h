@@ -56,8 +56,7 @@ public:
     //                        created on demand so same-adapter requests share the
     //                        prefix cache while cross-adapter requests never collide.
     MatchResult Match(const token_vec_t& token_ids, std::int32_t lora_id = kLoraNone);
-    MatchResult Match(const std::vector<std::span<const std::int32_t>>& token_pages,
-                      std::int32_t lora_id = kLoraNone);
+    MatchResult Match(const std::vector<std::span<const std::int32_t>>& token_pages, std::int32_t lora_id = kLoraNone);
 
     template <ResourceType RType>
     InsertResult Insert(const token_vec_t& token_ids, const std::vector<std::int32_t>& prefix_pages,

@@ -102,8 +102,7 @@ private:
 struct SchedulePrefillEvent : InvalidTransitionHandler<SchedulePrefillEvent> {
     using InvalidTransitionHandler<SchedulePrefillEvent>::operator();
     SchedulePrefillEvent(std::int32_t tokens_this_round, std::int32_t reserve_num_tokens_in_next_schedule_event,
-                         HybridPrefixCache* hybrid_prefix_cache = nullptr,
-                         std::int32_t lora_id = kLoraNone)
+                         HybridPrefixCache* hybrid_prefix_cache = nullptr, std::int32_t lora_id = kLoraNone)
         : tokens_this_round_(tokens_this_round),
           reserve_num_tokens_in_next_schedule_event_(reserve_num_tokens_in_next_schedule_event),
           hybrid_prefix_cache_(hybrid_prefix_cache),
@@ -124,8 +123,7 @@ struct ScheduleDecodeEvent : InvalidTransitionHandler<ScheduleDecodeEvent> {
 
     ScheduleDecodeEvent(std::int32_t decode_input_tokens, HybridPrefixCache* hybrid_prefix_cache = nullptr,
                         std::int32_t lora_id = kLoraNone)
-        : decode_input_tokens_(decode_input_tokens), hybrid_prefix_cache_(hybrid_prefix_cache),
-          lora_id_(lora_id) {}
+        : decode_input_tokens_(decode_input_tokens), hybrid_prefix_cache_(hybrid_prefix_cache), lora_id_(lora_id) {}
 
     Decoding operator()(PrefillDone&& state);
     Decoding operator()(Decoding&& state);
@@ -169,8 +167,7 @@ struct FinishEvent : InvalidTransitionHandler<FinishEvent> {
     using InvalidTransitionHandler<FinishEvent>::operator();
     explicit FinishEvent(KVPrefixCache* kv_prefix_cache, PageAllocator* host_allocator,
                          std::vector<std::string> page_hashes = {}, bool disable_l2_cache = false,
-                         HybridPrefixCache* hybrid_prefix_cache = nullptr,
-                         std::int32_t lora_id = kLoraNone)
+                         HybridPrefixCache* hybrid_prefix_cache = nullptr, std::int32_t lora_id = kLoraNone)
         : kv_prefix_cache_(kv_prefix_cache),
           host_allocator_(host_allocator),
           page_hashes_(std::move(page_hashes)),
