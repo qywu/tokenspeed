@@ -26,6 +26,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <unordered_set>
 #include <utility>
@@ -43,6 +44,78 @@
 #include "resource/radix_tree/tree_node.h"
 
 namespace tokenspeed {
+namespace {
+
+std::int32_t PageCount(const TreeNode* node, std::int32_t page_size) {
+    return static_cast<std::int32_t>(node->Tokens().size()) / page_size;
+}
+
+std::optional<std::uint64_t> ParentBlockHash(const TreeNode* node) {
+    const TreeNode* parent = node->Parent();
+    if (parent == nullptr || parent->IsRoot()) {
+        return std::nullopt;
+    }
+    return parent->BlockHash();
+}
+
+std::vector<std::uint64_t> BuildBlockHashesForTokens(const token_vec_t& tokens, std::int32_t page_size,
+                                                     std::optional<std::uint64_t> parent_hash) {
+    std::vector<std::uint64_t> block_hashes;
+    const auto page_count = static_cast<std::int32_t>(tokens.size()) / page_size;
+    block_hashes.reserve(page_count);
+    for (std::int32_t page = 0; page < page_count; ++page) {
+        const auto begin = tokens.begin() + page * page_size;
+        token_slice token_page{&*begin, static_cast<std::size_t>(page_size)};
+        parent_hash = HashKvBlock(token_page, parent_hash);
+        block_hashes.push_back(*parent_hash);
+    }
+    return block_hashes;
+}
+
+void EnsureBlockHashesForNode(TreeNode* node, std::int32_t page_size) {
+    if (node == nullptr || node->IsRoot()) {
+        return;
+    }
+    if (node->BlockHashes().size() == static_cast<std::size_t>(PageCount(node, page_size))) {
+        return;
+    }
+    node->SetBlockHashes(BuildBlockHashesForTokens(node->Tokens(), page_size, ParentBlockHash(node)));
+}
+
+void EnsureBlockHashesTo(TreeNode* target, std::int32_t page_size) {
+    for (TreeNode* node : RootToLeaf(target)) {
+        EnsureBlockHashesForNode(node, page_size);
+    }
+}
+
+std::vector<KvBlockStoredEvent> BuildBlockEventsForNode(TreeNode* target, std::int32_t page_size) {
+    std::vector<KvBlockStoredEvent> events;
+    if (target == nullptr || target->IsRoot()) {
+        return events;
+    }
+
+    EnsureBlockHashesForNode(target, page_size);
+
+    std::optional<std::uint64_t> parent_hash = ParentBlockHash(target);
+    const auto& tokens = target->Tokens();
+    const auto& block_hashes = target->BlockHashes();
+    const std::int32_t page_count = PageCount(target, page_size);
+    events.reserve(page_count);
+    for (std::int32_t page = 0; page < page_count; ++page) {
+        const auto begin = tokens.begin() + page * page_size;
+        const std::uint64_t block_hash = block_hashes[page];
+        events.push_back(KvBlockStoredEvent{
+            .block_hashes = {block_hash},
+            .parent_block_hash = parent_hash,
+            .token_ids = token_vec_t(begin, begin + page_size),
+            .block_size = page_size,
+        });
+        parent_hash = block_hash;
+    }
+    return events;
+}
+
+}  // namespace
 
 KVPrefixCache::KVPrefixCache(PageAllocator* device_allocator, PageAllocator* host_allocator, bool enable_l3_storage)
     : tree_(device_allocator->PageSize()),
@@ -73,6 +146,41 @@ TreeNode* KVPrefixCache::getOrCreateLoraRoot(std::int32_t lora_id) {
     tree_.Root()->AddChild(key, std::move(node));
     slot = raw;
     return raw;
+}
+
+void KVPrefixCache::SetKvEventSink(KvEventSink sink) {
+    kv_event_sink_ = std::move(sink);
+    if (!kv_event_sink_) {
+        published_device_blocks_.clear();
+    }
+}
+
+void KVPrefixCache::recordDeviceBlockStored(TreeNode* node) {
+    if (!kv_event_sink_) {
+        return;
+    }
+    for (auto& event : BuildBlockEventsForNode(node, tree_.PageSize())) {
+        const std::uint64_t block_hash = event.block_hashes.front();
+        if (published_device_blocks_.insert(block_hash).second) {
+            kv_event_sink_(KvCacheEvent{std::move(event)});
+        }
+    }
+}
+
+void KVPrefixCache::recordDeviceBlockRemoved(TreeNode* node) {
+    if (!kv_event_sink_) {
+        return;
+    }
+    std::vector<std::uint64_t> removed_hashes;
+    for (const auto& event : BuildBlockEventsForNode(node, tree_.PageSize())) {
+        const std::uint64_t block_hash = event.block_hashes.front();
+        if (published_device_blocks_.erase(block_hash) > 0) {
+            removed_hashes.push_back(block_hash);
+        }
+    }
+    if (!removed_hashes.empty()) {
+        kv_event_sink_(KvCacheEvent{KvBlockRemovedEvent{.block_hashes = std::move(removed_hashes)}});
+    }
 }
 
 MatchResult KVPrefixCache::Match(const token_vec_t& token_ids, std::int32_t lora_id) {
@@ -145,6 +253,11 @@ InsertResult KVPrefixCache::Insert(const token_vec_t& token_ids, const std::vect
     }
 
     insert_result.last_node = current;
+    if constexpr (RType == ResourceType::Device) {
+        if (kv_event_sink_) {
+            EnsureBlockHashesTo(current, page_size);
+        }
+    }
 
     auto already_has_pages = [](TreeNode* node) -> bool {
         return (RType == ResourceType::Device) ? node->OnDevice() : node->OnHost();
@@ -160,6 +273,7 @@ InsertResult KVPrefixCache::Insert(const token_vec_t& token_ids, const std::vect
 
     const std::int32_t alloc_start = static_cast<std::int32_t>(prefix_pages.size());
     OwnedPages unconsumed;
+    std::vector<TreeNode*> newly_stored_device_nodes;
 
     std::int32_t remaining_pages = total_pages;
     for (TreeNode* node : LeafToRoot(current)) {
@@ -201,6 +315,18 @@ InsertResult KVPrefixCache::Insert(const token_vec_t& token_ids, const std::vect
 
         update_leaves_set(node);
         insert_result.inserted_num_pages += node_num_pages;
+        if constexpr (RType == ResourceType::Device) {
+            if (kv_event_sink_) {
+                newly_stored_device_nodes.push_back(node);
+            }
+        }
+    }
+
+    if constexpr (RType == ResourceType::Device) {
+        std::reverse(newly_stored_device_nodes.begin(), newly_stored_device_nodes.end());
+        for (TreeNode* node : newly_stored_device_nodes) {
+            recordDeviceBlockStored(node);
+        }
     }
 
     return insert_result;
@@ -237,6 +363,11 @@ template <ResourceType RType>
 bool KVPrefixCache::EnsureCapacityByEvict(std::int32_t required_num_pages) {
     auto& manager = getResourceManager<RType>();
     auto evicted = manager.EnsureCapacity(required_num_pages);
+    if constexpr (RType == ResourceType::Device) {
+        for (TreeNode* node : evicted) {
+            recordDeviceBlockRemoved(node);
+        }
+    }
     pruneEvicted<RType>(evicted);
     return manager.AvailablePages() >= required_num_pages;
 }
@@ -321,6 +452,19 @@ bool KVPrefixCache::AllocateResourceOfType(const std::vector<TreeNode*>& nodes) 
             device_.UpdateLeaves(node);
         } else {
             host_.UpdateLeaves(node);
+        }
+    }
+
+    if constexpr (RType == ResourceType::Device) {
+        if (kv_event_sink_ && !nodes.empty()) {
+            std::vector<TreeNode*> published_nodes = nodes;
+            std::sort(published_nodes.begin(), published_nodes.end(), [](const TreeNode* lhs, const TreeNode* rhs) {
+                return lhs->DepthInTokens() < rhs->DepthInTokens();
+            });
+            EnsureBlockHashesTo(published_nodes.back(), tree_.PageSize());
+            for (TreeNode* node : published_nodes) {
+                recordDeviceBlockStored(node);
+            }
         }
     }
     return true;

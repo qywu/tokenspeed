@@ -17,3 +17,9 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
+
+"""TokenSpeed CLI package."""
+
+from tokenspeed.cli.__main__ import main
+
+__all__ = ["main"]
