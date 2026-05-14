@@ -18,22 +18,22 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Triton kernels for segment-grouped LoRA matmuls.
+from tokenspeed_kernel._triton import tl, triton
 
-Adapted from sglang's S-LoRA / Punica style kernels.  Each batch is a
-sequence of segments where each segment uses a single adapter; the kernels
-fuse the per-segment GEMMs into a single launch and keep per-segment state
-(rank, scaling) on-device.
-"""
 
-from tokenspeed.runtime.lora.triton_ops.gate_up_lora_b import gate_up_lora_b_fwd
-from tokenspeed.runtime.lora.triton_ops.qkv_lora_b import qkv_lora_b_fwd
-from tokenspeed.runtime.lora.triton_ops.sgemm_lora_a import sgemm_lora_a_fwd
-from tokenspeed.runtime.lora.triton_ops.sgemm_lora_b import sgemm_lora_b_fwd
+@triton.jit
+def _resolve_token_positions(
+    sorted_token_ids, seg_start, s_offset, seg_len, SORTED_BY_ADAPTER: tl.constexpr
+):
+    """Map logical segment offsets to physical token positions.
 
-__all__ = [
-    "sgemm_lora_a_fwd",
-    "sgemm_lora_b_fwd",
-    "qkv_lora_b_fwd",
-    "gate_up_lora_b_fwd",
-]
+    When ``SORTED_BY_ADAPTER`` is True the segment is a sorted slice of the
+    real token grid and ``sorted_token_ids[seg_start + s_offset]`` gives the
+    physical row index.  Otherwise tokens in this segment occupy a
+    contiguous range starting at ``seg_start``.
+    """
+    if SORTED_BY_ADAPTER:
+        return tl.load(
+            sorted_token_ids + seg_start + s_offset, mask=s_offset < seg_len
+        ).to(tl.int64)
+    return (seg_start + s_offset).to(tl.int64)

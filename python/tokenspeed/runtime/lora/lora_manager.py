@@ -61,14 +61,14 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 
 import torch
-
-from tokenspeed.runtime.distributed.comm_ops import all_reduce as comm_all_reduce
-from tokenspeed.runtime.lora.triton_ops import (
+from tokenspeed_kernel.ops.gemm.lora_triton import (
     gate_up_lora_b_fwd,
     qkv_lora_b_fwd,
     sgemm_lora_a_fwd,
     sgemm_lora_b_fwd,
 )
+
+from tokenspeed.runtime.distributed.comm_ops import all_reduce as comm_all_reduce
 from tokenspeed.runtime.utils import get_colorful_logger
 
 logger = get_colorful_logger(__name__)

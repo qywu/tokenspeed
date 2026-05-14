@@ -18,24 +18,34 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Segmented LoRA-B matmul (expand: r → out_dim) with fused scale + add."""
+"""Segmented LoRA-A matmul (shrink: in_dim → r).
+
+For each segment ``b`` in the batch the kernel computes
+``output[seg_b] = x[seg_b] @ A[wi_b].T`` where ``A[wi_b]`` has shape
+``(stack_num * r, in_dim)``.  Adapter ``slot 0`` is reserved for "no
+adapter" (rank == 0); the kernel returns immediately for that slot, leaving
+the output rows untouched.  Higher slots may have varying real ranks up to
+``max_rank``; ``output[..., :rank * stack_num]`` stores the real product
+and ``output[..., rank * stack_num:]`` is irrelevant — the consumer
+(``sgemm_lora_b`` / ``qkv_lora_b``) reads only the first ``rank * stack_num``
+columns.
+"""
 
 from __future__ import annotations
 
 import torch
-import triton
-import triton.language as tl
-
-from tokenspeed.runtime.lora.triton_ops.kernel_utils import _resolve_token_positions
+from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.ops.gemm.lora_triton.kernel_utils import _resolve_token_positions
 
 
 @triton.jit
-def _sgemm_lora_b_kernel(
+def _sgemm_lora_a_kernel(
     x,
     weights,
     output,
-    N,  # out_dim
-    K,  # max_rank
+    N,  # stack_num * max_rank
+    K,  # in_dim
+    stack_num,
     x_stride_0,
     x_stride_1,
     w_stride_0,
@@ -52,23 +62,25 @@ def _sgemm_lora_b_kernel(
     BLOCK_S: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
-    scalings,
 ):
     batch_id = tl.program_id(axis=1)
     w_index = tl.load(weight_indices + batch_id)
     rank = tl.load(lora_ranks + w_index)
 
-    # rank == 0 ⇒ slot 0 (no-adapter): leave the base output unchanged.
+    # rank == 0 ⇒ no-adapter slot.  Skip — the output is left untouched
+    # (downstream sgemm_lora_b / qkv_lora_b is also a no-op for rank == 0
+    # so the leftover values never feed into the base-output add).
     if rank == 0:
         return
 
     pid = tl.program_id(axis=0)
+    seg_start = tl.load(seg_indptr + batch_id)
     seg_len = tl.load(seg_lens + batch_id)
     if seg_len == 0:
         return
-    seg_start = tl.load(seg_indptr + batch_id)
-    scaling = tl.load(scalings + w_index)
-    K = tl.minimum(K, rank)
+
+    # Cap N to the real ``stack_num * rank`` for this adapter.
+    N = tl.minimum(N, rank * stack_num)
 
     num_pid_n = tl.cdiv(N, BLOCK_N)
     pid_s = pid // num_pid_n
@@ -87,7 +99,6 @@ def _sgemm_lora_b_kernel(
         k_offset[:, None] * w_stride_2 + n_offset[None, :] * w_stride_1
     )
 
-    n_mask = n_offset[None, :] < N
     partial_sum = tl.zeros((BLOCK_S, BLOCK_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_K)):
         x_tile = tl.load(
@@ -97,7 +108,7 @@ def _sgemm_lora_b_kernel(
         )
         w_tile = tl.load(
             w_ptrs,
-            mask=(k_offset[:, None] < K - k * BLOCK_K) & n_mask,
+            mask=(k_offset[:, None] < K - k * BLOCK_K) & (n_offset[None, :] < N),
             other=0.0,
         )
         partial_sum += tl.dot(x_tile, w_tile)
@@ -105,33 +116,32 @@ def _sgemm_lora_b_kernel(
         x_ptrs += BLOCK_K * x_stride_1
         w_ptrs += BLOCK_K * w_stride_2
 
-    partial_sum *= scaling
     partial_sum = partial_sum.to(x.dtype.element_ty)
+    output_mask = (s_offset[:, None] < seg_len) & (n_offset[None, :] < N)
     output_ptr = output + (
         s_physical[:, None] * output_stride_0 + n_offset[None, :] * output_stride_1
     )
-    output_mask = (s_offset[:, None] < seg_len) & n_mask
-    partial_sum += tl.load(output_ptr, mask=output_mask, other=0.0)
     tl.store(output_ptr, partial_sum, mask=output_mask)
 
 
-def sgemm_lora_b_fwd(
+def sgemm_lora_a_fwd(
     x: torch.Tensor,
     weights: torch.Tensor,
     batch_info,
-    base_output: torch.Tensor | None = None,
+    stack_num: int = 1,
 ) -> torch.Tensor:
-    """Run the LoRA-B expand and fuse-add into ``base_output``.
+    """Run the LoRA-A shrink for an arbitrary batch.
 
     Args:
-        x: ``(s, max_rank)`` activations from sgemm_lora_a.
-        weights: ``(num_lora, out_dim, max_rank)``, contiguous.
+        x:        ``(s, in_dim)`` activations, contiguous.
+        weights:  ``(num_lora, stack_num * max_rank, in_dim)``, contiguous.
         batch_info: :class:`LoraBatchInfo` describing the segment layout.
-        base_output: optional ``(s, out_dim)`` to add into.  When ``None``,
-            allocates a fresh zero-filled output.
+        stack_num: 1 for single projection, 3 for fused QKV, 2 for gate-up.
 
     Returns:
-        ``(s, out_dim)`` (same buffer as ``base_output`` when supplied).
+        ``(s, stack_num * max_rank)`` tensor.  Rows of segments whose adapter
+        is the no-op slot are unwritten — callers must not consume them
+        (the matching sgemm_lora_b kernel is also a no-op for those segments).
     """
     assert x.is_contiguous()
     assert weights.is_contiguous()
@@ -140,30 +150,28 @@ def sgemm_lora_b_fwd(
 
     S = x.shape[0]
     N = weights.shape[-2]
-    R = weights.shape[-1]
-    assert x.shape[-1] == R
+    K = weights.shape[-1]
+    assert x.shape[-1] == K
 
     BLOCK_S = 16
-    BLOCK_R = 16
-    BLOCK_N = 256
+    BLOCK_K = 256
+    BLOCK_N = 16
 
     grid = (
         triton.cdiv(batch_info.max_len, BLOCK_S) * triton.cdiv(N, BLOCK_N),
         batch_info.bs,
     )
 
-    if base_output is None:
-        output = torch.zeros((S, N), device=x.device, dtype=x.dtype)
-    else:
-        output = base_output
-
     sorted_by_adapter = batch_info.permutation is not None
-    _sgemm_lora_b_kernel[grid](
+
+    output = torch.empty((S, N), device=x.device, dtype=x.dtype)
+    _sgemm_lora_a_kernel[grid](
         x,
         weights,
         output,
         N,
-        R,
+        K,
+        stack_num,
         x.stride(0),
         x.stride(1),
         weights.stride(0),
@@ -179,7 +187,6 @@ def sgemm_lora_b_fwd(
         sorted_by_adapter,
         BLOCK_S,
         BLOCK_N,
-        BLOCK_R,
-        batch_info.scalings,
+        BLOCK_K,
     )
     return output
