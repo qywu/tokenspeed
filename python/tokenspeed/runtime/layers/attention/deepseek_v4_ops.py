@@ -1922,6 +1922,108 @@ def read_deepseek_v4_indexer_mxfp4_cache(
     return torch.where(valid[:, None], out, torch.zeros_like(out))
 
 
+@triton.jit
+def _deepseek_v4_gather_indexer_mxfp4_cache_kernel(
+    cache_ptr,
+    slot_mapping_ptr,
+    values_out_ptr,
+    scales_out_ptr,
+    rows: tl.constexpr,
+    slot_stride: tl.constexpr,
+    value_stride: tl.constexpr,
+    scale_stride: tl.constexpr,
+    cache_block_stride: tl.constexpr,
+    block_size: tl.constexpr,
+    value_bytes: tl.constexpr,
+    scale_bytes: tl.constexpr,
+    block_rows: tl.constexpr,
+):
+    row_offsets = tl.program_id(0) * block_rows + tl.arange(0, block_rows)
+    row_mask = row_offsets < rows
+    slots = tl.load(
+        slot_mapping_ptr + row_offsets * slot_stride,
+        mask=row_mask,
+        other=0,
+    ).to(tl.int64)
+    valid_slots = row_mask & (slots >= 0)
+    pages = slots // block_size
+    pos = slots - pages * block_size
+    page_base = pages * cache_block_stride
+
+    value_cols = tl.arange(0, value_bytes)
+    value_base = page_base + pos * value_bytes
+    values = tl.load(
+        cache_ptr + value_base[:, None] + value_cols[None, :],
+        mask=valid_slots[:, None],
+        other=0,
+    )
+    tl.store(
+        values_out_ptr + row_offsets[:, None] * value_stride + value_cols[None, :],
+        values,
+        mask=row_mask[:, None],
+    )
+
+    scale_cols = tl.arange(0, scale_bytes)
+    scale_base = page_base + block_size * value_bytes + pos * scale_bytes
+    scales = tl.load(
+        cache_ptr + scale_base[:, None] + scale_cols[None, :],
+        mask=valid_slots[:, None],
+        other=0,
+    )
+    tl.store(
+        scales_out_ptr + row_offsets[:, None] * scale_stride + scale_cols[None, :],
+        scales,
+        mask=row_mask[:, None],
+    )
+
+
+def deepseek_v4_gather_indexer_mxfp4_cache(
+    *,
+    cache_2d: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    values_out: torch.Tensor,
+    scales_out: torch.Tensor,
+    block_size: int,
+) -> None:
+    """Gather MXFP4 indexer cache bytes into DeepGEMM-ready workspaces."""
+
+    rows = int(slot_mapping.numel())
+    if rows == 0:
+        return
+    if not cache_2d.is_cuda:
+        raise ValueError("deepseek_v4_gather_indexer_mxfp4_cache requires CUDA cache")
+    if not slot_mapping.is_cuda:
+        raise ValueError("deepseek_v4_gather_indexer_mxfp4_cache requires CUDA slots")
+    if values_out.dtype != torch.uint8 or scales_out.dtype != torch.uint8:
+        raise TypeError("MXFP4 gather workspaces must be uint8 tensors")
+    if values_out.stride(1) != 1 or scales_out.stride(1) != 1:
+        raise ValueError("MXFP4 gather workspaces must be contiguous in the last dim")
+    if values_out.shape[0] < rows or scales_out.shape[0] < rows:
+        raise ValueError("MXFP4 gather workspaces are smaller than slot_mapping")
+    if values_out.shape[1] < DEEPSEEK_V4_INDEXER_MXFP4_VALUE_BYTES:
+        raise ValueError("values_out has insufficient value bytes")
+    if scales_out.shape[1] < DEEPSEEK_V4_INDEXER_MXFP4_SCALE_DIM:
+        raise ValueError("scales_out has insufficient scale bytes")
+
+    block_rows = 16
+    _deepseek_v4_gather_indexer_mxfp4_cache_kernel[(triton.cdiv(rows, block_rows),)](
+        cache_2d,
+        slot_mapping,
+        values_out,
+        scales_out,
+        rows=rows,
+        slot_stride=slot_mapping.stride(0),
+        value_stride=values_out.stride(0),
+        scale_stride=scales_out.stride(0),
+        cache_block_stride=cache_2d.stride(0),
+        block_size=block_size,
+        value_bytes=DEEPSEEK_V4_INDEXER_MXFP4_VALUE_BYTES,
+        scale_bytes=DEEPSEEK_V4_INDEXER_MXFP4_SCALE_DIM,
+        block_rows=block_rows,
+        num_warps=4,
+    )
+
+
 def read_deepseek_v4_indexer_fp8_cache(
     cache_2d: torch.Tensor,
     slot_mapping: torch.Tensor,
@@ -2101,11 +2203,18 @@ def _deepseek_v4_compute_global_topk_indices_and_lens_kernel(
     token_to_req_indices_ptr,
     block_table_ptr,
     block_table_stride,
+    is_valid_token_ptr,
+    has_valid_token: tl.constexpr,
     block_size: tl.constexpr,
     topk: tl.constexpr,
     TRITON_BLOCK_SIZE: tl.constexpr,
 ):
     token_idx = tl.program_id(0)
+    if has_valid_token:
+        is_valid_token = tl.load(is_valid_token_ptr + token_idx)
+        if not is_valid_token:
+            tl.store(topk_lens_ptr + token_idx, 0)
+            return
     req_idx = tl.load(token_to_req_indices_ptr + token_idx)
     count = tl.zeros((), dtype=tl.int32)
 
@@ -2143,6 +2252,7 @@ def deepseek_v4_compute_global_topk_indices_and_lens(
     token_to_req_indices: torch.Tensor,
     block_table: torch.Tensor,
     block_size: int,
+    is_valid_token: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Map local CSA top-k indices to global KV slots in one Triton kernel."""
 
@@ -2155,13 +2265,31 @@ def deepseek_v4_compute_global_topk_indices_and_lens(
     topk_lens = torch.empty(num_tokens, dtype=torch.int32, device=topk_indices.device)
     if num_tokens == 0:
         return global_topk_indices, topk_lens
+    if is_valid_token is not None:
+        is_valid_token = is_valid_token[:num_tokens].to(
+            device=topk_indices.device,
+            dtype=torch.bool,
+        )
     if not topk_indices.is_cuda:
         valid = topk_indices >= 0
+        if is_valid_token is not None:
+            valid = valid & is_valid_token[:, None]
         req_idx = token_to_req_indices[:num_tokens].to(torch.int64)
+        rows = int(block_table.shape[0]) if block_table.dim() >= 1 else 0
+        cols = int(block_table.shape[1]) if block_table.dim() >= 2 else 0
+        if rows <= 0 or cols <= 0:
+            global_topk_indices.fill_(-1)
+            topk_lens.zero_()
+            return global_topk_indices, topk_lens
         safe_local = torch.where(valid, topk_indices, torch.zeros_like(topk_indices))
         block_indices = torch.div(safe_local, block_size, rounding_mode="floor")
         block_offsets = safe_local % block_size
-        block_numbers = block_table[req_idx[:, None], block_indices.long()]
+        req_valid = (req_idx >= 0) & (req_idx < rows)
+        block_valid = (block_indices >= 0) & (block_indices < cols)
+        valid = valid & req_valid[:, None] & block_valid
+        safe_req = req_idx.clamp(0, rows - 1)
+        safe_block = block_indices.long().clamp(0, cols - 1)
+        block_numbers = block_table[safe_req[:, None], safe_block]
         global_topk_indices.copy_(
             torch.where(
                 valid,
@@ -2171,6 +2299,8 @@ def deepseek_v4_compute_global_topk_indices_and_lens(
         )
         topk_lens.copy_(valid.sum(dim=1, dtype=torch.int32))
         return global_topk_indices, topk_lens
+    if is_valid_token is None:
+        is_valid_token = torch.empty(0, dtype=torch.bool, device=topk_indices.device)
 
     _deepseek_v4_compute_global_topk_indices_and_lens_kernel[(num_tokens,)](
         global_topk_indices,
@@ -2181,6 +2311,8 @@ def deepseek_v4_compute_global_topk_indices_and_lens(
         token_to_req_indices.to(torch.int32),
         block_table.to(torch.int32),
         block_table.stride(0),
+        is_valid_token,
+        is_valid_token.numel() != 0,
         block_size=block_size,
         topk=topk_indices.shape[-1],
         TRITON_BLOCK_SIZE=1024,
@@ -2268,7 +2400,7 @@ def deepseek_v4_combine_topk_swa_indices(
     workspace_width: int,
     compressed_base: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build FlashMLA sparse prefill indices from CSA top-k and SWA windows."""
+    """Build FlashMLA sparse prefill indices from compressed prefix and SWA."""
 
     num_tokens = topk_indices.shape[0]
     num_reqs = seq_lens.shape[0]
@@ -2306,6 +2438,66 @@ def deepseek_v4_combine_topk_swa_indices(
         padded_topk=triton.next_power_of_2(topk_indices.shape[-1]),
     )
     return combined_indices, combined_lens
+
+
+@triton.jit
+def _deepseek_v4_build_dense_prefill_local_compressed_indices_kernel(
+    out_ptr,
+    out_stride,
+    positions_ptr,
+    width: tl.constexpr,
+    compress_ratio: tl.constexpr,
+    block: tl.constexpr,
+):
+    token_idx = tl.program_id(0)
+    position = tl.load(positions_ptr + token_idx).to(tl.int64)
+    compressed_len = tl.minimum((position + 1) // compress_ratio, width)
+    for start in range(0, width, block):
+        offsets = start + tl.arange(0, block)
+        mask = offsets < width
+        values = tl.where(offsets < compressed_len, offsets, -1)
+        tl.store(out_ptr + token_idx * out_stride + offsets, values, mask=mask)
+
+
+def deepseek_v4_build_dense_prefill_local_compressed_indices(
+    *,
+    positions: torch.Tensor,
+    compress_ratio: int,
+    width: int,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """Build C128A/HCA prefill-local compressed prefix indices into `out`."""
+
+    result = out[: positions.numel(), :width]
+    if positions.numel() == 0 or width <= 0:
+        return result
+    if result.stride(1) != 1:
+        raise ValueError(
+            "dense prefill compressed indices output must be contiguous in the last dim"
+        )
+    if positions.is_cuda:
+        _deepseek_v4_build_dense_prefill_local_compressed_indices_kernel[
+            (positions.numel(),)
+        ](
+            result,
+            result.stride(0),
+            positions,
+            width=width,
+            compress_ratio=compress_ratio,
+            block=1024,
+        )
+        return result
+
+    compressed_lens = torch.div(
+        positions.to(torch.int64) + 1,
+        compress_ratio,
+        rounding_mode="floor",
+    ).clamp(0, width)
+    offsets = torch.arange(width, dtype=torch.int64, device=positions.device)
+    local = offsets[None, :].expand(positions.numel(), -1)
+    valid = offsets[None, :] < compressed_lens[:, None]
+    result.copy_(torch.where(valid, local, torch.full_like(local, -1)).to(torch.int32))
+    return result
 
 
 @triton.jit
@@ -2429,15 +2621,22 @@ def _deepseek_v4_decode_swa_indices_and_lens_kernel(
     query_start_loc_ptr,
     seq_lens_ptr,
     token_to_req_indices_ptr,
+    is_valid_token_ptr,
     block_table_ptr,
     block_table_base_offsets_ptr,
     block_table_stride,
     max_blocks_per_seq: tl.constexpr,
+    has_valid_token: tl.constexpr,
     window_size: tl.constexpr,
     block_size: tl.constexpr,
     candidate_block: tl.constexpr,
 ):
     token_idx = tl.program_id(0)
+    if has_valid_token:
+        is_valid = tl.load(is_valid_token_ptr + token_idx)
+        if not is_valid:
+            tl.store(swa_lens_ptr + token_idx, 0)
+            return
     req_idx = tl.load(token_to_req_indices_ptr + token_idx).to(tl.int32)
 
     query_start = tl.load(query_start_loc_ptr + req_idx).to(tl.int32)
@@ -2485,6 +2684,7 @@ def deepseek_v4_decode_swa_indices_and_lens(
     window_size: int,
     block_size: int,
     block_table_base_offsets: torch.Tensor | None = None,
+    is_valid_token: torch.Tensor | None = None,
     out_indices: torch.Tensor | None = None,
     out_lens: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -2501,6 +2701,13 @@ def deepseek_v4_decode_swa_indices_and_lens(
         out_lens = torch.empty(num_tokens, dtype=torch.int32, device=seq_lens.device)
     if num_tokens == 0:
         return out_indices, out_lens
+    if is_valid_token is None:
+        is_valid_token = torch.empty(0, dtype=torch.bool, device=seq_lens.device)
+    else:
+        is_valid_token = is_valid_token[:num_tokens].to(
+            device=seq_lens.device,
+            dtype=torch.bool,
+        )
 
     candidate_block = min(1024, triton.next_power_of_2(window_size))
     _deepseek_v4_decode_swa_indices_and_lens_kernel[(num_tokens,)](
@@ -2510,6 +2717,7 @@ def deepseek_v4_decode_swa_indices_and_lens(
         query_start_loc.to(torch.int32),
         seq_lens.to(torch.int32),
         token_to_req_indices.to(torch.int32),
+        is_valid_token,
         block_table.to(torch.int32),
         (
             block_table_base_offsets.to(torch.int32)
@@ -2518,6 +2726,7 @@ def deepseek_v4_decode_swa_indices_and_lens(
         ),
         block_table.stride(0),
         block_table.shape[-1],
+        is_valid_token.numel() != 0,
         window_size=window_size,
         block_size=block_size,
         candidate_block=candidate_block,

@@ -82,11 +82,12 @@ struct SchedulerConfig {
     bool disable_l2_cache{false};
     bool enable_l3_storage{false};
     std::int32_t prefetch_threshold{4};  // num pages
+    bool enable_kv_cache_events{false};
+    bool enable_mixed_prefill_decode{false};
 
     std::int32_t num_pages_reserved_for_retracted_or_running{};
     Role role{Role::kFused};
 
-    std::int32_t num_mamba_slots{0};
     bool disable_prefix_cache{false};
     bool enable_mamba{false};
     std::int32_t mamba_cache_chunk_size{64};

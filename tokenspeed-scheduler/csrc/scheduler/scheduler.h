@@ -34,6 +34,7 @@
 #include "scheduler/request.h"
 #include "scheduler/execution_plan.h"
 #include "scheduler/execution_event.h"
+#include "scheduler/kv_cache_events.h"
 
 #include "resource/allocator/page_allocator.h"
 #include "resource/allocator/paged_cache_group.h"
@@ -63,6 +64,7 @@ public:
     ExecutionPlan NextExecutionPlan();
 
     void Advance(const ExecutionEvent& event);
+    std::vector<KvCacheEvent> DrainKvEvents();
 
     std::size_t WaitingSize() const;
     std::size_t DecodingSize() const;
@@ -150,9 +152,9 @@ private:
 private:
     PageAllocator device_allocator_;
     PageAllocator host_allocator_;
+    std::optional<MambaChunkAllocator> mamba_allocator_{};
     KVPrefixCache kv_prefix_cache_;
     ReqPoolAllocator req_pool_allocator_;
-    std::optional<MambaChunkAllocator> mamba_allocator_{};
     std::optional<HybridPrefixCache> hybrid_prefix_cache_{};
     std::map<std::string, std::unique_ptr<PagedCacheGroupAllocator>> paged_cache_allocators_;
     std::unordered_map<std::string, std::map<std::string, PagedCacheGroupTable>> request_paged_cache_tables_;
@@ -160,6 +162,7 @@ private:
 private:
     std::unordered_map<std::string, std::unique_ptr<Request>> requests_;
     std::unordered_map<cache_op_id, CacheOpSpec> cache_op_tracker_;
+    std::vector<KvCacheEvent> kv_events_;
     // Stats
     SchedulerStats stats_;
 };

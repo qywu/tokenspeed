@@ -193,6 +193,7 @@ class TestCLIConfigCompat(unittest.TestCase):
         args = self._parse_args(["--model", "test/model"])
         self.assertEqual(args.max_prefill_tokens, 8192)
         self.assertIsNone(args.chunked_prefill_size)
+        self.assertFalse(args.enable_mixed_batch)
 
         sa = self._from_cli_args_no_init(args)
         sa.mapping = SimpleNamespace(world_size=1)
@@ -205,6 +206,11 @@ class TestCLIConfigCompat(unittest.TestCase):
 
         self.assertEqual(sa.max_prefill_tokens, 8192)
         self.assertEqual(sa.chunked_prefill_size, 8192)
+        self.assertFalse(sa.enable_mixed_batch)
+
+    def test_mixed_batch_can_be_enabled(self):
+        args = self._parse_args(["--model", "test/model", "--enable-mixed-batch"])
+        self.assertTrue(args.enable_mixed_batch)
 
     def test_distributed_timeout_seconds_arg(self):
         args = self._parse_args(
@@ -304,18 +310,14 @@ class TestCLIConfigCompat(unittest.TestCase):
         args = self._parse_args(["--model", "test/model", "--no-enable-prefix-caching"])
         self.assertFalse(args.enable_prefix_caching)
 
-    def test_vllm_recipe_parser_aliases(self):
-        for parser_name in ("deepseek_v4", "openai", "minimax_m2"):
-            with self.subTest(tool_call_parser=parser_name):
-                args = self._parse_args(
-                    ["--model", "test/model", "--tool-call-parser", parser_name]
-                )
-                self.assertEqual(args.tool_call_parser, parser_name)
-            with self.subTest(reasoning_parser=parser_name):
-                args = self._parse_args(
-                    ["--model", "test/model", "--reasoning-parser", parser_name]
-                )
-                self.assertEqual(args.reasoning_parser, parser_name)
+    def test_kv_events_config_arg(self):
+        config = (
+            '{"publisher":"zmq","endpoint":"tcp://*:5557",'
+            '"topic":"kv-events","enable_kv_cache_events":true}'
+        )
+        args = self._parse_args(["--model", "test/model", "--kv-events-config", config])
+        sa = self._from_cli_args_no_init(args)
+        self.assertEqual(sa.kv_events_config, config)
 
     def test_speculative_draft_quantization_defaults_to_unquant(self):
         args = self._parse_args(["--model", "test/model", "--quantization", "nvfp4"])

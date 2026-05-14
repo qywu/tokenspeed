@@ -59,12 +59,14 @@ def make_config(
     enable_l3_storage: bool,
     prefetch_threshold: int,
     role: str,
+    enable_kv_cache_events: bool = False,
     decode_input_tokens: int = 1,
     disable_prefix_cache: bool = False,
     enable_mamba: bool = False,
     mamba_cache_chunk_size: int = 64,
     mamba_pool_total_chunks: int = 0,
     paged_cache_groups: Sequence["PagedCacheGroupConfig"] | None = None,
+    enable_mixed_prefill_decode: bool = False,
 ) -> SchedulerConfig:
     cfg = SchedulerConfig()
     cfg.num_device_pages = num_device_pages
@@ -75,6 +77,7 @@ def make_config(
     cfg.num_host_pages = num_host_pages
     cfg.enable_l3_storage = enable_l3_storage
     cfg.prefetch_threshold = prefetch_threshold
+    cfg.enable_kv_cache_events = enable_kv_cache_events
 
     if role == "prefill":
         cfg.role = SchedulerConfig.Role.P
@@ -90,6 +93,7 @@ def make_config(
     cfg.enable_mamba = enable_mamba
     cfg.mamba_cache_chunk_size = mamba_cache_chunk_size
     cfg.mamba_pool_total_chunks = mamba_pool_total_chunks
+    cfg.enable_mixed_prefill_decode = enable_mixed_prefill_decode
     if paged_cache_groups:
         cfg.paged_cache_groups = list(paged_cache_groups)
     return cfg
