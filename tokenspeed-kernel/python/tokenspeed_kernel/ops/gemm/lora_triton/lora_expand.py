@@ -48,7 +48,7 @@ _EXPAND_CONFIGS = [
 
 @triton.autotune(configs=_EXPAND_CONFIGS, key=["N", "K"])
 @triton.jit
-def _sgemm_lora_b_kernel(
+def _lora_expand_kernel(
     x,
     weights,
     output,
@@ -133,7 +133,7 @@ def _sgemm_lora_b_kernel(
     tl.store(output_ptr, partial_sum, mask=output_mask)
 
 
-def sgemm_lora_b_fwd(
+def lora_expand_fwd(
     x: torch.Tensor,
     weights: torch.Tensor,
     batch_info,
@@ -142,7 +142,7 @@ def sgemm_lora_b_fwd(
     """Run the LoRA-B expand and fuse-add into ``base_output``.
 
     Args:
-        x: ``(s, max_rank)`` activations from sgemm_lora_a.
+        x: ``(s, max_rank)`` activations from lora_shrink.
         weights: ``(num_lora, out_dim, max_rank)``, contiguous.
         batch_info: :class:`LoraBatchInfo` describing the segment layout.
         base_output: optional ``(s, out_dim)`` to add into.  When ``None``,
@@ -175,7 +175,7 @@ def sgemm_lora_b_fwd(
         output = base_output
 
     sorted_by_adapter = batch_info.permutation is not None
-    _sgemm_lora_b_kernel[grid](
+    _lora_expand_kernel[grid](
         x,
         weights,
         output,
@@ -199,4 +199,4 @@ def sgemm_lora_b_fwd(
     return output
 
 
-load_kernel_cache(_sgemm_lora_b_kernel)
+load_kernel_cache(_lora_expand_kernel)

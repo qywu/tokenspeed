@@ -45,21 +45,21 @@ import logging
 from dataclasses import dataclass
 
 import torch
-from tokenspeed_kernel.ops.gemm.lora_triton.gate_up_lora_b import (
-    _gate_up_lora_b_kernel,
-    gate_up_lora_b_fwd,
+from tokenspeed_kernel.ops.gemm.lora_triton.lora_expand import (
+    _lora_expand_kernel,
+    lora_expand_fwd,
 )
-from tokenspeed_kernel.ops.gemm.lora_triton.qkv_lora_b import (
-    _qkv_lora_b_kernel,
-    qkv_lora_b_fwd,
+from tokenspeed_kernel.ops.gemm.lora_triton.lora_gate_up_expand import (
+    _lora_gate_up_expand_kernel,
+    lora_gate_up_expand_fwd,
 )
-from tokenspeed_kernel.ops.gemm.lora_triton.sgemm_lora_a import (
-    _sgemm_lora_a_kernel,
-    sgemm_lora_a_fwd,
+from tokenspeed_kernel.ops.gemm.lora_triton.lora_qkv_expand import (
+    _lora_qkv_expand_kernel,
+    lora_qkv_expand_fwd,
 )
-from tokenspeed_kernel.ops.gemm.lora_triton.sgemm_lora_b import (
-    _sgemm_lora_b_kernel,
-    sgemm_lora_b_fwd,
+from tokenspeed_kernel.ops.gemm.lora_triton.lora_shrink import (
+    _lora_shrink_kernel,
+    lora_shrink_fwd,
 )
 from tokenspeed_kernel.ops.gemm.lora_triton.tuning import save_kernel_cache
 
@@ -103,7 +103,7 @@ def _make_batch(
 
 
 def tune_shrink(*, in_dim: int, stack_num: int, rank: int, max_rank: int) -> None:
-    """Drive ``_sgemm_lora_a_kernel`` for one ``(stack_num, in_dim)`` shape.
+    """Drive ``_lora_shrink_kernel`` for one ``(stack_num, in_dim)`` shape.
 
     Uses a decode-shaped batch (``bs=32, max_len=1``) because that is where
     LoRA latency dominates the e2e (every decode step pays the kernel cost;
@@ -118,10 +118,10 @@ def tune_shrink(*, in_dim: int, stack_num: int, rank: int, max_rank: int) -> Non
     x = torch.randn((s, in_dim), device=device, dtype=dtype)
     weights = torch.randn((2, stack_num * max_rank, in_dim), device=device, dtype=dtype)
     bi = _make_batch(s_per_seg, n_segs, rank=rank, device=device)
-    sgemm_lora_a_fwd(x, weights, bi, stack_num=stack_num)
+    lora_shrink_fwd(x, weights, bi, stack_num=stack_num)
     torch.cuda.synchronize()
     print(
-        f"  shrink in_dim={in_dim} stack={stack_num}  →  best={_sgemm_lora_a_kernel.best_config}"
+        f"  shrink in_dim={in_dim} stack={stack_num}  →  best={_lora_shrink_kernel.best_config}"
     )
 
 
@@ -135,10 +135,10 @@ def tune_expand(*, out_dim: int, max_rank: int, rank: int) -> None:
     weights = torch.randn((2, out_dim, max_rank), device=device, dtype=dtype)
     bi = _make_batch(s_per_seg, n_segs, rank=rank, device=device)
     out = torch.zeros((s, out_dim), device=device, dtype=dtype)
-    sgemm_lora_b_fwd(x, weights, bi, base_output=out)
+    lora_expand_fwd(x, weights, bi, base_output=out)
     torch.cuda.synchronize()
     print(
-        f"  expand out_dim={out_dim} R={max_rank}  →  best={_sgemm_lora_b_kernel.best_config}"
+        f"  expand out_dim={out_dim} R={max_rank}  →  best={_lora_expand_kernel.best_config}"
     )
 
 
@@ -159,10 +159,10 @@ def tune_qkv(*, q_per_tp: int, kv_per_tp: int, max_rank: int, rank: int) -> None
     )
     bi = _make_batch(s_per_seg, n_segs, rank=rank, device=device)
     out = torch.zeros((s, out_dim), device=device, dtype=dtype)
-    qkv_lora_b_fwd(x, weights, bi, output_offset, max_qkv, base_output=out)
+    lora_qkv_expand_fwd(x, weights, bi, output_offset, max_qkv, base_output=out)
     torch.cuda.synchronize()
     print(
-        f"  qkv_expand max_qkv={max_qkv} R={max_rank}  →  best={_qkv_lora_b_kernel.best_config}"
+        f"  qkv_expand max_qkv={max_qkv} R={max_rank}  →  best={_lora_qkv_expand_kernel.best_config}"
     )
 
 
@@ -178,10 +178,10 @@ def tune_gate_up(*, intermediate_per_tp: int, max_rank: int, rank: int) -> None:
     )
     bi = _make_batch(s_per_seg, n_segs, rank=rank, device=device)
     out = torch.zeros((s, 2 * intermediate_per_tp), device=device, dtype=dtype)
-    gate_up_lora_b_fwd(x, weights, bi, intermediate_per_tp, base_output=out)
+    lora_gate_up_expand_fwd(x, weights, bi, intermediate_per_tp, base_output=out)
     torch.cuda.synchronize()
     print(
-        f"  gate_up_expand out={intermediate_per_tp} R={max_rank}  →  best={_gate_up_lora_b_kernel.best_config}"
+        f"  gate_up_expand out={intermediate_per_tp} R={max_rank}  →  best={_lora_gate_up_expand_kernel.best_config}"
     )
 
 
@@ -205,7 +205,7 @@ def main() -> int:
 
     intermediate_per_tp = args.intermediate // args.tp_size
 
-    print("=== Tuning shrink (sgemm_lora_a) ===")
+    print("=== Tuning shrink (lora_shrink) ===")
     # Attention shrink: stack=3 (QKV) on hidden, stack=1 (o) on q_per_tp.
     tune_shrink(in_dim=args.hidden, stack_num=3, rank=args.rank, max_rank=args.max_rank)
     tune_shrink(
@@ -217,13 +217,13 @@ def main() -> int:
         in_dim=intermediate_per_tp, stack_num=1, rank=args.rank, max_rank=args.max_rank
     )
 
-    print("\n=== Tuning expand (sgemm_lora_b) ===")
-    # o_proj uses sgemm_lora_b directly (out_dim = hidden).
+    print("\n=== Tuning expand (lora_expand) ===")
+    # o_proj uses lora_expand directly (out_dim = hidden).
     tune_expand(out_dim=args.hidden, max_rank=args.max_rank, rank=args.rank)
-    # down_proj also uses sgemm_lora_b (out_dim = hidden).
+    # down_proj also uses lora_expand (out_dim = hidden).
     # Same shape — autotune cache hit on the second call.
 
-    print("\n=== Tuning qkv_expand (qkv_lora_b) ===")
+    print("\n=== Tuning qkv_expand (lora_qkv_expand) ===")
     tune_qkv(
         q_per_tp=args.q_per_tp,
         kv_per_tp=args.kv_per_tp,
@@ -231,7 +231,7 @@ def main() -> int:
         rank=args.rank,
     )
 
-    print("\n=== Tuning gate_up_expand (gate_up_lora_b) ===")
+    print("\n=== Tuning gate_up_expand (lora_gate_up_expand) ===")
     tune_gate_up(
         intermediate_per_tp=intermediate_per_tp,
         max_rank=args.max_rank,
@@ -240,10 +240,10 @@ def main() -> int:
 
     print("\n=== Saving caches ===")
     for kern in (
-        _sgemm_lora_a_kernel,
-        _sgemm_lora_b_kernel,
-        _qkv_lora_b_kernel,
-        _gate_up_lora_b_kernel,
+        _lora_shrink_kernel,
+        _lora_expand_kernel,
+        _lora_qkv_expand_kernel,
+        _lora_gate_up_expand_kernel,
     ):
         path = save_kernel_cache(kern)
         print(f"  wrote {path} ({len(kern.cache)} entries)")

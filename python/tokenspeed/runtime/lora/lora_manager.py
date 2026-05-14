@@ -62,10 +62,10 @@ from dataclasses import dataclass
 
 import torch
 from tokenspeed_kernel.ops.gemm.lora_triton import (
-    gate_up_lora_b_fwd,
-    qkv_lora_b_fwd,
-    sgemm_lora_a_fwd,
-    sgemm_lora_b_fwd,
+    lora_expand_fwd,
+    lora_gate_up_expand_fwd,
+    lora_qkv_expand_fwd,
+    lora_shrink_fwd,
 )
 
 from tokenspeed.runtime.utils import get_colorful_logger
@@ -324,7 +324,7 @@ class LoraManager:
         self.down_A_buffers: list[torch.Tensor] = []
         self.down_B_buffers: list[torch.Tensor] = []
 
-        # Cumulative output offsets [0, q, q+kv, q+2*kv] for qkv_lora_b.
+        # Cumulative output offsets [0, q, q+kv, q+2*kv] for lora_qkv_expand.
         self._qkv_output_offset = torch.tensor(
             [
                 0,
@@ -505,8 +505,8 @@ class LoraManager:
         A_buf = self.qkv_A_buffers[layer_id]
         B_buf = self.qkv_B_buffers[layer_id]
         # lora_a: (s, 3 * max_rank)
-        lora_a = sgemm_lora_a_fwd(hidden_states, A_buf, bi, stack_num=3)
-        qkv_lora_b_fwd(
+        lora_a = lora_shrink_fwd(hidden_states, A_buf, bi, stack_num=3)
+        lora_qkv_expand_fwd(
             lora_a,
             B_buf,
             bi,
@@ -546,8 +546,8 @@ class LoraManager:
         B_buf = self.o_B_buffers[layer_id]
         # lora_a (partial per rank): (s, max_rank).  No internal all-reduce —
         # the partial flows into B and the result rides the downstream sum.
-        lora_a = sgemm_lora_a_fwd(attn_output, A_buf, bi, stack_num=1)
-        sgemm_lora_b_fwd(lora_a, B_buf, bi, base_output=o_output)
+        lora_a = lora_shrink_fwd(attn_output, A_buf, bi, stack_num=1)
+        lora_expand_fwd(lora_a, B_buf, bi, base_output=o_output)
         return o_output
 
     def apply_gate_up_lora(
@@ -572,8 +572,8 @@ class LoraManager:
         A_buf = self.gate_up_A_buffers[layer_id]
         B_buf = self.gate_up_B_buffers[layer_id]
         # lora_a: (s, 2 * max_rank) — gate's lora_a in [:, :r], up's in [:, r:].
-        lora_a = sgemm_lora_a_fwd(hidden_states, A_buf, bi, stack_num=2)
-        gate_up_lora_b_fwd(
+        lora_a = lora_shrink_fwd(hidden_states, A_buf, bi, stack_num=2)
+        lora_gate_up_expand_fwd(
             lora_a,
             B_buf,
             bi,
@@ -609,8 +609,8 @@ class LoraManager:
 
         A_buf = self.down_A_buffers[layer_id]
         B_buf = self.down_B_buffers[layer_id]
-        lora_a = sgemm_lora_a_fwd(x, A_buf, bi, stack_num=1)
-        sgemm_lora_b_fwd(lora_a, B_buf, bi, base_output=down_output)
+        lora_a = lora_shrink_fwd(x, A_buf, bi, stack_num=1)
+        lora_expand_fwd(lora_a, B_buf, bi, base_output=down_output)
         return down_output
 
     def set_adapter_scaling(self, name: str, scaling: float) -> None:
@@ -872,13 +872,13 @@ class LoraManager:
 
                 # Stacked LoRA-A: pack at ``stack_idx * actual_rank``
                 # (contiguous), NOT at multiples of ``max_lora_rank``.
-                # The sgemm_lora_a kernel writes only the first
+                # The lora_shrink kernel writes only the first
                 # ``rank * stack_num`` columns of its output and the
-                # downstream qkv_lora_b / gate_up_lora_b kernel reads
-                # ``x[:, stack_id * rank]``.  Both ends use ``rank`` (the
-                # adapter's actual rank, not max_rank), so stacks must be
-                # contiguous in the buffer — gaps would be read as zero
-                # and silently kill the k/v / up deltas.
+                # downstream lora_qkv_expand / lora_gate_up_expand kernel
+                # reads ``x[:, stack_id * rank]``.  Both ends use ``rank``
+                # (the adapter's actual rank, not max_rank), so stacks
+                # must be contiguous in the buffer — gaps would be read
+                # as zero and silently kill the k/v / up deltas.
                 if mod in ("q_proj", "k_proj", "v_proj"):
                     qkv_idx = ("q_proj", "k_proj", "v_proj").index(mod)
                     rank_off = qkv_idx * r

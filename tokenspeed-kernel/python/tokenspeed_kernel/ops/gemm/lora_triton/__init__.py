@@ -26,14 +26,16 @@ fuse the per-segment GEMMs into a single launch and keep per-segment state
 (rank, scaling) on-device.
 """
 
-from tokenspeed_kernel.ops.gemm.lora_triton.gate_up_lora_b import gate_up_lora_b_fwd
-from tokenspeed_kernel.ops.gemm.lora_triton.qkv_lora_b import qkv_lora_b_fwd
-from tokenspeed_kernel.ops.gemm.lora_triton.sgemm_lora_a import sgemm_lora_a_fwd
-from tokenspeed_kernel.ops.gemm.lora_triton.sgemm_lora_b import sgemm_lora_b_fwd
+from tokenspeed_kernel.ops.gemm.lora_triton.lora_expand import lora_expand_fwd
+from tokenspeed_kernel.ops.gemm.lora_triton.lora_gate_up_expand import (
+    lora_gate_up_expand_fwd,
+)
+from tokenspeed_kernel.ops.gemm.lora_triton.lora_qkv_expand import lora_qkv_expand_fwd
+from tokenspeed_kernel.ops.gemm.lora_triton.lora_shrink import lora_shrink_fwd
 
 __all__ = [
-    "sgemm_lora_a_fwd",
-    "sgemm_lora_b_fwd",
-    "qkv_lora_b_fwd",
-    "gate_up_lora_b_fwd",
+    "lora_shrink_fwd",
+    "lora_expand_fwd",
+    "lora_qkv_expand_fwd",
+    "lora_gate_up_expand_fwd",
 ]
