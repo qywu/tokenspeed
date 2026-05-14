@@ -32,8 +32,25 @@ from __future__ import annotations
 import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.gemm.lora_triton.kernel_utils import _resolve_token_positions
+from tokenspeed_kernel.ops.gemm.lora_triton.tuning import load_kernel_cache
+
+_GATE_UP_EXPAND_CONFIGS = [
+    triton.Config(
+        {"BLOCK_S": s, "BLOCK_N": n, "BLOCK_K": k},
+        num_warps=w,
+        num_stages=stages,
+        maxnreg=mr,
+    )
+    for s in (16, 32)
+    for n in (32, 64, 128)
+    for k in (16, 32)
+    for w in (4, 8)
+    for stages in (1, 2, 3)
+    for mr in (None, 128, 160)
+]
 
 
+@triton.autotune(configs=_GATE_UP_EXPAND_CONFIGS, key=["output_dim", "K"])
 @triton.jit
 def _gate_up_lora_b_kernel(
     x,
@@ -53,11 +70,11 @@ def _gate_up_lora_b_kernel(
     weight_indices,
     lora_ranks,
     sorted_token_ids,
+    scalings,
     SORTED_BY_ADAPTER: tl.constexpr,
     BLOCK_S: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
-    scalings,
 ):
     batch_id = tl.program_id(axis=2)
     w_index = tl.load(weight_indices + batch_id)
@@ -150,15 +167,15 @@ def gate_up_lora_b_fwd(
     r = gate_up_lora_b.shape[-1]
     assert input_dim == 2 * r
 
-    BLOCK_S = 16
-    BLOCK_R = 16
-    BLOCK_OUT = 64
+    max_len = batch_info.max_len
 
-    grid_b = (
-        triton.cdiv(batch_info.max_len, BLOCK_S) * triton.cdiv(output_dim, BLOCK_OUT),
-        2,
-        batch_info.bs,
-    )
+    def grid(meta):
+        return (
+            triton.cdiv(max_len, meta["BLOCK_S"])
+            * triton.cdiv(output_dim, meta["BLOCK_N"]),
+            2,
+            batch_info.bs,
+        )
 
     if base_output is None:
         output = torch.zeros((s, 2 * output_dim), device=x.device, dtype=x.dtype)
@@ -166,7 +183,7 @@ def gate_up_lora_b_fwd(
         output = base_output
 
     sorted_by_adapter = batch_info.permutation is not None
-    _gate_up_lora_b_kernel[grid_b](
+    _gate_up_lora_b_kernel[grid](
         x,
         gate_up_lora_b,
         output,
@@ -184,11 +201,11 @@ def gate_up_lora_b_fwd(
         batch_info.weight_indices,
         batch_info.lora_ranks,
         batch_info.permutation,
-        sorted_by_adapter,
-        BLOCK_S,
-        BLOCK_OUT,
-        BLOCK_R,
         batch_info.scalings,
+        sorted_by_adapter,
     )
 
     return output
+
+
+load_kernel_cache(_gate_up_lora_b_kernel)

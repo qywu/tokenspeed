@@ -32,8 +32,25 @@ from __future__ import annotations
 import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.gemm.lora_triton.kernel_utils import _resolve_token_positions
+from tokenspeed_kernel.ops.gemm.lora_triton.tuning import load_kernel_cache
+
+_QKV_EXPAND_CONFIGS = [
+    triton.Config(
+        {"BLOCK_S": s, "BLOCK_N": n, "BLOCK_K": k},
+        num_warps=w,
+        num_stages=stages,
+        maxnreg=mr,
+    )
+    for s in (16, 32)
+    for n in (32, 64, 128)
+    for k in (16, 32)
+    for w in (4, 8)
+    for stages in (1, 2, 3)
+    for mr in (None, 128, 160)
+]
 
 
+@triton.autotune(configs=_QKV_EXPAND_CONFIGS, key=["max_qkv_out_dim", "K"])
 @triton.jit
 def _qkv_lora_b_kernel(
     x,
@@ -54,11 +71,11 @@ def _qkv_lora_b_kernel(
     lora_ranks,
     n_offs,  # (4,) cumulative offsets into the fused QKV output
     sorted_token_ids,
+    scalings,
     SORTED_BY_ADAPTER: tl.constexpr,
     BLOCK_S: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
-    scalings,
 ):
     batch_id = tl.program_id(axis=2)
     w_index = tl.load(weight_indices + batch_id)
@@ -153,16 +170,15 @@ def qkv_lora_b_fwd(
     assert input_dim == 3 * r
     assert output_offset.shape[0] == 4
 
-    BLOCK_S = 16
-    BLOCK_R = 16
-    BLOCK_OUT = 64
+    max_len = batch_info.max_len
 
-    grid_b = (
-        triton.cdiv(batch_info.max_len, BLOCK_S)
-        * triton.cdiv(max_qkv_out_dim, BLOCK_OUT),
-        3,
-        batch_info.bs,
-    )
+    def grid(meta):
+        return (
+            triton.cdiv(max_len, meta["BLOCK_S"])
+            * triton.cdiv(max_qkv_out_dim, meta["BLOCK_N"]),
+            3,
+            batch_info.bs,
+        )
 
     if base_output is None:
         output = torch.zeros((s, output_dim), device=x.device, dtype=x.dtype)
@@ -170,7 +186,7 @@ def qkv_lora_b_fwd(
         output = base_output
 
     sorted_by_adapter = batch_info.permutation is not None
-    _qkv_lora_b_kernel[grid_b](
+    _qkv_lora_b_kernel[grid](
         x,
         qkv_lora_b,
         output,
@@ -189,10 +205,10 @@ def qkv_lora_b_fwd(
         batch_info.lora_ranks,
         output_offset,
         batch_info.permutation,
-        sorted_by_adapter,
-        BLOCK_S,
-        BLOCK_OUT,
-        BLOCK_R,
         batch_info.scalings,
+        sorted_by_adapter,
     )
     return output
+
+
+load_kernel_cache(_qkv_lora_b_kernel)

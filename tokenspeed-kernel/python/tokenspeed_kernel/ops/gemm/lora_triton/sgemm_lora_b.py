@@ -25,8 +25,28 @@ from __future__ import annotations
 import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.gemm.lora_triton.kernel_utils import _resolve_token_positions
+from tokenspeed_kernel.ops.gemm.lora_triton.tuning import load_kernel_cache
+
+# Expand kernel: N = out_dim (large, 4096+), K = max_rank (tiny, 16–64).
+# Tile space targets "large N, small K, small S".  Mirrors sglang's
+# csgmv-expand grid (PR #20391); maxnreg helped with occupancy there.
+_EXPAND_CONFIGS = [
+    triton.Config(
+        {"BLOCK_S": s, "BLOCK_N": n, "BLOCK_K": k},
+        num_warps=w,
+        num_stages=stages,
+        maxnreg=mr,
+    )
+    for s in (16, 32)
+    for n in (32, 64, 128)
+    for k in (16, 32)
+    for w in (4, 8)
+    for stages in (1, 2, 3)
+    for mr in (None, 128, 160)
+]
 
 
+@triton.autotune(configs=_EXPAND_CONFIGS, key=["N", "K"])
 @triton.jit
 def _sgemm_lora_b_kernel(
     x,
@@ -46,11 +66,11 @@ def _sgemm_lora_b_kernel(
     weight_indices,
     lora_ranks,
     sorted_token_ids,
+    scalings,
     SORTED_BY_ADAPTER: tl.constexpr,
     BLOCK_S: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
-    scalings,
 ):
     batch_id = tl.program_id(axis=1)
     w_index = tl.load(weight_indices + batch_id)
@@ -141,14 +161,13 @@ def sgemm_lora_b_fwd(
     R = weights.shape[-1]
     assert x.shape[-1] == R
 
-    BLOCK_S = 16
-    BLOCK_R = 16
-    BLOCK_N = 256
+    max_len = batch_info.max_len
 
-    grid = (
-        triton.cdiv(batch_info.max_len, BLOCK_S) * triton.cdiv(N, BLOCK_N),
-        batch_info.bs,
-    )
+    def grid(meta):
+        return (
+            triton.cdiv(max_len, meta["BLOCK_S"]) * triton.cdiv(N, meta["BLOCK_N"]),
+            batch_info.bs,
+        )
 
     if base_output is None:
         output = torch.zeros((S, N), device=x.device, dtype=x.dtype)
@@ -174,10 +193,10 @@ def sgemm_lora_b_fwd(
         batch_info.weight_indices,
         batch_info.lora_ranks,
         batch_info.permutation,
-        sorted_by_adapter,
-        BLOCK_S,
-        BLOCK_N,
-        BLOCK_R,
         batch_info.scalings,
+        sorted_by_adapter,
     )
     return output
+
+
+load_kernel_cache(_sgemm_lora_b_kernel)

@@ -36,8 +36,26 @@ from __future__ import annotations
 import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.gemm.lora_triton.kernel_utils import _resolve_token_positions
+from tokenspeed_kernel.ops.gemm.lora_triton.tuning import load_kernel_cache
+
+# Shrink kernel: N = stack_num * rank (tiny, 16–192), K = in_dim (large,
+# 4096+).  Decode-step segments are short (S = 1–32 per segment), so the
+# right tile shape is "small N, large K, small S".  Sweep matches the
+# sglang csgmv-shrink space (PR sgl-project/sglang#20391) plus a BLOCK_S
+# axis since our kernel exposes it.  72 configs.
+_SHRINK_CONFIGS = [
+    triton.Config(
+        {"BLOCK_S": s, "BLOCK_N": n, "BLOCK_K": k}, num_warps=w, num_stages=stages
+    )
+    for s in (16, 32)
+    for n in (16, 32, 64)
+    for k in (64, 128, 256)
+    for w in (4, 8)
+    for stages in (2, 3, 4)
+]
 
 
+@triton.autotune(configs=_SHRINK_CONFIGS, key=["N", "K"])
 @triton.jit
 def _sgemm_lora_a_kernel(
     x,
@@ -153,14 +171,13 @@ def sgemm_lora_a_fwd(
     K = weights.shape[-1]
     assert x.shape[-1] == K
 
-    BLOCK_S = 16
-    BLOCK_K = 256
-    BLOCK_N = 16
+    max_len = batch_info.max_len
 
-    grid = (
-        triton.cdiv(batch_info.max_len, BLOCK_S) * triton.cdiv(N, BLOCK_N),
-        batch_info.bs,
-    )
+    def grid(meta):
+        return (
+            triton.cdiv(max_len, meta["BLOCK_S"]) * triton.cdiv(N, meta["BLOCK_N"]),
+            batch_info.bs,
+        )
 
     sorted_by_adapter = batch_info.permutation is not None
 
@@ -185,8 +202,10 @@ def sgemm_lora_a_fwd(
         batch_info.lora_ranks,
         batch_info.permutation,
         sorted_by_adapter,
-        BLOCK_S,
-        BLOCK_N,
-        BLOCK_K,
     )
     return output
+
+
+# Eager pre-population from disk happens lazily inside the autotuner cache
+# (see `tokenspeed_kernel.ops.gemm.lora_triton.__init__`).
+load_kernel_cache(_sgemm_lora_a_kernel)
