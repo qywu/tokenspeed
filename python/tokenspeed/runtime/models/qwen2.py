@@ -26,10 +26,9 @@ from collections.abc import Iterable
 from typing import Any
 
 import torch
-from tokenspeed_kernel.ops.layernorm.triton import qk_rmsnorm
 from torch import nn
 
-from tokenspeed.runtime.configs.qwen3_config import Qwen3Config
+from tokenspeed.runtime.configs.qwen2_config import Qwen2Config
 from tokenspeed.runtime.configs.utils import get_rope_theta
 from tokenspeed.runtime.distributed.comm_ops import all_reduce
 from tokenspeed.runtime.distributed.mapping import Mapping
@@ -55,7 +54,7 @@ from tokenspeed.runtime.utils import add_prefix, make_layers
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
 
-class Qwen3MLP(nn.Module):
+class Qwen2MLP(nn.Module):
     def __init__(
         self,
         hidden_size: int,
@@ -100,10 +99,10 @@ class Qwen3MLP(nn.Module):
         return x
 
 
-class Qwen3Attention(nn.Module):
+class Qwen2Attention(nn.Module):
     def __init__(
         self,
-        config: Qwen3Config,
+        config: Qwen2Config,
         mapping: Mapping,
         hidden_size: int,
         num_heads: int,
@@ -114,8 +113,6 @@ class Qwen3Attention(nn.Module):
         head_dim: int | None = None,
         max_position_embeddings: int = 32768,
         quant_config: QuantizationConfig | None = None,
-        rms_norm_eps: float = None,
-        attention_bias: bool = False,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -128,12 +125,8 @@ class Qwen3Attention(nn.Module):
         self.num_heads = self.total_num_heads // self.tp_size
         self.total_num_kv_heads = num_kv_heads
         if self.total_num_kv_heads >= self.tp_size:
-            # Number of KV heads is greater than TP size, so we partition
-            # the KV heads across multiple tensor parallel GPUs.
             assert self.total_num_kv_heads % self.tp_size == 0
         else:
-            # Number of KV heads is less than TP size, so we replicate
-            # the KV heads across multiple tensor parallel GPUs.
             assert self.tp_size % self.total_num_kv_heads == 0
         self.num_kv_heads = max(1, self.total_num_kv_heads // self.tp_size)
         self.head_dim = head_dim or hidden_size // self.total_num_heads
@@ -143,15 +136,13 @@ class Qwen3Attention(nn.Module):
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
 
-        self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
-        self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
-
+        # Qwen2 uses biases on Q/K/V projections but not on the output projection.
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
             self.head_dim,
             self.total_num_heads,
             self.total_num_kv_heads,
-            bias=attention_bias,
+            bias=True,
             quant_config=quant_config,
             prefix=add_prefix("qkv_proj", prefix),
             tp_rank=self.mapping.attn.tp_rank,
@@ -161,7 +152,7 @@ class Qwen3Attention(nn.Module):
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
-            bias=attention_bias,
+            bias=False,
             quant_config=quant_config,
             prefix=add_prefix("o_proj", prefix),
             reduce_results=False,
@@ -185,25 +176,6 @@ class Qwen3Attention(nn.Module):
             layer_id=layer_id,
         )
 
-    def _apply_qk_norm(
-        self, q: torch.Tensor, k: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        return qk_rmsnorm(
-            q,
-            k,
-            self.q_norm.weight.data,
-            self.k_norm.weight.data,
-            self.q_norm.variance_epsilon,
-        )
-
-    def _rotate_half(self, x):
-        x1 = x[..., : x.shape[-1] // 2]
-        x2 = x[..., x.shape[-1] // 2 :]
-        return torch.cat((-x2, x1), dim=-1)
-
-    def _apply_rotary_pos_emb(self, t, cos, sin):
-        return (t * cos) + self._rotate_half(t) * sin
-
     def forward(
         self,
         positions: torch.Tensor,
@@ -214,7 +186,6 @@ class Qwen3Attention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self._apply_qk_norm(q, k)
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, ctx, out_cache_loc)
         if len(attn_output.size()) == 3:
@@ -223,10 +194,10 @@ class Qwen3Attention(nn.Module):
         return output
 
 
-class Qwen3DecoderLayer(nn.Module):
+class Qwen2DecoderLayer(nn.Module):
     def __init__(
         self,
-        config: Qwen3Config,
+        config: Qwen2Config,
         mapping: Mapping,
         layer_id: int = 0,
         quant_config: QuantizationConfig | None = None,
@@ -236,13 +207,13 @@ class Qwen3DecoderLayer(nn.Module):
         self.mapping = mapping
         assert (
             self.mapping.attn.tp_size == self.mapping.dense.tp_size
-        ), "Qwen3 does not use CommManager and assumes attn_tp_size == dense_tp_size"
+        ), "Qwen2 does not use CommManager and assumes attn_tp_size == dense_tp_size"
         self.hidden_size = config.hidden_size
         rope_theta = get_rope_theta(config, 1000000)
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 32768)
         head_dim = getattr(config, "head_dim", None)
-        self.self_attn = Qwen3Attention(
+        self.self_attn = Qwen2Attention(
             config=config,
             mapping=self.mapping,
             hidden_size=self.hidden_size,
@@ -254,11 +225,9 @@ class Qwen3DecoderLayer(nn.Module):
             head_dim=head_dim,
             max_position_embeddings=max_position_embeddings,
             quant_config=quant_config,
-            rms_norm_eps=config.rms_norm_eps,
-            attention_bias=config.attention_bias,
             prefix=add_prefix("self_attn", prefix),
         )
-        self.mlp = Qwen3MLP(
+        self.mlp = Qwen2MLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
@@ -281,7 +250,6 @@ class Qwen3DecoderLayer(nn.Module):
         residual: torch.Tensor | None,
         cos_sin: tuple[torch.Tensor, torch.Tensor] | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Self Attention
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -310,7 +278,6 @@ class Qwen3DecoderLayer(nn.Module):
             cos_sin=cos_sin,
         )
 
-        # Fully Connected
         if ctx.input_num_tokens > global_server_args_dict["comm_fusion_max_num_tokens"]:
             hidden_states = all_reduce(
                 hidden_states, self.mapping.attn.tp_rank, self.mapping.attn.tp_group
@@ -331,10 +298,10 @@ class Qwen3DecoderLayer(nn.Module):
         return hidden_states, residual
 
 
-class Qwen3Model(nn.Module):
+class Qwen2Model(nn.Module):
     def __init__(
         self,
-        config: Qwen3Config,
+        config: Qwen2Config,
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
@@ -353,7 +320,7 @@ class Qwen3Model(nn.Module):
             tp_size=self.mapping.attn.tp_size,
             tp_group=self.mapping.attn.tp_group,
         )
-        decoder_layer_type = decoder_layer_type or Qwen3DecoderLayer
+        decoder_layer_type = decoder_layer_type or Qwen2DecoderLayer
         self.layers = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: decoder_layer_type(
@@ -429,10 +396,9 @@ class Qwen3Model(nn.Module):
                 )
 
 
-class Qwen3ForCausalLM(BaseCausalLM):
-    model_cls = Qwen3Model
+class Qwen2ForCausalLM(BaseCausalLM):
+    model_cls = Qwen2Model
 
-    # BitandBytes specific attributes
     default_bitsandbytes_target_modules = [
         ".gate_proj.",
         ".down_proj.",
@@ -443,7 +409,6 @@ class Qwen3ForCausalLM(BaseCausalLM):
         ".o_proj.",
     ]
     bitsandbytes_stacked_params_mapping = {
-        # shard_name, weight_name, index
         "q_proj": ("qkv_proj", 0),
         "k_proj": ("qkv_proj", 1),
         "v_proj": ("qkv_proj", 2),
@@ -453,7 +418,7 @@ class Qwen3ForCausalLM(BaseCausalLM):
 
     def __init__(
         self,
-        config: Qwen3Config,
+        config: Qwen2Config,
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
     ) -> None:
@@ -468,7 +433,6 @@ class Qwen3ForCausalLM(BaseCausalLM):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
             ("qkv_proj", "k_proj", "k"),
             ("qkv_proj", "v_proj", "v"),
@@ -476,16 +440,6 @@ class Qwen3ForCausalLM(BaseCausalLM):
             ("gate_up_proj", "up_proj", 1),
         ]
 
-        """
-        'model.layers.0.self_attn.q_norm.weight',
-        'model.layers.0.self_attn.k_norm.weight',
-        'model.layers.0.self_attn.qkv_proj.weight',
-        'model.layers.0.self_attn.o_proj.weight',
-        'model.layers.0.mlp.gate_up_proj.weight',
-        'model.layers.0.mlp.down_proj.weight',
-        'model.layers.0.input_layernorm.weight',
-        'model.layers.0.post_attention_layernorm.weight'
-        """
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
             if "Embedding" in self.config.name_or_path:
@@ -504,8 +458,6 @@ class Qwen3ForCausalLM(BaseCausalLM):
             if "rotary_emb.inv_freq" in name or "projector" in name:
                 continue
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
-                # Models trained using ColossalAI may include these tensors in
-                # the checkpoint. Skip them.
                 continue
             if self.config.tie_word_embeddings and "lm_head.weight" in name:
                 continue
@@ -516,7 +468,6 @@ class Qwen3ForCausalLM(BaseCausalLM):
                 if weight_name not in name:
                     continue
                 name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 param = params_dict[name]
@@ -524,7 +475,6 @@ class Qwen3ForCausalLM(BaseCausalLM):
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-                # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 param = params_dict[name]
@@ -546,4 +496,4 @@ class Qwen3ForCausalLM(BaseCausalLM):
         self.model.load_kv_cache_scales(quantization_param_path)
 
 
-EntryClass = Qwen3ForCausalLM
+EntryClass = Qwen2ForCausalLM
