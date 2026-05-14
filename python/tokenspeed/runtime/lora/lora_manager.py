@@ -68,7 +68,6 @@ from tokenspeed_kernel.ops.gemm.lora_triton import (
     sgemm_lora_b_fwd,
 )
 
-from tokenspeed.runtime.distributed.comm_ops import all_reduce as comm_all_reduce
 from tokenspeed.runtime.utils import get_colorful_logger
 
 logger = get_colorful_logger(__name__)
@@ -205,13 +204,16 @@ class LoraManager:
         self.o_in_per_tp: int = self.q_size_per_tp
         self.hidden_size: int = hidden
 
-        # MLP runs un-sharded in this codebase (qwen3 ``Qwen3MLP`` does
-        # not pass tp args to ``MergedColumnParallelLinear`` / ``RowParallelLinear``,
-        # so each rank holds the full intermediate weight).  Match that
-        # for MLP LoRA buffers — no sharding, no per-step all-reduce.
+        # Qwen3MLP is TP-aware: ``gate_up_proj`` is column-parallel (each rank
+        # holds ``intermediate_size // tp_size`` output cols) and ``down_proj``
+        # is row-parallel (each rank holds ``intermediate_size // tp_size``
+        # input cols).  The LoRA deltas ride the partial outputs of those base
+        # linears, and the existing downstream all-reduce sums per-rank
+        # partials — see ``apply_down_lora``/``apply_gate_up_lora``.
         self.intermediate_size: int = getattr(
             model_config, "intermediate_size", 4 * hidden
         )
+        self.intermediate_per_tp: int = self.intermediate_size // self.tp_size
 
         # CPU-side flag: True when at least one segment in the current
         # batch_info uses a real adapter (slot != 0).  CudaGraphWrapper
@@ -308,11 +310,11 @@ class LoraManager:
         #   qkv_B_buffers: (n_slots, q_per_tp + 2 * kv_per_tp, max_rank).
         #   o_A_buffers:   (n_slots, max_rank, o_in_per_tp).
         #   o_B_buffers:   (n_slots, hidden, max_rank).
-        # MLP (un-sharded):
-        #   gate_up_A_buffers: (n_slots, 2 * max_rank, hidden).
-        #   gate_up_B_buffers: (n_slots, 2 * intermediate_size, max_rank).
-        #   down_A_buffers:    (n_slots, max_rank, intermediate_size).
-        #   down_B_buffers:    (n_slots, hidden, max_rank).
+        # MLP (TP-aware, mirrors qwen3 ``Qwen3MLP``):
+        #   gate_up_A_buffers: (n_slots, 2 * max_rank, hidden)             — A replicated.
+        #   gate_up_B_buffers: (n_slots, 2 * intermediate_per_tp, max_rank) — column-parallel.
+        #   down_A_buffers:    (n_slots, max_rank, intermediate_per_tp)    — row-parallel.
+        #   down_B_buffers:    (n_slots, hidden, max_rank)                 — B replicated.
         self.qkv_A_buffers: list[torch.Tensor] = []
         self.qkv_B_buffers: list[torch.Tensor] = []
         self.o_A_buffers: list[torch.Tensor] = []
@@ -527,13 +529,12 @@ class LoraManager:
         ``o_output``: ``(s, hidden)`` partial sum from the host o_proj
         (``reduce_results=False`` on this codebase).  Updated in place.
 
-        TP correctness caveat: the delta computed here is the *full*
-        ``B @ A @ x`` (after an internal all-reduce on lora_a).  The host
-        layer's downstream fused all-reduce in post_attention_layernorm
-        sums this delta ``tp_size`` times, overcounting the LoRA
-        contribution at TP > 1.  This is a pre-existing TP issue
-        independent of the kernel path; fixing it cleanly requires
-        coordinating with the host module's reduce policy.
+        Each rank computes ``B @ A_local @ x_local`` — a partial of shape
+        ``(s, hidden)``.  A is sharded along its input dim and B is
+        replicated, so the sum of partials over ranks equals
+        ``B @ A_full @ x_full``.  The host layer's downstream fused
+        all-reduce in ``post_attention_layernorm`` sums the base partial
+        and the LoRA partial together, producing the correct full output.
         """
         if attn_output.shape[0] == 0:
             return o_output
@@ -543,12 +544,9 @@ class LoraManager:
 
         A_buf = self.o_A_buffers[layer_id]
         B_buf = self.o_B_buffers[layer_id]
-        # lora_a (partial per rank): (s, max_rank)
+        # lora_a (partial per rank): (s, max_rank).  No internal all-reduce —
+        # the partial flows into B and the result rides the downstream sum.
         lora_a = sgemm_lora_a_fwd(attn_output, A_buf, bi, stack_num=1)
-        # All-reduce so each rank has the full ``A @ x``.  Routes through
-        # the comm_ops backend (graph-capturable).
-        if self.tp_size > 1 and self.tp_group is not None:
-            lora_a = comm_all_reduce(lora_a, self.tp_rank, self.tp_group)
         sgemm_lora_b_fwd(lora_a, B_buf, bi, base_output=o_output)
         return o_output
 
@@ -561,9 +559,9 @@ class LoraManager:
         """Fused gate/up LoRA delta: ``gate_up += B @ A @ x * scaling``.
 
         ``hidden_states``: ``(s, hidden)``.
-        ``gate_up``:       ``(s, 2 * intermediate_size)`` — output of
-        ``gate_up_proj`` (un-sharded in this codebase).  Updated in place
-        via the kernel's fused-add.
+        ``gate_up``:       ``(s, 2 * intermediate_per_tp)`` — output of the
+        column-parallel ``gate_up_proj`` (each rank holds its own output
+        shard).  Updated in place via the kernel's fused-add.
         """
         if hidden_states.shape[0] == 0:
             return gate_up
@@ -579,7 +577,7 @@ class LoraManager:
             lora_a,
             B_buf,
             bi,
-            self.intermediate_size,
+            self.intermediate_per_tp,
             base_output=gate_up,
         )
         return gate_up
@@ -590,14 +588,18 @@ class LoraManager:
         down_output: torch.Tensor,
         layer_id: int,
     ) -> torch.Tensor:
-        """Down-projection LoRA delta (un-sharded in this codebase).
+        """Down-projection LoRA delta (row-parallel under MLP TP).
 
-        ``x``:           ``(s, intermediate_size)`` — input to ``down_proj``.
-        ``down_output``: ``(s, hidden)`` — output of ``down_proj``.  Updated
-        in place.
+        ``x``:           ``(s, intermediate_per_tp)`` — input to the
+        row-parallel ``down_proj`` (this rank's input shard).
+        ``down_output``: ``(s, hidden)`` — partial output of ``down_proj``
+        before its all-reduce.  Updated in place.
 
-        MLP runs at tp_size=1 here, so no internal all-reduce is needed
-        (vs ``apply_o_lora`` which is row-parallel under attn TP).
+        Each rank's delta is ``B @ A_local @ x_local``: A is sharded along
+        the input dim and B is replicated, so summing per-rank deltas yields
+        the full ``B @ A_full @ x_full``.  The base linear runs with
+        ``reduce_results=False``; the downstream all-reduce that sums the
+        base partial also sums the LoRA partials.
         """
         if x.shape[0] == 0:
             return down_output
@@ -624,7 +626,7 @@ class LoraManager:
         q = self.q_size_per_tp
         kv = self.kv_size_per_tp
         o_in = self.o_in_per_tp
-        i = self.intermediate_size
+        i = self.intermediate_per_tp
         n = self._n_slots
 
         for _ in range(self.n_layers):
@@ -643,15 +645,16 @@ class LoraManager:
             self.o_B_buffers.append(
                 torch.zeros((n, h, r), dtype=self.dtype, device=self.device)
             )
-            # ── MLP (un-sharded) ──────────────────────────────────────────
+            # ── MLP (TP-aware) ────────────────────────────────────────────
             # gate_up_A: stack gate/up along dim 1; both see the full input.
             self.gate_up_A_buffers.append(
                 torch.zeros((n, 2 * r, h), dtype=self.dtype, device=self.device)
             )
-            # gate_up_B: stack gate/up along dim 1, output dim per projection.
+            # gate_up_B: column-parallel — output sharded to ``intermediate_per_tp``.
             self.gate_up_B_buffers.append(
                 torch.zeros((n, 2 * i, r), dtype=self.dtype, device=self.device)
             )
+            # down_A: row-parallel — input sharded to ``intermediate_per_tp``.
             self.down_A_buffers.append(
                 torch.zeros((n, r, i), dtype=self.dtype, device=self.device)
             )
@@ -894,12 +897,12 @@ class LoraManager:
                 elif mod in ("gate_proj", "up_proj"):
                     gate_up_idx = 0 if mod == "gate_proj" else 1
                     rank_off = gate_up_idx * r
-                    out_off = gate_up_idx * self.intermediate_size
+                    out_off = gate_up_idx * self.intermediate_per_tp
                     self.gate_up_A_buffers[layer_id][
                         slot, rank_off : rank_off + r, :
                     ].copy_(lora_A_shard[:r])
                     self.gate_up_B_buffers[layer_id][
-                        slot, out_off : out_off + self.intermediate_size, :r
+                        slot, out_off : out_off + self.intermediate_per_tp, :r
                     ].copy_(lora_B_shard[:, :r])
                 else:  # down_proj
                     self.down_A_buffers[layer_id][slot, :r, :].copy_(lora_A_shard[:r])
@@ -949,20 +952,17 @@ class LoraManager:
         lora_A: torch.Tensor,
         lora_B: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # MLP modules run un-sharded in this codebase (qwen3 ``Qwen3MLP``
-        # builds the linears with tp_size=1).  No sharding for them.
-        if module in _PEFT_MLP_MODULES:
-            return lora_A, lora_B
         if self.tp_size == 1:
             return lora_A, lora_B
-        if module in ("q_proj", "k_proj", "v_proj"):
+        # Column-parallel (attn q/k/v, MLP gate/up): shard B along output dim.
+        if module in ("q_proj", "k_proj", "v_proj", "gate_proj", "up_proj"):
             out_total = lora_B.shape[0]
             out_per = out_total // self.tp_size
             return (
                 lora_A,
                 lora_B[self.tp_rank * out_per : (self.tp_rank + 1) * out_per],
             )
-        # row-parallel o_proj: shard A along input dim
+        # Row-parallel (attn o_proj, MLP down_proj): shard A along input dim.
         in_total = lora_A.shape[1]
         in_per = in_total // self.tp_size
         return (
