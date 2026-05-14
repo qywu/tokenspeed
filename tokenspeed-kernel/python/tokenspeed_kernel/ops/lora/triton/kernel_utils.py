@@ -18,6 +18,12 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+"""Shared Triton helpers for the LoRA segmented matmul kernels.
+
+Adapted from sglang ``python/sglang/srt/lora/triton_ops/kernel_utils.py``
+(Apache-2.0): https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/lora/triton_ops/kernel_utils.py.
+"""
+
 from tokenspeed_kernel._triton import tl, triton
 
 

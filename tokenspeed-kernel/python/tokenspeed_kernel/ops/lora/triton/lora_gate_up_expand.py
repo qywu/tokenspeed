@@ -25,14 +25,18 @@ The MLP gate_up linear is fused into a single matmul with output layout
 This kernel packs the two B projections into one launch: each program
 instance picks ``gate`` (axis=1, id=0) or ``up`` (id=1) and writes its
 tile into the matching half of the fused output.
+
+Adapted from sglang ``python/sglang/srt/lora/triton_ops/gate_up_lora_b.py``
+(Apache-2.0): https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/lora/triton_ops/gate_up_lora_b.py.
+Local changes: autotune + on-disk cache, constexpr ordering.
 """
 
 from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.ops.gemm.lora_triton.kernel_utils import _resolve_token_positions
-from tokenspeed_kernel.ops.gemm.lora_triton.tuning import load_kernel_cache
+from tokenspeed_kernel.ops.lora.triton.kernel_utils import _resolve_token_positions
+from tokenspeed_kernel.ops.lora.triton.tuning import load_kernel_cache
 
 _GATE_UP_EXPAND_CONFIGS = [
     triton.Config(

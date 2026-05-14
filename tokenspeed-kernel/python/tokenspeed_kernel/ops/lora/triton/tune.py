@@ -24,11 +24,11 @@ Builds synthetic ``LoraBatchInfo`` batches for a few representative
 segment shapes, calls each kernel once (triggering ``triton.autotune``
 to benchmark all candidate configs and pick the fastest per ``(N, K)``
 key), and then writes the picked configs to JSON via
-:func:`tokenspeed_kernel.ops.gemm.lora_triton.tuning.save_kernel_cache`.
+:func:`tokenspeed_kernel.ops.lora.triton.tuning.save_kernel_cache`.
 
 Usage::
 
-    python -m tokenspeed_kernel.ops.gemm.lora_triton.tune \\
+    python -m tokenspeed_kernel.ops.lora.triton.tune \\
         --hidden 4096 --intermediate 12288 \\
         --q-per-tp 2048 --kv-per-tp 1024 \\
         --rank 16 --max-rank 64 --tp-size 2
@@ -45,23 +45,23 @@ import logging
 from dataclasses import dataclass
 
 import torch
-from tokenspeed_kernel.ops.gemm.lora_triton.lora_expand import (
+from tokenspeed_kernel.ops.lora.triton.lora_expand import (
     _lora_expand_kernel,
     lora_expand_fwd,
 )
-from tokenspeed_kernel.ops.gemm.lora_triton.lora_gate_up_expand import (
+from tokenspeed_kernel.ops.lora.triton.lora_gate_up_expand import (
     _lora_gate_up_expand_kernel,
     lora_gate_up_expand_fwd,
 )
-from tokenspeed_kernel.ops.gemm.lora_triton.lora_qkv_expand import (
+from tokenspeed_kernel.ops.lora.triton.lora_qkv_expand import (
     _lora_qkv_expand_kernel,
     lora_qkv_expand_fwd,
 )
-from tokenspeed_kernel.ops.gemm.lora_triton.lora_shrink import (
+from tokenspeed_kernel.ops.lora.triton.lora_shrink import (
     _lora_shrink_kernel,
     lora_shrink_fwd,
 )
-from tokenspeed_kernel.ops.gemm.lora_triton.tuning import save_kernel_cache
+from tokenspeed_kernel.ops.lora.triton.tuning import save_kernel_cache
 
 logger = logging.getLogger(__name__)
 

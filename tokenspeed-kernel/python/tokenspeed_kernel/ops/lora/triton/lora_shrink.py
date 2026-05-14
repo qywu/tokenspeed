@@ -29,14 +29,22 @@ the output rows untouched.  Higher slots may have varying real ranks up to
 and ``output[..., rank * stack_num:]`` is irrelevant — the consumer
 (``lora_expand`` / ``lora_qkv_expand``) reads only the first ``rank * stack_num``
 columns.
+
+Adapted from sglang ``python/sglang/srt/lora/triton_ops/sgemm_lora_a.py``
+(Apache-2.0): https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/lora/triton_ops/sgemm_lora_a.py.
+sglang's kernel is in turn descended from the Punica S-LoRA design
+(https://github.com/punica-ai/punica).  Local changes: ported to
+``tokenspeed_kernel._triton``, added ``@triton.autotune`` over the
+``(N, K)`` shape with an on-disk config cache, and reshuffled the
+constexpr params so block sizes come last.
 """
 
 from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.ops.gemm.lora_triton.kernel_utils import _resolve_token_positions
-from tokenspeed_kernel.ops.gemm.lora_triton.tuning import load_kernel_cache
+from tokenspeed_kernel.ops.lora.triton.kernel_utils import _resolve_token_positions
+from tokenspeed_kernel.ops.lora.triton.tuning import load_kernel_cache
 
 # Shrink kernel: N = stack_num * rank (tiny, 16–192), K = in_dim (large,
 # 4096+).  Decode-step segments are short (S = 1–32 per segment), so the
@@ -207,5 +215,5 @@ def lora_shrink_fwd(
 
 
 # Eager pre-population from disk happens lazily inside the autotuner cache
-# (see `tokenspeed_kernel.ops.gemm.lora_triton.__init__`).
+# (see `tokenspeed_kernel.ops.lora.triton.__init__`).
 load_kernel_cache(_lora_shrink_kernel)

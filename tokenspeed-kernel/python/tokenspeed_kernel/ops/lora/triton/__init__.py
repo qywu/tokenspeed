@@ -20,18 +20,22 @@
 
 """Triton kernels for segment-grouped LoRA matmuls.
 
-Adapted from sglang's S-LoRA / Punica style kernels.  Each batch is a
-sequence of segments where each segment uses a single adapter; the kernels
-fuse the per-segment GEMMs into a single launch and keep per-segment state
-(rank, scaling) on-device.
+Adapted from sglang ``python/sglang/srt/lora/triton_ops/`` (Apache-2.0):
+https://github.com/sgl-project/sglang/tree/main/python/sglang/srt/lora/triton_ops.
+sglang's kernels in turn descend from the Punica S-LoRA design
+(https://github.com/punica-ai/punica).  Each batch is a sequence of
+segments where each segment uses a single adapter; the kernels fuse the
+per-segment GEMMs into a single launch and keep per-segment state
+(rank, scaling) on-device.  See each kernel module for file-level
+provenance.
 """
 
-from tokenspeed_kernel.ops.gemm.lora_triton.lora_expand import lora_expand_fwd
-from tokenspeed_kernel.ops.gemm.lora_triton.lora_gate_up_expand import (
+from tokenspeed_kernel.ops.lora.triton.lora_expand import lora_expand_fwd
+from tokenspeed_kernel.ops.lora.triton.lora_gate_up_expand import (
     lora_gate_up_expand_fwd,
 )
-from tokenspeed_kernel.ops.gemm.lora_triton.lora_qkv_expand import lora_qkv_expand_fwd
-from tokenspeed_kernel.ops.gemm.lora_triton.lora_shrink import lora_shrink_fwd
+from tokenspeed_kernel.ops.lora.triton.lora_qkv_expand import lora_qkv_expand_fwd
+from tokenspeed_kernel.ops.lora.triton.lora_shrink import lora_shrink_fwd
 
 __all__ = [
     "lora_shrink_fwd",

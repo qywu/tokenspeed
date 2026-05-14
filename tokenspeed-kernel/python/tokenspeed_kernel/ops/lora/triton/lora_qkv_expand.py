@@ -25,14 +25,18 @@ The QKV linear is fused into a single matmul with output layout
 projections into one launch: each program instance picks ``q``, ``k``, or
 ``v`` via ``program_id(1)`` and writes its tile into the matching slice of
 the fused output.
+
+Adapted from sglang ``python/sglang/srt/lora/triton_ops/qkv_lora_b.py``
+(Apache-2.0): https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/lora/triton_ops/qkv_lora_b.py.
+Local changes: autotune + on-disk cache, constexpr ordering.
 """
 
 from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.ops.gemm.lora_triton.kernel_utils import _resolve_token_positions
-from tokenspeed_kernel.ops.gemm.lora_triton.tuning import load_kernel_cache
+from tokenspeed_kernel.ops.lora.triton.kernel_utils import _resolve_token_positions
+from tokenspeed_kernel.ops.lora.triton.tuning import load_kernel_cache
 
 _QKV_EXPAND_CONFIGS = [
     triton.Config(

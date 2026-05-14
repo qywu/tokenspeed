@@ -18,14 +18,21 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Segmented LoRA-B matmul (expand: r → out_dim) with fused scale + add."""
+"""Segmented LoRA-B matmul (expand: r → out_dim) with fused scale + add.
+
+Adapted from sglang ``python/sglang/srt/lora/triton_ops/sgemm_lora_b.py``
+(Apache-2.0): https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/lora/triton_ops/sgemm_lora_b.py.
+sglang's kernel is descended from the Punica S-LoRA design
+(https://github.com/punica-ai/punica).  Local changes mirror those in
+``lora_shrink.py`` (autotune + on-disk cache, constexpr ordering).
+"""
 
 from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.ops.gemm.lora_triton.kernel_utils import _resolve_token_positions
-from tokenspeed_kernel.ops.gemm.lora_triton.tuning import load_kernel_cache
+from tokenspeed_kernel.ops.lora.triton.kernel_utils import _resolve_token_positions
+from tokenspeed_kernel.ops.lora.triton.tuning import load_kernel_cache
 
 # Expand kernel: N = out_dim (large, 4096+), K = max_rank (tiny, 16–64).
 # Tile space targets "large N, small K, small S".  Mirrors sglang's
