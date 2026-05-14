@@ -171,7 +171,7 @@ class EventLoop:
         has_mamba = getattr(self.model_config, "mambaish_config", None) is not None or (
             text_config is not None and hasattr(text_config, "mamba2_cache_params")
         )
-        enable_mamba_radix_cache = has_mamba and server_args.enable_prefix_caching
+
         model_executor_config = ModelExecutorConfig.from_server_args(
             server_args=server_args,
             model_config=self.model_config,
@@ -265,13 +265,17 @@ class EventLoop:
             EventPublisherFactory.is_enabled(server_args.kv_events_config)
             and attn_tp_rank == 0
         )
-        if enable_mamba_radix_cache and server_args.max_mamba_cache_size is None:
+
+        if has_mamba and server_args.max_mamba_cache_size is None:
             logger.info(
                 f"Mamba radix cache enabled without explicit max_mamba_cache_size. "
                 f"Auto-derived mamba_pool_total_chunks={mamba_pool_total_chunks} "
                 f"(ratio={server_args.mamba_full_memory_ratio})."
             )
 
+        enable_mixed_prefill_decode = (
+            server_args.enable_mixed_batch and server_args.speculative_algorithm is None
+        )
         scheduler_cfg = make_config(
             num_device_pages=self.max_total_num_tokens // server_args.block_size,
             max_scheduled_tokens=server_args.chunked_prefill_size,
@@ -289,16 +293,17 @@ class EventLoop:
                 else 1
             ),
             disable_prefix_cache=not server_args.enable_prefix_caching,
-            enable_mamba=enable_mamba_radix_cache,
+            enable_mamba=has_mamba,
             mamba_cache_chunk_size=server_args.mamba_cache_chunk_size,
             mamba_pool_total_chunks=mamba_pool_total_chunks,
             paged_cache_groups=pool_to_paged_cache_groups(token_to_kv_pool),
+            enable_mixed_prefill_decode=enable_mixed_prefill_decode,
         )
         logger.info(
             "Scheduler config: page_size=%s num_device_pages=%s "
             "max_scheduled_tokens=%s decode_input_tokens=%s disable_l2_cache=%s "
             "max_batch_size=%s (global max_num_seqs=%s, dp_size=%s) "
-            "num_mamba_slots=%s",
+            "mamba_pool_total_chunks=%s enable_mamba=%s",
             scheduler_cfg.page_size,
             scheduler_cfg.num_device_pages,
             scheduler_cfg.max_scheduled_tokens,
@@ -308,6 +313,7 @@ class EventLoop:
             server_args.max_num_seqs,
             self.dp_size,
             mamba_pool_total_chunks,
+            has_mamba,
         )
         self.scheduler = Scheduler(scheduler_cfg)
         if attn_tp_rank == 0:
@@ -876,8 +882,10 @@ class EventLoop:
         on_first_token=None,
     ):
         self.request_handler.forward_ct += 1
-        forward_mode = (
-            ForwardMode.EXTEND if forward_op.num_extends() > 0 else ForwardMode.DECODE
+        forward_mode = ForwardMode.from_num_extends(
+            forward_op.num_extends(),
+            len(forward_op.request_ids),
+            has_drafter=self.server_args.speculative_algorithm is not None,
         )
         self.request_handler._profile_batch_predicate(forward_mode)
 
@@ -950,12 +958,12 @@ class EventLoop:
         batch_size = len(forward_op.request_ids) if forward_op is not None else 0
         if forward_op is None:
             forward_mode = ForwardMode.IDLE
-        elif forward_op.num_extends() > 0:
-            forward_mode = ForwardMode.EXTEND
-        elif self.server_args.speculative_algorithm is not None:
-            forward_mode = ForwardMode.TARGET_VERIFY
         else:
-            forward_mode = ForwardMode.DECODE
+            forward_mode = ForwardMode.from_num_extends(
+                forward_op.num_extends(),
+                batch_size,
+                has_drafter=self.server_args.speculative_algorithm is not None,
+            )
 
         self._dp_local_info[0, 0] = num_tokens
         self._dp_local_info[0, 1] = batch_size

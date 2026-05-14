@@ -33,15 +33,17 @@ HybridPrefixCache::HybridPrefixCache(KVPrefixCache& kv_prefix_cache, MambaChunkA
       mamba_eviction_manager_{mamba_allocator},
       mamba_cache_chunk_size_{mamba_cache_chunk_size} {}
 
-MatchResult HybridPrefixCache::Match(const token_vec_t& token_ids, std::int32_t lora_id) {
-    auto match = kv_prefix_cache_.Match(token_ids, lora_id);
+// The HybridPrefixCache::Match is a wrapper of the KVPrefixCache::Match.
+// And it's not used in fact, because the HybridPrefixCache is always used with the KVPrefixCache now.
+MatchResult HybridPrefixCache::Match(const token_vec_t& token_ids, std::int32_t lora_id, MatchIntent intent) {
+    auto match = kv_prefix_cache_.Match(token_ids, lora_id, intent);
     augmentMatch(match);
     return match;
 }
 
 MatchResult HybridPrefixCache::Match(const std::vector<std::span<const std::int32_t>>& token_pages,
-                                     std::int32_t lora_id) {
-    auto match = kv_prefix_cache_.Match(token_pages, lora_id);
+                                     std::int32_t lora_id, MatchIntent intent) {
+    auto match = kv_prefix_cache_.Match(token_pages, lora_id, intent);
     augmentMatch(match);
     return match;
 }
@@ -93,8 +95,8 @@ TreeNode* HybridPrefixCache::FindLastMambaNode(TreeNode* from) const {
     return nullptr;
 }
 
-bool HybridPrefixCache::EnsureMambaCapacityByEvict(std::int32_t num_slots) {
-    return mamba_eviction_manager_.EnsureCapacity(num_slots);
+bool HybridPrefixCache::EnsureMambaCapacityByEvict(std::int32_t num_slots, TreeNode* protected_node) {
+    return mamba_eviction_manager_.EnsureCapacity(num_slots, protected_node);
 }
 
 void HybridPrefixCache::InsertMamba(TreeNode* terminal_node, std::unique_ptr<MambaSlot> slot) {

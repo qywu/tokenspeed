@@ -23,14 +23,29 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import signal
 import sys
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.join(REPO_ROOT, "python"))
+
 from tokenspeed.cli._argsplit import OrchestratorOpts
-from tokenspeed.cli.serve_smg import run_smg
+from tokenspeed.cli.serve_smg import (
+    _DEFAULT_SMG_DISABLE_FLAGS,
+    _gateway_args_with_default_log_level,
+    _gateway_args_with_default_port,
+    _gateway_args_with_default_reasoning_parser,
+    _gateway_args_with_defaults,
+    _gateway_args_with_smg_disable_defaults,
+    _prewarm_hf_tokenizer,
+    _user_host_port_from_gateway_args,
+    _user_model_id,
+    run_smg,
+)
 
 
 def _make_proc(returncode: int | None = None) -> MagicMock:
@@ -44,6 +59,143 @@ def _make_proc(returncode: int | None = None) -> MagicMock:
     proc.kill = MagicMock()
     proc.wait = AsyncMock(return_value=returncode if returncode is not None else 0)
     return proc
+
+
+def test_gateway_args_default_port_is_8000():
+    gateway_args = _gateway_args_with_default_port(["--model", "/tmp/x"])
+
+    assert gateway_args == ["--model", "/tmp/x", "--port", "8000"]
+    assert _user_host_port_from_gateway_args(gateway_args) == ("0.0.0.0", 8000)
+
+
+def test_gateway_args_preserve_user_port():
+    gateway_args = _gateway_args_with_default_port(["--port", "8413"])
+
+    assert gateway_args == ["--port", "8413"]
+    assert _user_host_port_from_gateway_args(gateway_args) == ("0.0.0.0", 8413)
+
+
+def test_gateway_args_default_reasoning_parser_is_none():
+    gateway_args = _gateway_args_with_default_reasoning_parser(["--model", "/tmp/x"])
+
+    assert gateway_args == ["--model", "/tmp/x", "--reasoning-parser", "none"]
+
+
+def test_gateway_args_preserve_user_reasoning_parser():
+    gateway_args = _gateway_args_with_default_reasoning_parser(
+        ["--reasoning-parser", "qwen3"]
+    )
+
+    assert gateway_args == ["--reasoning-parser", "qwen3"]
+
+
+def test_gateway_args_defaults_include_port_and_reasoning_parser():
+    gateway_args = _gateway_args_with_defaults(["--model", "/tmp/x"])
+
+    assert gateway_args == [
+        "--model",
+        "/tmp/x",
+        "--port",
+        "8000",
+        "--reasoning-parser",
+        "none",
+        "--disable-circuit-breaker",
+        "--disable-retries",
+        "--log-level",
+        "warn",
+    ]
+
+
+def test_gateway_args_default_log_level_is_warn():
+    gateway_args = _gateway_args_with_default_log_level(["--model", "/tmp/x"])
+
+    assert gateway_args == ["--model", "/tmp/x", "--log-level", "warn"]
+
+
+def test_gateway_args_preserve_user_log_level():
+    gateway_args = _gateway_args_with_default_log_level(["--log-level", "debug"])
+
+    assert gateway_args == ["--log-level", "debug"]
+
+
+def test_smg_disable_flags_appended_when_absent():
+    gateway_args = _gateway_args_with_smg_disable_defaults(["--model", "/tmp/x"])
+
+    assert gateway_args == [
+        "--model",
+        "/tmp/x",
+        "--disable-circuit-breaker",
+        "--disable-retries",
+    ]
+
+
+def test_smg_disable_flags_not_duplicated():
+    """Idempotent: passing the flag explicitly must not double it up for smg's argparse."""
+    gateway_args = _gateway_args_with_smg_disable_defaults(
+        ["--disable-circuit-breaker"]
+    )
+
+    assert gateway_args == [
+        "--disable-circuit-breaker",
+        "--disable-retries",
+    ]
+
+
+def test_smg_disable_flag_set_covers_both():
+    assert _DEFAULT_SMG_DISABLE_FLAGS == (
+        "--disable-circuit-breaker",
+        "--disable-retries",
+    )
+
+
+def test_user_model_id_extracts_value():
+    assert (
+        _user_model_id(["--model", "nvidia/Qwen3.5-397B-A17B-NVFP4", "--port", "8000"])
+        == "nvidia/Qwen3.5-397B-A17B-NVFP4"
+    )
+
+
+def test_user_model_id_returns_none_when_absent():
+    assert _user_model_id(["--port", "8000"]) is None
+
+
+def test_user_model_id_returns_none_when_model_lacks_value():
+    assert _user_model_id(["--model"]) is None
+
+
+def test_prewarm_skips_local_path(tmp_path):
+    with patch(
+        "huggingface_hub.snapshot_download", side_effect=AssertionError("must not call")
+    ) as sd:
+        _prewarm_hf_tokenizer(str(tmp_path))
+    sd.assert_not_called()
+
+
+def test_prewarm_skips_empty():
+    with patch("huggingface_hub.snapshot_download") as sd:
+        _prewarm_hf_tokenizer("")
+    sd.assert_not_called()
+
+
+def test_prewarm_fetches_tokenizer_artifacts_for_hf_id():
+    with patch("huggingface_hub.snapshot_download") as sd:
+        _prewarm_hf_tokenizer("nvidia/Qwen3.5-397B-A17B-NVFP4")
+    sd.assert_called_once()
+    _, kwargs = sd.call_args
+    assert kwargs["repo_id"] == "nvidia/Qwen3.5-397B-A17B-NVFP4"
+    # Patterns must include tokenizer.json and the surrounding JSON configs;
+    # avoid pulling weight files (no `*.safetensors` etc.).
+    patterns = set(kwargs["allow_patterns"])
+    assert "tokenizer*" in patterns
+    assert "*.json" in patterns
+
+
+def test_prewarm_swallows_download_errors():
+    with patch(
+        "huggingface_hub.snapshot_download", side_effect=RuntimeError("HF down")
+    ):
+        # Must not raise — smg's own retry path is the fallback.
+        _prewarm_hf_tokenizer("nvidia/Qwen3.5-397B-A17B-NVFP4")
 
 
 @pytest.mark.asyncio

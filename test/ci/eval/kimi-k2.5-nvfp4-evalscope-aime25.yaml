@@ -19,7 +19,6 @@ server:
     --tp 4
     --max-model-len 80000
     --trust-remote-code
-    --reasoning-parser none
     --attention-backend tokenspeed_mla
     --moe-backend flashinfer_trtllm
     --quantization nvfp4
@@ -33,7 +32,7 @@ server:
     --host 127.0.0.1
     --port 8000
   ready:
-    url: http://127.0.0.1:8000/health
+    url: http://127.0.0.1:8000/readiness
     timeout: 1800
     interval: 10
 eval:

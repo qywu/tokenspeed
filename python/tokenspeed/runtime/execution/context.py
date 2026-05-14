@@ -60,6 +60,7 @@ class ForwardContext:
 
     # --- logits processor ---
     keep_full_logits: bool = False
+    last_index_offsets: torch.Tensor | None = None
 
     # --- LoRA ---
     # Reference to the LoraManager.  When set, forward layers call

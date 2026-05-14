@@ -47,7 +47,8 @@ using KvEventSink = std::function<void(KvCacheEvent)>;
 
 class KVPrefixCache {
 public:
-    KVPrefixCache(PageAllocator* device_allocator, PageAllocator* host_allocator, bool enable_l3_storage = false);
+    KVPrefixCache(PageAllocator* device_allocator, PageAllocator* host_allocator, bool enable_l3_storage = false,
+                  bool disable_prefix_cache = false);
 
     void SetKvEventSink(KvEventSink sink);
 
@@ -55,8 +56,13 @@ public:
     // lora_id > 0          → adapter namespace; a per-adapter virtual root is
     //                        created on demand so same-adapter requests share the
     //                        prefix cache while cross-adapter requests never collide.
-    MatchResult Match(const token_vec_t& token_ids, std::int32_t lora_id = kLoraNone);
-    MatchResult Match(const std::vector<std::span<const std::int32_t>>& token_pages, std::int32_t lora_id = kLoraNone);
+    // intent: PrefixReuse honours disable_prefix_cache_ (returns empty match);
+    //         StateRecovery always walks the tree (used to recover state for
+    //         retracted requests even when prefix caching is disabled).
+    MatchResult Match(const token_vec_t& token_ids, std::int32_t lora_id = kLoraNone,
+                      MatchIntent intent = MatchIntent::PrefixReuse);
+    MatchResult Match(const std::vector<std::span<const std::int32_t>>& token_pages,
+                      std::int32_t lora_id = kLoraNone, MatchIntent intent = MatchIntent::PrefixReuse);
 
     template <ResourceType RType>
     InsertResult Insert(const token_vec_t& token_ids, const std::vector<std::int32_t>& prefix_pages,
@@ -95,6 +101,8 @@ public:
     void EvictLoraNamespace(std::int32_t lora_id);
 
 private:
+    MatchResult RootMatch() const;
+
     template <ResourceType RType>
     void pruneEvicted(const std::vector<TreeNode*>& evicted);
 
@@ -131,6 +139,7 @@ private:
     std::unordered_map<std::int32_t, TreeNode*> lora_virtual_roots_;
     KvEventSink kv_event_sink_{};
     std::unordered_set<std::uint64_t> published_device_blocks_;
+    bool disable_prefix_cache_{false};
 };
 
 }  // namespace tokenspeed

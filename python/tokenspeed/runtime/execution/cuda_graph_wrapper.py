@@ -249,13 +249,13 @@ class CudaGraphWrapper:
             try:
                 draft_attn_backend.init_cuda_graph_state(
                     self.max_bs,
-                    self.drafter.draft_seq_lens,
+                    self.drafter.draft_seq_lens_buf,
                     paged_cache_group_specs=draft_paged_cache_group_specs,
                     max_tokens_per_req=self.max_tokens_per_req,
                 )
             except TypeError:
                 draft_attn_backend.init_cuda_graph_state(
-                    self.max_bs, self.drafter.draft_seq_lens
+                    self.max_bs, self.drafter.draft_seq_lens_buf
                 )
 
         self.graphs: dict[int, torch.cuda.CUDAGraph] = {}
@@ -585,6 +585,7 @@ class CudaGraphWrapper:
     def _init_replay_metadata(
         self,
         padded_bs: int,
+        actual_bs: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         req_to_page: torch.Tensor,
@@ -601,7 +602,7 @@ class CudaGraphWrapper:
             "uses_paged_cache_groups",
             False,
         ):
-            actual_bs = next(
+            table_bs = next(
                 (
                     int(table.shape[0])
                     for table in paged_cache_block_tables.values()
@@ -611,7 +612,7 @@ class CudaGraphWrapper:
             )
             paged_cache_block_tables = self._pad_block_tables_to_padded_bs(
                 paged_cache_block_tables,
-                actual_bs=actual_bs,
+                actual_bs=table_bs,
                 padded_bs=padded_bs,
             )
             kwargs["paged_cache_block_tables"] = paged_cache_block_tables
@@ -624,6 +625,8 @@ class CudaGraphWrapper:
                 kwargs["paged_cache_block_table_base_offsets"] = (
                     paged_cache_block_table_base_offsets
                 )
+        if getattr(self.attn_backend, "uses_padded_decode_token_mask", False):
+            kwargs["actual_bs"] = actual_bs
         self.attn_backend.init_forward_metadata_replay_cuda_graph(
             padded_bs,
             req_pool_indices,
@@ -824,6 +827,7 @@ class CudaGraphWrapper:
                 )
             self._init_replay_metadata(
                 padded_bs,
+                bs,
                 req_pool_indices,
                 seq_lens,
                 req_to_page=req_to_page,
@@ -883,6 +887,7 @@ class CudaGraphWrapper:
                 extend_prefix_lens_cpu=extend_prefix_lens_cpu,
                 extend_seq_lens=extend_seq_lens,
                 extend_seq_lens_cpu=extend_seq_lens_cpu,
+                num_extends=ctx.num_extends,
                 positions=positions,
                 out_cache_loc=out_cache_loc,
                 global_num_tokens=ctx.global_num_tokens,
