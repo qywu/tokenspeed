@@ -61,7 +61,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 
 import torch
-from tokenspeed_kernel.ops.gemm.lora_triton import (
+from tokenspeed_kernel.ops.lora.triton import (
     lora_expand_fwd,
     lora_gate_up_expand_fwd,
     lora_qkv_expand_fwd,
