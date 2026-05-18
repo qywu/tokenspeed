@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING
 
 import torch
 from tokenspeed_kernel import (
+    mha_decode_scheduler_metadata,
     mha_decode_with_kvcache,
     mha_prefill,
     mha_prefill_with_kvcache,
@@ -90,8 +91,6 @@ class MHAAttnBackend(AttentionBackend):
         self._tp_k_head_num = max(config.num_kv_heads // config.attn_tp_size, 1)
         self._head_dim = config.head_dim
         self._qkv_dtype = config.dtype
-        # Lazily imported so the backend stays importable without flash_attn.
-        self._get_scheduler_metadata = None
 
     def init_forward_metadata(
         self,
@@ -185,21 +184,11 @@ class MHAAttnBackend(AttentionBackend):
     ) -> torch.Tensor | None:
         """Pre-compute FA3 decode scheduler metadata once per step.
 
-        Returns ``None`` when flash_attn is unavailable; the kernel falls back
-        to its internal prepare_varlen_num_blocks launch in that case.
+        Returns ``None`` when the active backend does not consume pre-computed
+        scheduler metadata (only FA3 on Hopper does); the kernel then falls
+        back to its internal prepare_varlen_num_blocks launch.
         """
-        if self._get_scheduler_metadata is None:
-            try:
-                from flash_attn_interface import (  # noqa: WPS433
-                    get_scheduler_metadata,
-                )
-
-                self._get_scheduler_metadata = get_scheduler_metadata
-            except ImportError:
-                self._get_scheduler_metadata = False
-        if not self._get_scheduler_metadata:
-            return None
-        return self._get_scheduler_metadata(
+        return mha_decode_scheduler_metadata(
             batch_size=bs,
             max_seqlen_q=1,
             max_seqlen_k=self.max_context_len,
