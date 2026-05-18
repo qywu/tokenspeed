@@ -517,6 +517,14 @@ class ServerArgs:
                 int(x) for x in self.eagle3_layers_to_capture.split(",")
             ]
 
+        # Hoist the PD-decode runtime assert (topk == 1) to startup.
+        if self.speculative_algorithm is not None and self.speculative_eagle_topk != 1:
+            raise ValueError(
+                "speculative_eagle_topk > 1 (tree spec) is not currently "
+                f"supported: {self.speculative_eagle_topk=}. Only chain spec "
+                "(topk=1) is wired end-to-end."
+            )
+
     def resolve_communication(self):
         # Auto-enable allreduce fusion on supported single-node TP configurations.
         platform = current_platform()
@@ -1304,7 +1312,7 @@ class ServerArgs:
             type=str,
             default=ServerArgs.reasoning_parser,
             help=(
-                "Reasoning parser name (e.g. 'minimax', 'gpt-oss'). "
+                "Reasoning parser name (e.g. 'minimax', 'kimi_k25'). "
                 "Used to defer json_schema grammars past the model's "
                 "reasoning channel."
             ),
@@ -1383,7 +1391,7 @@ class ServerArgs:
             "--speculative-eagle-topk",
             type=int,
             help="The number of tokens sampled from the draft model in each speculative step.",
-            choices=[1, 2, 4, 8],
+            choices=[1],
             default=ServerArgs.speculative_eagle_topk,
         )
         parser.add_argument(
