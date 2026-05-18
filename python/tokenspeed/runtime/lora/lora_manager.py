@@ -62,11 +62,18 @@ from dataclasses import dataclass
 
 import torch
 from tokenspeed_kernel.ops.lora.triton import (
+    chunked_sgmv_expand_fwd,
     lora_expand_fwd,
     lora_gate_up_expand_fwd,
     lora_qkv_expand_fwd,
     lora_shrink_fwd,
 )
+
+# Segments longer than this use the prefill (chunked-SGMV) expand kernel,
+# which specialises strides and loop counts at compile time.  Shorter
+# segments (decode) use the decode-tuned kernels.  Threshold chosen from
+# benchmarks: chunked-SGMV wins above ~32 tokens/segment at rank ≥ 64.
+_CHUNKED_THRESHOLD = 32
 
 from tokenspeed.runtime.utils import get_colorful_logger
 
@@ -337,6 +344,20 @@ class LoraManager:
         )
         self._max_qkv_out_dim = max(self.q_size_per_tp, self.kv_size_per_tp)
 
+        # Slice-offset tensors for chunked_sgmv_expand_fwd (prefill path).
+        # Reuse _qkv_output_offset for QKV; allocate separate ones for the
+        # single-slice projections (o, down) and gate/up.
+        q, kv = self.q_size_per_tp, self.kv_size_per_tp
+        i = self.intermediate_per_tp
+        h = hidden
+        self._o_slice_offsets = torch.tensor([0, h], dtype=torch.int32, device=device)
+        self._gate_up_slice_offsets = torch.tensor(
+            [0, i, 2 * i], dtype=torch.int32, device=device
+        )
+        self._down_slice_offsets = torch.tensor(
+            [0, h], dtype=torch.int32, device=device
+        )
+
         self._alloc_gpu_buffers()
 
         logger.info(
@@ -506,14 +527,24 @@ class LoraManager:
         B_buf = self.qkv_B_buffers[layer_id]
         # lora_a: (s, 3 * max_rank)
         lora_a = lora_shrink_fwd(hidden_states, A_buf, bi, stack_num=3)
-        lora_qkv_expand_fwd(
-            lora_a,
-            B_buf,
-            bi,
-            self._qkv_output_offset,
-            self._max_qkv_out_dim,
-            base_output=qkv,
-        )
+        if bi.max_len > _CHUNKED_THRESHOLD:
+            chunked_sgmv_expand_fwd(
+                lora_a,
+                B_buf,
+                bi,
+                self._qkv_output_offset,
+                self._max_qkv_out_dim,
+                base_output=qkv,
+            )
+        else:
+            lora_qkv_expand_fwd(
+                lora_a,
+                B_buf,
+                bi,
+                self._qkv_output_offset,
+                self._max_qkv_out_dim,
+                base_output=qkv,
+            )
         return qkv
 
     def apply_o_lora(
@@ -547,7 +578,17 @@ class LoraManager:
         # lora_a (partial per rank): (s, max_rank).  No internal all-reduce —
         # the partial flows into B and the result rides the downstream sum.
         lora_a = lora_shrink_fwd(attn_output, A_buf, bi, stack_num=1)
-        lora_expand_fwd(lora_a, B_buf, bi, base_output=o_output)
+        if bi.max_len > _CHUNKED_THRESHOLD:
+            chunked_sgmv_expand_fwd(
+                lora_a,
+                B_buf,
+                bi,
+                self._o_slice_offsets,
+                self.hidden_size,
+                base_output=o_output,
+            )
+        else:
+            lora_expand_fwd(lora_a, B_buf, bi, base_output=o_output)
         return o_output
 
     def apply_gate_up_lora(
@@ -573,13 +614,23 @@ class LoraManager:
         B_buf = self.gate_up_B_buffers[layer_id]
         # lora_a: (s, 2 * max_rank) — gate's lora_a in [:, :r], up's in [:, r:].
         lora_a = lora_shrink_fwd(hidden_states, A_buf, bi, stack_num=2)
-        lora_gate_up_expand_fwd(
-            lora_a,
-            B_buf,
-            bi,
-            self.intermediate_per_tp,
-            base_output=gate_up,
-        )
+        if bi.max_len > _CHUNKED_THRESHOLD:
+            chunked_sgmv_expand_fwd(
+                lora_a,
+                B_buf,
+                bi,
+                self._gate_up_slice_offsets,
+                self.intermediate_per_tp,
+                base_output=gate_up,
+            )
+        else:
+            lora_gate_up_expand_fwd(
+                lora_a,
+                B_buf,
+                bi,
+                self.intermediate_per_tp,
+                base_output=gate_up,
+            )
         return gate_up
 
     def apply_down_lora(
@@ -610,7 +661,17 @@ class LoraManager:
         A_buf = self.down_A_buffers[layer_id]
         B_buf = self.down_B_buffers[layer_id]
         lora_a = lora_shrink_fwd(x, A_buf, bi, stack_num=1)
-        lora_expand_fwd(lora_a, B_buf, bi, base_output=down_output)
+        if bi.max_len > _CHUNKED_THRESHOLD:
+            chunked_sgmv_expand_fwd(
+                lora_a,
+                B_buf,
+                bi,
+                self._down_slice_offsets,
+                self.hidden_size,
+                base_output=down_output,
+            )
+        else:
+            lora_expand_fwd(lora_a, B_buf, bi, base_output=down_output)
         return down_output
 
     def set_adapter_scaling(self, name: str, scaling: float) -> None:
