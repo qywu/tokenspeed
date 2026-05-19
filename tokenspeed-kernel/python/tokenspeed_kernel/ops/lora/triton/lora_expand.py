@@ -103,7 +103,7 @@ def _lora_expand_kernel(
 
     s_offset = tl.arange(0, BLOCK_S) + pid_s * BLOCK_S
     n_offset = tl.arange(0, BLOCK_N) + pid_n * BLOCK_N
-    k_offset = tl.arange(0, BLOCK_K)
+    k_offset = tl.max_contiguous(tl.arange(0, BLOCK_K), BLOCK_K)
     s_physical = _resolve_token_positions(
         sorted_token_ids, seg_start, s_offset, seg_len, SORTED_BY_ADAPTER
     )
@@ -112,18 +112,22 @@ def _lora_expand_kernel(
         k_offset[:, None] * w_stride_2 + n_offset[None, :] * w_stride_1
     )
 
-    n_mask = n_offset[None, :] < N
+    s_mask = s_offset[:, None] < seg_len  # hoisted: loop-invariant
+    n_mask = n_offset[None, :] < N  # hoisted: loop-invariant (already was)
     partial_sum = tl.zeros((BLOCK_S, BLOCK_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_K)):
+        k_rem = K - k * BLOCK_K
         x_tile = tl.load(
             x_ptrs,
-            mask=(s_offset[:, None] < seg_len) & (k_offset[None, :] < K - k * BLOCK_K),
+            mask=s_mask & (k_offset[None, :] < k_rem),
             other=0.0,
+            eviction_policy="evict_first",
         )
         w_tile = tl.load(
             w_ptrs,
-            mask=(k_offset[:, None] < K - k * BLOCK_K) & n_mask,
+            mask=(k_offset[:, None] < k_rem) & n_mask,
             other=0.0,
+            eviction_policy="evict_last",
         )
         partial_sum += tl.dot(x_tile, w_tile)
 
@@ -135,7 +139,7 @@ def _lora_expand_kernel(
     output_ptr = output + (
         s_physical[:, None] * output_stride_0 + n_offset[None, :] * output_stride_1
     )
-    output_mask = (s_offset[:, None] < seg_len) & n_mask
+    output_mask = s_mask & n_mask
     partial_sum += tl.load(output_ptr, mask=output_mask, other=0.0)
     tl.store(output_ptr, partial_sum, mask=output_mask)
 

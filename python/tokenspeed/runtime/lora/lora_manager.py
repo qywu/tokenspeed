@@ -483,6 +483,8 @@ class LoraManager:
             )
         max_len = max(seg_lens_list) if seg_lens_list else 0
 
+        bi = self._batch_info
+
         # Stage on CPU then a single non-blocking H2D.
         self._seg_lens_cpu[:bs] = torch.as_tensor(seg_lens_list, dtype=torch.int32)
         self._weight_indices_cpu[:bs] = torch.as_tensor(
