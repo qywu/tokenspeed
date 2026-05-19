@@ -52,18 +52,20 @@ Tensor parallelism
 
 from __future__ import annotations
 
-import json
 import os
-import re
-import threading
 from collections import OrderedDict
-from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
 
 import torch
+from tokenspeed_kernel.ops.lora.cutedsl import (
+    lora_expand_batched_slots_cutedsl_fwd,
+    lora_expand_single_slot_cutedsl_fwd,
+    lora_gate_up_batched_slots_cutedsl_fwd,
+    lora_gate_up_single_slot_cutedsl_fwd,
+    lora_qkv_single_slot_cutedsl_fwd,
+)
 from tokenspeed_kernel.ops.lora.triton import (
-    lora_expand_decode_fwd,
     lora_expand_fwd,
+    lora_expand_grouped_v2_fwd,
     lora_expand_prefill_fwd,
     lora_gate_up_expand_fwd,
     lora_qkv_expand_fwd,
@@ -71,96 +73,544 @@ from tokenspeed_kernel.ops.lora.triton import (
     lora_shrink_prefill_fwd,
 )
 
+from tokenspeed.runtime.lora.adapter_io import (
+    PEFT_MODULES,
+    read_adapter_scaling,
+    resolve_adapter_weight_path,
+)
+from tokenspeed.runtime.lora.lora_batch import LoraBatchInfo, build_decode_lora_groups
+from tokenspeed.runtime.lora.lora_buffers import LoraWeightBuffers
+from tokenspeed.runtime.lora.lora_cache import LoraCpuCache
+from tokenspeed.runtime.lora.moe_lora import MoeLoraBuffers, MoeLoraContext
+from tokenspeed.runtime.utils import get_colorful_logger
+
 # Segments longer than this use the prefill (chunked-SGMV) expand kernel,
 # which specialises strides and loop counts at compile time.  Shorter
 # segments (decode) use the decode-tuned kernels.  Threshold chosen from
 # benchmarks: chunked-SGMV wins above ~32 tokens/segment at rank ≥ 64.
 _CHUNKED_THRESHOLD = 32
 
-from tokenspeed.runtime.utils import get_colorful_logger
+# The CuTeDSL single-slot expand path lowers LoRA-B expand to dense GEMM-adds.
+# Thresholds are based on H100 full-path measurements, including the Triton
+# shrink that still feeds the CuTeDSL expand.
+_CUTEDSL_SINGLE_SLOT_DECODE_MIN_OUT_DIM = 3072
+_CUTEDSL_SINGLE_SLOT_LOW_RANK_MIN_OUT_DIM = 1024
+_CUTEDSL_SINGLE_SLOT_PREFILL_MIN_OUT_DIM = 2048
+_CUTEDSL_SINGLE_SLOT_LOW_OUT_MIN_TOKENS = 256
+_CUTEDSL_SINGLE_SLOT_LOW_OUT_DECODE_MIN_TOKENS = 64
+_CUTEDSL_MULTI_SLOT_MIN_OUT_DIM = 3072
+_CUTEDSL_MULTI_SLOT_LOW_OUT_DIM = 2048
+_CUTEDSL_SINGLE_SLOT_SMALL_PREFILL_MIN_TOKENS = 128
+_CUTEDSL_SINGLE_SLOT_GATE_UP_SMALL_OUT_DIM = 1024
+_CUTEDSL_SINGLE_SLOT_GATE_UP_SMALL_MIN_TOKENS = 256
+_CUTEDSL_SINGLE_SLOT_GATE_UP_LOW_OUT_MIN_TOKENS = 512
+_CUTEDSL_GATE_UP_SMALL_OUT_DIM = 4096
+_CUTEDSL_GATE_UP_MEDIUM_OUT_DIM = 8192
+_CUTEDSL_GATE_UP_LARGE_OUT_DIM = 12288
+_TRITON_GROUPED_DECODE_MIN_GROUP_SIZE = 32
 
 logger = get_colorful_logger(__name__)
 
-_PEFT_ATTN_MODULES = ("q_proj", "k_proj", "v_proj", "o_proj")
-_PEFT_MLP_MODULES = ("gate_proj", "up_proj", "down_proj")
-
-
-# ── Batch info ──────────────────────────────────────────────────────────────
-
-
-@dataclass
-class LoraBatchInfo:
-    """Per-step segment metadata read by the Triton kernels.
-
-    All tensors live on the LoRA device.  When the captured CUDA graph
-    needs persistent storage (for in-place updates between replays), the
-    LoraManager pre-allocates these tensors with maximum sizes; runtime
-    fills the prefix and updates :attr:`bs` / :attr:`max_len`.
-    """
-
-    bs: int
-    num_segments: int
-    max_len: int
-    seg_lens: torch.Tensor  # (num_segments,) int32
-    seg_indptr: torch.Tensor  # (num_segments + 1,) int32
-    weight_indices: torch.Tensor  # (num_segments,) int32
-    lora_ranks: torch.Tensor  # (n_slots,) int32 (slot 0 ⇒ rank 0)
-    scalings: torch.Tensor  # (n_slots,) float32
-    permutation: torch.Tensor | None = None  # unused (no sort by adapter yet)
-    # Adapter-group metadata for lora_expand_decode_fwd (decode path only).
-    # Populated by prepare_loras when max_len == 1.
-    sort_order: torch.Tensor | None = None  # (bs,) int64
-    group_slots: torch.Tensor | None = None  # (num_groups,) int32
-    group_starts: torch.Tensor | None = None  # (num_groups,) int32
-    group_sizes: torch.Tensor | None = None  # (num_groups,) int32
-    num_groups: int = 0
-
-
-# ── Adapter file IO ─────────────────────────────────────────────────────────
-
-
-def _load_safetensors(path: str) -> dict[str, torch.Tensor]:
-    from safetensors import safe_open
-
-    tensors: dict[str, torch.Tensor] = {}
-    with safe_open(path, framework="pt", device="cpu") as f:
-        for key in f.keys():
-            tensors[key] = f.get_tensor(key)
-    return tensors
-
-
-def _parse_adapter_weights(
-    tensors: dict[str, torch.Tensor],
-) -> dict[int, dict[str, tuple[torch.Tensor, torch.Tensor]]]:
-    """``{layer_id: {module_name: (lora_A, lora_B)}}`` (CPU, fp32 from PEFT).
-
-    Matches both attention (``self_attn.{q,k,v,o}_proj``) and MLP
-    (``mlp.{gate,up,down}_proj``) modules.  Attention modules are stored
-    keyed by ``q_proj`` etc.; MLP modules by ``gate_proj`` etc.
-    """
-    pattern = re.compile(
-        r"base_model\.model\.model\.layers\.(\d+)\."
-        r"(?:self_attn|mlp)\."
-        r"(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)\."
-        r"lora_(A|B)\.weight"
-    )
-    weights: dict[int, dict[str, dict[str, torch.Tensor]]] = {}
-    for key, tensor in tensors.items():
-        m = pattern.match(key)
-        if not m:
-            continue
-        layer_id, module, ab = int(m.group(1)), m.group(2), m.group(3)
-        weights.setdefault(layer_id, {}).setdefault(module, {})[ab] = tensor
-
-    result: dict[int, dict[str, tuple[torch.Tensor, torch.Tensor]]] = {}
-    for layer_id, modules in weights.items():
-        result[layer_id] = {}
-        for module, ab_dict in modules.items():
-            result[layer_id][module] = (ab_dict["A"], ab_dict["B"])
-    return result
-
 
 # ── Manager ─────────────────────────────────────────────────────────────────
+
+
+def _use_cutedsl_single_slot_expand(
+    bi: LoraBatchInfo,
+    total_tokens: int,
+    out_dim: int,
+    lora_rank: int,
+    input_dim: int = 4096,
+) -> bool:
+    """Return whether the single-slot CuTeDSL expand is faster than Triton.
+
+    The dense CuTeDSL path wins for single-adapter prefill shapes once the
+    output tile and token count are large enough; smaller output tiles stay on
+    Triton.
+    """
+    if bi.single_lora_slot <= 0:
+        return False
+    if input_dim < 4096:
+        if input_dim < 3072:
+            if input_dim < 2048 and bi.max_len == 1:
+                if out_dim >= _CUTEDSL_SINGLE_SLOT_PREFILL_MIN_OUT_DIM:
+                    return (lora_rank >= 64 and total_tokens >= 64) or (
+                        lora_rank >= 32 and total_tokens >= 128
+                    )
+                return (
+                    out_dim >= _CUTEDSL_SINGLE_SLOT_LOW_RANK_MIN_OUT_DIM
+                    and lora_rank >= 64
+                    and total_tokens >= 128
+                )
+            if bi.max_len == 1:
+                if out_dim >= _CUTEDSL_SINGLE_SLOT_PREFILL_MIN_OUT_DIM:
+                    return lora_rank >= 64 and total_tokens >= 64
+                return (
+                    out_dim >= _CUTEDSL_SINGLE_SLOT_LOW_RANK_MIN_OUT_DIM
+                    and lora_rank >= 64
+                    and total_tokens >= 128
+                )
+            if bi.max_len <= _CHUNKED_THRESHOLD:
+                return False
+            if input_dim >= 1536 and input_dim < 2048:
+                if out_dim >= _CUTEDSL_SINGLE_SLOT_PREFILL_MIN_OUT_DIM:
+                    return (lora_rank >= 64 and total_tokens >= 512) or (
+                        lora_rank >= 32 and total_tokens >= 1024
+                    )
+                if out_dim >= _CUTEDSL_SINGLE_SLOT_LOW_RANK_MIN_OUT_DIM:
+                    return lora_rank >= 64 and total_tokens >= 512
+                return False
+            if out_dim >= _CUTEDSL_SINGLE_SLOT_PREFILL_MIN_OUT_DIM:
+                return lora_rank >= 64 and total_tokens >= 512
+            if out_dim >= _CUTEDSL_SINGLE_SLOT_LOW_RANK_MIN_OUT_DIM:
+                return lora_rank >= 64 and total_tokens >= 1024
+            return False
+        if bi.max_len == 1:
+            if out_dim < _CUTEDSL_SINGLE_SLOT_PREFILL_MIN_OUT_DIM:
+                return (
+                    out_dim >= _CUTEDSL_SINGLE_SLOT_LOW_RANK_MIN_OUT_DIM
+                    and lora_rank >= 64
+                    and total_tokens >= 64
+                )
+            return (lora_rank >= 64 and total_tokens >= 32) or (
+                lora_rank >= 16 and total_tokens >= 128
+            )
+        if bi.max_len <= _CHUNKED_THRESHOLD:
+            return False
+        if out_dim >= _CUTEDSL_SINGLE_SLOT_PREFILL_MIN_OUT_DIM:
+            return lora_rank >= 16 and total_tokens >= 512
+        if out_dim >= _CUTEDSL_SINGLE_SLOT_LOW_RANK_MIN_OUT_DIM:
+            return lora_rank >= 64 and total_tokens >= 512
+        return False
+    if bi.max_len == 1:
+        if out_dim >= _CUTEDSL_SINGLE_SLOT_DECODE_MIN_OUT_DIM:
+            if lora_rank > 8 and lora_rank < 32:
+                return total_tokens >= 64
+            return lora_rank >= 8 and total_tokens >= 32
+        if out_dim >= _CUTEDSL_SINGLE_SLOT_PREFILL_MIN_OUT_DIM:
+            if lora_rank >= 128:
+                return total_tokens >= 32
+            if lora_rank >= 32:
+                return total_tokens >= 64
+            if lora_rank >= 8 and out_dim == _CUTEDSL_SINGLE_SLOT_PREFILL_MIN_OUT_DIM:
+                return total_tokens >= 128
+            return lora_rank >= 16 and total_tokens >= 128
+        return (
+            out_dim >= _CUTEDSL_SINGLE_SLOT_LOW_RANK_MIN_OUT_DIM
+            and lora_rank >= 64
+            and total_tokens >= _CUTEDSL_SINGLE_SLOT_LOW_OUT_DECODE_MIN_TOKENS
+        )
+    if out_dim >= _CUTEDSL_SINGLE_SLOT_LOW_RANK_MIN_OUT_DIM and out_dim < (
+        _CUTEDSL_SINGLE_SLOT_PREFILL_MIN_OUT_DIM
+    ):
+        if input_dim >= 8192:
+            return bi.max_len > _CHUNKED_THRESHOLD and (
+                (lora_rank >= 16 and total_tokens >= 256)
+                or (lora_rank >= 8 and total_tokens >= 512)
+            )
+        return bi.max_len > _CHUNKED_THRESHOLD and (
+            (
+                lora_rank >= 64
+                and total_tokens >= _CUTEDSL_SINGLE_SLOT_LOW_OUT_MIN_TOKENS
+            )
+            or (lora_rank >= 16 and total_tokens >= 512)
+            or (lora_rank >= 8 and total_tokens >= 1024)
+        )
+    if out_dim >= _CUTEDSL_SINGLE_SLOT_PREFILL_MIN_OUT_DIM:
+        if out_dim < _CUTEDSL_SINGLE_SLOT_DECODE_MIN_OUT_DIM:
+            return (
+                bi.max_len > _CHUNKED_THRESHOLD
+                and lora_rank >= 8
+                and total_tokens >= _CUTEDSL_SINGLE_SLOT_SMALL_PREFILL_MIN_TOKENS
+            )
+        return (
+            bi.max_len > _CHUNKED_THRESHOLD
+            and lora_rank >= 8
+            and total_tokens > _CHUNKED_THRESHOLD
+        )
+    return False
+
+
+def _use_cutedsl_multi_slot_expand(
+    bi: LoraBatchInfo,
+    total_tokens: int,
+    out_dim: int,
+    input_dim: int = 4096,
+) -> bool:
+    """Return whether equal-length consecutive multi-slot CuTeDSL should win."""
+    if input_dim < 4096:
+        if not (
+            input_dim >= 3072
+            and bi.multi_lora_start_slot > 0
+            and bi.max_len > _CHUNKED_THRESHOLD
+            and total_tokens > _CHUNKED_THRESHOLD
+        ):
+            return False
+        if (
+            bi.multi_lora_count == 4
+            and bi.multi_lora_segment_len >= 128
+            and bi.multi_lora_rank >= 32
+            and out_dim >= 4096
+        ):
+            return True
+        return (
+            bi.multi_lora_count >= 2
+            and bi.multi_lora_count <= 4
+            and out_dim >= 8192
+            and bi.multi_lora_rank >= 16
+            and bi.multi_lora_segment_len >= 128
+        )
+    if bi.multi_lora_start_slot <= 0:
+        return False
+    if bi.multi_lora_count < 2 or bi.multi_lora_count > 4:
+        return False
+    if out_dim < _CUTEDSL_MULTI_SLOT_LOW_OUT_DIM:
+        return False
+    if out_dim < 4096 and bi.multi_lora_rank < 64:
+        return False
+    if (
+        out_dim < _CUTEDSL_MULTI_SLOT_MIN_OUT_DIM
+        and bi.multi_lora_segment_len < 256
+        and not (bi.multi_lora_rank >= 64 and bi.multi_lora_segment_len >= 128)
+    ):
+        return False
+    return (
+        bi.max_len > _CHUNKED_THRESHOLD
+        and bi.multi_lora_rank >= 8
+        and total_tokens > _CHUNKED_THRESHOLD
+        and (
+            (bi.multi_lora_rank >= 64 and bi.multi_lora_segment_len >= 64)
+            or (
+                out_dim >= 8192
+                and bi.multi_lora_rank >= 16
+                and bi.multi_lora_segment_len >= 128
+            )
+            or bi.multi_lora_segment_len >= 256
+            or (bi.multi_lora_count >= 4 and bi.multi_lora_segment_len >= 128)
+        )
+    )
+
+
+def _use_cutedsl_single_slot_gate_up(
+    bi: LoraBatchInfo,
+    total_tokens: int,
+    output_dim: int,
+    lora_rank: int,
+    input_dim: int = 4096,
+) -> bool:
+    """Return whether the two-GEMM CuTeDSL gate/up path should beat Triton."""
+    if bi.single_lora_slot <= 0:
+        return False
+    if input_dim < 4096:
+        if input_dim < 3072:
+            if input_dim < 2048:
+                if bi.max_len == 1:
+                    if output_dim >= 2048:
+                        return (lora_rank >= 64 and total_tokens >= 64) or (
+                            lora_rank >= 32 and total_tokens >= 128
+                        )
+                    return (
+                        output_dim >= _CUTEDSL_SINGLE_SLOT_GATE_UP_SMALL_OUT_DIM
+                        and lora_rank >= 64
+                        and total_tokens >= 64
+                    )
+                if bi.max_len <= _CHUNKED_THRESHOLD:
+                    return False
+                if output_dim >= 2048:
+                    return lora_rank >= 64 and total_tokens >= 512
+                return (
+                    output_dim >= _CUTEDSL_SINGLE_SLOT_GATE_UP_SMALL_OUT_DIM
+                    and lora_rank >= 64
+                    and total_tokens >= 1024
+                )
+            if bi.max_len == 1:
+                if output_dim >= 2048:
+                    return lora_rank >= 64 and total_tokens >= 64
+                return (
+                    output_dim >= _CUTEDSL_SINGLE_SLOT_GATE_UP_SMALL_OUT_DIM
+                    and lora_rank >= 64
+                    and total_tokens >= 128
+                )
+            if bi.max_len <= _CHUNKED_THRESHOLD:
+                return False
+            return (
+                output_dim >= _CUTEDSL_SINGLE_SLOT_GATE_UP_SMALL_OUT_DIM
+                and lora_rank >= 64
+                and total_tokens >= 512
+            )
+        if bi.max_len == 1:
+            if output_dim >= _CUTEDSL_GATE_UP_SMALL_OUT_DIM:
+                return (lora_rank >= 64 and total_tokens >= 32) or (
+                    lora_rank >= 16 and total_tokens >= 64
+                )
+            if output_dim >= 2048:
+                return (lora_rank >= 64 and total_tokens >= 64) or (
+                    lora_rank >= 16 and total_tokens >= 128
+                )
+            if output_dim >= _CUTEDSL_SINGLE_SLOT_GATE_UP_SMALL_OUT_DIM:
+                return lora_rank >= 64 and total_tokens >= 64
+            return False
+        if bi.max_len <= _CHUNKED_THRESHOLD:
+            return False
+        if output_dim >= _CUTEDSL_GATE_UP_SMALL_OUT_DIM:
+            return (lora_rank >= 64 and total_tokens >= 256) or (
+                lora_rank >= 16 and total_tokens >= 512
+            )
+        if output_dim >= 2048:
+            return (lora_rank >= 64 and total_tokens >= 512) or (
+                lora_rank >= 16 and total_tokens >= 1024
+            )
+        if output_dim >= _CUTEDSL_SINGLE_SLOT_GATE_UP_SMALL_OUT_DIM:
+            return lora_rank >= 64 and total_tokens >= 512
+        return False
+    if bi.max_len == 1:
+        if output_dim >= _CUTEDSL_GATE_UP_SMALL_OUT_DIM:
+            return lora_rank >= 8 and total_tokens >= 32
+        if output_dim >= 2048:
+            if lora_rank >= 8 and total_tokens >= 64:
+                return True
+            if lora_rank >= 16 and total_tokens >= 64:
+                return True
+            return (lora_rank >= 64 and total_tokens >= 32) or (
+                lora_rank >= 32 and total_tokens >= 64
+            )
+        return output_dim >= _CUTEDSL_SINGLE_SLOT_GATE_UP_SMALL_OUT_DIM and (
+            (lora_rank >= 64 and total_tokens >= 32)
+            or (lora_rank >= 16 and total_tokens >= 128)
+        )
+    if bi.max_len <= _CHUNKED_THRESHOLD:
+        return False
+    if output_dim >= _CUTEDSL_GATE_UP_SMALL_OUT_DIM:
+        if output_dim >= _CUTEDSL_GATE_UP_LARGE_OUT_DIM:
+            return lora_rank >= 8 and total_tokens >= 64
+        if output_dim >= _CUTEDSL_GATE_UP_MEDIUM_OUT_DIM:
+            return lora_rank >= 8 and total_tokens >= 64
+        if lora_rank < 64:
+            return lora_rank >= 8 and total_tokens >= 256
+        return (lora_rank >= 64 and total_tokens >= 80) or (
+            lora_rank >= 8 and total_tokens >= 128
+        )
+    if output_dim >= _CUTEDSL_SINGLE_SLOT_GATE_UP_SMALL_OUT_DIM:
+        if output_dim < 2048:
+            return (lora_rank >= 64 and total_tokens >= 512) or (
+                lora_rank >= 8 and total_tokens >= 1024
+            )
+        if input_dim >= 8192 and lora_rank >= 8:
+            return total_tokens >= 256
+        if output_dim >= 3072 and lora_rank >= 8:
+            return total_tokens >= 256
+        return (
+            (lora_rank >= 64 and total_tokens >= 256)
+            or (lora_rank >= 16 and total_tokens >= 512)
+            or (lora_rank >= 8 and total_tokens >= 512)
+        )
+    return False
+
+
+def _use_cutedsl_single_slot_qkv(
+    bi: LoraBatchInfo,
+    total_tokens: int,
+    q_dim: int,
+    kv_dim: int,
+    lora_rank: int,
+    input_dim: int = 4096,
+) -> bool:
+    """Return whether the single-slot CuTeDSL QKV path should win."""
+    if bi.single_lora_slot <= 0:
+        return False
+    if input_dim < 4096:
+        if input_dim < 3072:
+            if input_dim < 2048:
+                if bi.max_len == 1:
+                    if lora_rank >= 64 and q_dim >= 4096 and kv_dim >= 512:
+                        return total_tokens >= 64
+                    if lora_rank == 32 and q_dim >= 4096 and kv_dim >= 512:
+                        if q_dim >= 8192 and kv_dim >= 1024:
+                            return total_tokens >= 64
+                        return total_tokens >= 96
+                    return (
+                        lora_rank == 16
+                        and q_dim >= 8192
+                        and kv_dim >= 1024
+                        and total_tokens >= 96
+                    )
+                if bi.max_len <= _CHUNKED_THRESHOLD:
+                    return False
+                if input_dim >= 1536 and input_dim < 2048:
+                    return (
+                        (
+                            lora_rank >= 64
+                            and q_dim >= 4096
+                            and kv_dim >= 512
+                            and total_tokens >= 1536
+                        )
+                        or (
+                            lora_rank >= 32
+                            and q_dim >= 4096
+                            and kv_dim >= 1024
+                            and total_tokens >= 3072
+                        )
+                        or (
+                            lora_rank >= 16
+                            and q_dim >= 8192
+                            and kv_dim >= 1024
+                            and total_tokens >= 3072
+                        )
+                    )
+                return (
+                    lora_rank >= 64
+                    and q_dim >= 4096
+                    and kv_dim >= 512
+                    and total_tokens >= 3072
+                ) or (
+                    lora_rank >= 16
+                    and q_dim >= 8192
+                    and kv_dim >= 1024
+                    and total_tokens >= 3072
+                )
+            if bi.max_len == 1:
+                if lora_rank >= 64 and q_dim >= 4096 and kv_dim >= 512:
+                    return total_tokens >= 64
+                if lora_rank == 32 and q_dim >= 4096 and kv_dim >= 512:
+                    if q_dim >= 8192 and kv_dim >= 1024:
+                        return total_tokens >= 64
+                    return total_tokens >= 96
+                return (
+                    lora_rank == 16
+                    and q_dim >= 8192
+                    and kv_dim >= 1024
+                    and total_tokens >= 96
+                )
+            if bi.max_len <= _CHUNKED_THRESHOLD:
+                return False
+            return (
+                (
+                    lora_rank >= 64
+                    and q_dim >= 4096
+                    and kv_dim >= 512
+                    and total_tokens >= 1536
+                )
+                or (
+                    lora_rank >= 32
+                    and q_dim >= 4096
+                    and kv_dim >= 1024
+                    and total_tokens >= 3072
+                )
+                or (
+                    lora_rank >= 16
+                    and q_dim >= 8192
+                    and kv_dim >= 1024
+                    and total_tokens >= 3072
+                )
+            )
+        if bi.max_len == 1:
+            if (
+                input_dim >= 3072
+                and lora_rank >= 64
+                and q_dim >= 4096
+                and kv_dim >= 512
+            ):
+                return total_tokens >= 64
+            if (
+                input_dim >= 3072
+                and lora_rank == 32
+                and q_dim >= 4096
+                and kv_dim >= 512
+            ):
+                return total_tokens >= 96
+            if (
+                input_dim >= 3072
+                and lora_rank == 16
+                and q_dim >= 4096
+                and kv_dim >= 512
+            ):
+                return total_tokens >= 128 or (
+                    q_dim >= 8192 and kv_dim >= 1024 and total_tokens >= 96
+                )
+            return False
+        return (
+            input_dim >= 3072
+            and bi.max_len > _CHUNKED_THRESHOLD
+            and (total_tokens >= 1536 if lora_rank >= 32 else total_tokens >= 3072)
+            and (
+                lora_rank >= 64
+                or (q_dim >= 8192 and kv_dim >= 1024 and lora_rank >= 32)
+                or (q_dim >= 8192 and kv_dim >= 1024 and lora_rank >= 16)
+            )
+        )
+    if q_dim < 4096 or kv_dim < 512:
+        return False
+    if bi.max_len == 1:
+        if lora_rank >= 64:
+            return total_tokens >= 32
+        if lora_rank >= 32:
+            if kv_dim < 1024:
+                if input_dim >= 8192:
+                    return total_tokens >= 96
+                return total_tokens >= 128
+            return total_tokens >= 64
+        if lora_rank >= 16:
+            if kv_dim < 1024:
+                return total_tokens >= 96
+            return q_dim >= 8192 or total_tokens >= 96
+        return False
+    if bi.max_len <= _CHUNKED_THRESHOLD:
+        return False
+    if lora_rank >= 64:
+        return total_tokens >= 1536
+    return (
+        (q_dim >= 8192 and kv_dim >= 1024 and lora_rank >= 32 and total_tokens >= 1536)
+        or (
+            q_dim >= 4096
+            and kv_dim >= 512
+            and lora_rank >= 32
+            and total_tokens >= (1536 if input_dim >= 8192 else 3072)
+        )
+        or (
+            q_dim >= 8192
+            and kv_dim >= 1024
+            and lora_rank >= 16
+            and total_tokens >= (1536 if input_dim >= 8192 else 3072)
+        )
+    )
+
+
+def _use_cutedsl_multi_slot_gate_up(
+    bi: LoraBatchInfo,
+    total_tokens: int,
+    output_dim: int,
+) -> bool:
+    """Return whether equal-length consecutive multi-slot gate/up should win."""
+    if bi.multi_lora_start_slot <= 0:
+        return False
+    if bi.multi_lora_count < 2 or bi.multi_lora_count > 4:
+        return False
+    if bi.max_len <= _CHUNKED_THRESHOLD or total_tokens <= _CHUNKED_THRESHOLD:
+        return False
+    if bi.multi_lora_rank < 64:
+        return False
+    if output_dim >= _CUTEDSL_GATE_UP_LARGE_OUT_DIM:
+        return bi.multi_lora_segment_len >= 256 or (
+            bi.multi_lora_count >= 4 and bi.multi_lora_segment_len >= 128
+        )
+    if output_dim >= _CUTEDSL_GATE_UP_MEDIUM_OUT_DIM:
+        if bi.multi_lora_rank >= 128 and bi.multi_lora_segment_len >= 128:
+            return True
+        return bi.multi_lora_segment_len >= 256 or (
+            bi.multi_lora_count >= 4 and bi.multi_lora_segment_len >= 128
+        )
+    if output_dim >= _CUTEDSL_GATE_UP_SMALL_OUT_DIM:
+        return bi.multi_lora_rank >= 128 and bi.multi_lora_segment_len >= 256
+    return False
+
+
+def _use_triton_grouped_decode(bi: LoraBatchInfo) -> bool:
+    """Return whether grouped Triton decode expand should beat basic decode."""
+    return (
+        bi.single_lora_slot <= 0
+        and bi.num_groups > 0
+        and bi.bs // bi.num_groups >= _TRITON_GROUPED_DECODE_MIN_GROUP_SIZE
+    )
 
 
 class LoraManager:
@@ -251,42 +701,29 @@ class LoraManager:
         # GPU-resident adapters are also kept in ``_cpu_cache`` (we pay
         # the host RAM cost once; reload to GPU is cheap and re-evicting
         # GPU then re-promoting only needs an H2D copy, not a disk read).
-        self._cpu_cache: dict[
-            str, dict[int, dict[str, tuple[torch.Tensor, torch.Tensor]]]
-        ] = {}
-        self._cpu_lru: OrderedDict[str, None] = OrderedDict()
-
-        # ── Tier 3: disk (source of truth) ───────────────────────────────
-        # ``_adapter_paths[name]`` is the directory containing
-        # ``adapter_model.safetensors`` + ``adapter_config.json``.  We
-        # assume the path is durable; on CPU eviction the in-memory
-        # buffers are dropped and a future use re-reads from disk.
         self._name_to_id: dict[str, int] = {}
         self._id_to_name: dict[int, str] = {}
         self._next_id: int = 1
-        self._pinned: set[str] = set()
-        self._adapter_paths: dict[str, str] = {}
 
-        # ── Async prefetch ──────────────────────────────────────────────
-        # Disk reads happen on a small thread pool so the scheduler's
-        # event loop never blocks on safetensors I/O.  Hooked from the
-        # request-admission path (see EventLoop._process_new_requests):
-        # when a request arrives with ``lora_id != 0`` the manager's
-        # ``prefetch`` is called, which submits a background load if the
-        # adapter is not already CPU-resident.  ``_ensure_in_cpu`` checks
-        # the pending map and joins an in-flight load instead of reading
-        # the same safetensors a second time.
-        self._loader_executor = ThreadPoolExecutor(
-            max_workers=2, thread_name_prefix="lora-loader"
+        # ── Tier 2/3: CPU pinned pool + disk source of truth ─────────────
+        self._cpu_store = LoraCpuCache(
+            capacity=self.max_loras_cpu,
+            is_gpu_resident=lambda name: name in self._name_to_slot,
         )
-        self._lock = threading.Lock()
-        self._pending_loads: dict[str, Future] = {}
+        # Compatibility aliases for existing tests/debug tooling.
+        self._cpu_cache = self._cpu_store.cache
+        self._cpu_lru = self._cpu_store.lru
+        self._pinned = self._cpu_store.pinned
+        self._adapter_paths = self._cpu_store.adapter_paths
+        self._pending_loads = self._cpu_store.pending_loads
 
         # Per-slot rank + scaling.  Rank 0 means "no adapter"; the Triton
         # kernels skip on rank 0, so slot 0's row is permanently zero.
         self._lora_ranks: torch.Tensor = torch.zeros(
             self._n_slots, dtype=torch.int32, device=device
         )
+        self._slot_ranks: list[int] = [0] * self._n_slots
+        self._slot_scalings: list[float] = [0.0] * self._n_slots
         self._scalings: torch.Tensor = torch.zeros(
             self._n_slots, dtype=torch.float32, device=device
         )
@@ -349,43 +786,43 @@ class LoraManager:
         #   gate_up_B_buffers: (n_slots, 2 * intermediate_per_tp, max_rank) — column-parallel.
         #   down_A_buffers:    (n_slots, max_rank, intermediate_per_tp)    — row-parallel.
         #   down_B_buffers:    (n_slots, hidden, max_rank)                 — B replicated.
-        self.qkv_A_buffers: list[torch.Tensor] = []
-        self.qkv_B_buffers: list[torch.Tensor] = []
-        self.o_A_buffers: list[torch.Tensor] = []
-        self.o_B_buffers: list[torch.Tensor] = []
-        self.gate_up_A_buffers: list[torch.Tensor] = []
-        self.gate_up_B_buffers: list[torch.Tensor] = []
-        self.down_A_buffers: list[torch.Tensor] = []
-        self.down_B_buffers: list[torch.Tensor] = []
-
-        # Cumulative output offsets [0, q, q+kv, q+2*kv] for lora_qkv_expand.
-        self._qkv_output_offset = torch.tensor(
-            [
-                0,
-                self.q_size_per_tp,
-                self.q_size_per_tp + self.kv_size_per_tp,
-                self.q_size_per_tp + 2 * self.kv_size_per_tp,
-            ],
-            dtype=torch.int32,
-            device=device,
+        self._weight_buffers = LoraWeightBuffers(
+            n_layers=self.n_layers,
+            n_slots=self._n_slots,
+            max_lora_rank=self.max_lora_rank,
+            hidden_size=self.hidden_size,
+            q_size_per_tp=self.q_size_per_tp,
+            kv_size_per_tp=self.kv_size_per_tp,
+            o_in_per_tp=self.o_in_per_tp,
+            intermediate_per_tp=self.intermediate_per_tp,
+            dtype=self.dtype,
+            device=self.device,
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
         )
-        self._max_qkv_out_dim = max(self.q_size_per_tp, self.kv_size_per_tp)
-
-        # Slice-offset tensors for lora_expand_prefill_fwd (prefill path).
-        # Reuse _qkv_output_offset for QKV; allocate separate ones for the
-        # single-slice projections (o, down) and gate/up.
-        q, kv = self.q_size_per_tp, self.kv_size_per_tp
-        i = self.intermediate_per_tp
-        h = hidden
-        self._o_slice_offsets = torch.tensor([0, h], dtype=torch.int32, device=device)
-        self._gate_up_slice_offsets = torch.tensor(
-            [0, i, 2 * i], dtype=torch.int32, device=device
+        self.qkv_A_buffers = self._weight_buffers.qkv_A_buffers
+        self.qkv_B_buffers = self._weight_buffers.qkv_B_buffers
+        self.o_A_buffers = self._weight_buffers.o_A_buffers
+        self.o_B_buffers = self._weight_buffers.o_B_buffers
+        self.gate_up_A_buffers = self._weight_buffers.gate_up_A_buffers
+        self.gate_up_B_buffers = self._weight_buffers.gate_up_B_buffers
+        self.down_A_buffers = self._weight_buffers.down_A_buffers
+        self.down_B_buffers = self._weight_buffers.down_B_buffers
+        self._qkv_output_offset = self._weight_buffers.qkv_output_offset
+        self._max_qkv_out_dim = self._weight_buffers.max_qkv_out_dim
+        self._o_slice_offsets = self._weight_buffers.o_slice_offsets
+        self._gate_up_slice_offsets = self._weight_buffers.gate_up_slice_offsets
+        self._down_slice_offsets = self._weight_buffers.down_slice_offsets
+        self._moe_lora_buffers = MoeLoraBuffers(
+            hidden_size=self.hidden_size,
+            intermediate_per_tp=self.intermediate_per_tp,
+            dtype=self.dtype,
+            device=self.device,
+            shard_weights=self._weight_buffers.shard_weights,
         )
-        self._down_slice_offsets = torch.tensor(
-            [0, h], dtype=torch.int32, device=device
-        )
-
-        self._alloc_gpu_buffers()
+        # Compatibility alias for tests/debug tooling that inspected the old
+        # manager-owned storage directly.
+        self._moe_lora_weights = self._moe_lora_buffers.weights_by_layer
 
         logger.info(
             "LoraManager initialized: max_loras=%d max_rank=%d "
@@ -403,6 +840,14 @@ class LoraManager:
     @property
     def batch_info(self) -> LoraBatchInfo:
         return self._batch_info
+
+    @property
+    def moe_lora_context(self) -> MoeLoraContext:
+        return self._moe_lora_buffers.build_context(
+            batch_info=self._batch_info,
+            scalings=self._scalings,
+            has_active_lora=self.has_active_lora,
+        )
 
     def load_adapter(self, name: str, path: str, pinned: bool = False) -> int:
         """Register a PEFT adapter from *path* and warm the CPU pool.
@@ -422,23 +867,21 @@ class LoraManager:
         # Resolve the durable disk path now (used by future re-reads when
         # the CPU pool evicts these weights).
         adapter_path = path
-        safetensors = os.path.join(adapter_path, "adapter_model.safetensors")
-        if not os.path.exists(safetensors) and not os.path.exists(path):
+        weight_path = resolve_adapter_weight_path(adapter_path)
+        if not os.path.exists(weight_path):
             raise FileNotFoundError(
-                f"Adapter weights not found at {safetensors!r} or {path!r}"
+                f"Adapter weights not found at {weight_path!r} or {path!r}"
             )
 
         lora_id = self._next_id
         self._next_id += 1
         self._name_to_id[name] = lora_id
         self._id_to_name[lora_id] = name
-        self._adapter_paths[name] = adapter_path
-        if pinned:
-            self._pinned.add(name)
+        self._cpu_store.set_path(name, adapter_path, pinned=pinned)
 
         # Warm the CPU pool — bounded by ``max_loras_cpu``, may evict
         # other CPU-resident adapters back to disk.
-        self._ensure_in_cpu(name)
+        self._cpu_store.ensure(name)
 
         logger.info(
             "Registered adapter '%s' (lora_id=%d) from %s; CPU pool: %d/%d",
@@ -454,11 +897,9 @@ class LoraManager:
         if name not in self._name_to_id:
             raise KeyError(f"Adapter '{name}' is not loaded.")
         self._evict_by_name(name)
-        self._evict_from_cpu(name)
+        self._cpu_store.remove(name)
         lora_id = self._name_to_id.pop(name)
         del self._id_to_name[lora_id]
-        self._pinned.discard(name)
-        self._adapter_paths.pop(name, None)
         logger.info("Unloaded adapter '%s'", name)
 
     def get_id(self, name: str) -> int | None:
@@ -515,25 +956,16 @@ class LoraManager:
         # so the grouped expand kernel can batch same-adapter tokens into a
         # full BLOCK_S=16 GEMM tile, recovering tensor-core efficiency.
         if max_len == 1 and bs > 1:
-            sort_order = sorted(range(bs), key=lambda i: per_request_slots[i])
-            groups: list[list[int]] = []
-            for pos, orig in enumerate(sort_order):
-                slot = per_request_slots[orig]
-                if not groups or groups[-1][0] != slot:
-                    groups.append([slot, pos, 1])
-                else:
-                    groups[-1][2] += 1
-            ng = len(groups)
+            sort_order, group_slots, group_starts, group_sizes = (
+                build_decode_lora_groups(per_request_slots)
+            )
+            ng = len(group_slots)
             self._sort_order_cpu[:bs] = torch.as_tensor(sort_order, dtype=torch.int64)
-            self._group_slots_cpu[:ng] = torch.as_tensor(
-                [g[0] for g in groups], dtype=torch.int32
-            )
+            self._group_slots_cpu[:ng] = torch.as_tensor(group_slots, dtype=torch.int32)
             self._group_starts_cpu[:ng] = torch.as_tensor(
-                [g[1] for g in groups], dtype=torch.int32
+                group_starts, dtype=torch.int32
             )
-            self._group_sizes_cpu[:ng] = torch.as_tensor(
-                [g[2] for g in groups], dtype=torch.int32
-            )
+            self._group_sizes_cpu[:ng] = torch.as_tensor(group_sizes, dtype=torch.int32)
             bi.sort_order = self._sort_order_buf
             bi.group_slots = self._group_slots_buf
             bi.group_starts = self._group_starts_buf
@@ -546,6 +978,42 @@ class LoraManager:
         else:
             bi.sort_order = bi.group_slots = bi.group_starts = bi.group_sizes = None
             bi.num_groups = 0
+
+        first_slot = per_request_slots[0] if per_request_slots else 0
+        bi.single_lora_slot = (
+            first_slot
+            if first_slot != 0 and all(slot == first_slot for slot in per_request_slots)
+            else -1
+        )
+        bi.single_lora_rank = (
+            self._slot_ranks[bi.single_lora_slot] if bi.single_lora_slot > 0 else 0
+        )
+        bi.multi_lora_start_slot = -1
+        bi.multi_lora_count = 0
+        bi.multi_lora_segment_len = 0
+        bi.multi_lora_rank = 0
+        if (
+            bs > 1
+            and bi.single_lora_slot <= 0
+            and max_len > _CHUNKED_THRESHOLD
+            and len(set(seg_lens_list)) == 1
+            and all(slot > 0 for slot in per_request_slots)
+        ):
+            start_slot = per_request_slots[0]
+            consecutive_slots = all(
+                slot == start_slot + i for i, slot in enumerate(per_request_slots)
+            )
+            rank = self._slot_ranks[start_slot]
+            scaling = self._slot_scalings[start_slot]
+            same_rank_and_scaling = all(
+                self._slot_ranks[slot] == rank and self._slot_scalings[slot] == scaling
+                for slot in per_request_slots
+            )
+            if consecutive_slots and rank > 0 and same_rank_and_scaling:
+                bi.multi_lora_start_slot = start_slot
+                bi.multi_lora_count = bs
+                bi.multi_lora_segment_len = seg_lens_list[0]
+                bi.multi_lora_rank = rank
 
         # Stage on CPU then a single non-blocking H2D.
         self._seg_lens_cpu[:bs] = torch.as_tensor(seg_lens_list, dtype=torch.int32)
@@ -596,7 +1064,25 @@ class LoraManager:
             if bi.max_len > _CHUNKED_THRESHOLD
             else lora_shrink_fwd(hidden_states, A_buf, bi, stack_num=3)
         )
-        if bi.max_len > _CHUNKED_THRESHOLD:
+        if _use_cutedsl_single_slot_qkv(
+            bi,
+            lora_a.shape[0],
+            self.q_size_per_tp,
+            self.kv_size_per_tp,
+            bi.single_lora_rank,
+            input_dim=hidden_states.shape[1],
+        ):
+            lora_qkv_single_slot_cutedsl_fwd(
+                lora_a,
+                B_buf,
+                bi,
+                self.q_size_per_tp,
+                self.kv_size_per_tp,
+                qkv,
+                apply_scaling=True,
+                single_weight_index=bi.single_lora_slot,
+            )
+        elif bi.max_len > _CHUNKED_THRESHOLD:
             lora_expand_prefill_fwd(
                 lora_a,
                 B_buf,
@@ -651,7 +1137,35 @@ class LoraManager:
             if bi.max_len > _CHUNKED_THRESHOLD
             else lora_shrink_fwd(attn_output, A_buf, bi, stack_num=1)
         )
-        if bi.max_len > _CHUNKED_THRESHOLD:
+        if _use_cutedsl_single_slot_expand(
+            bi,
+            lora_a.shape[0],
+            B_buf.shape[1],
+            bi.single_lora_rank,
+            input_dim=attn_output.shape[1],
+        ):
+            lora_expand_single_slot_cutedsl_fwd(
+                lora_a,
+                B_buf,
+                bi,
+                base_output=o_output,
+                apply_scaling=True,
+                single_weight_index=bi.single_lora_slot,
+            )
+        elif _use_cutedsl_multi_slot_expand(
+            bi,
+            lora_a.shape[0],
+            B_buf.shape[1],
+            input_dim=attn_output.shape[1],
+        ):
+            lora_expand_batched_slots_cutedsl_fwd(
+                lora_a,
+                B_buf,
+                bi,
+                base_output=o_output,
+                apply_scaling=True,
+            )
+        elif bi.max_len > _CHUNKED_THRESHOLD:
             lora_expand_prefill_fwd(
                 lora_a,
                 B_buf,
@@ -660,8 +1174,8 @@ class LoraManager:
                 self.hidden_size,
                 base_output=o_output,
             )
-        elif bi.num_groups > 0 and bi.bs // bi.num_groups >= 8:
-            lora_expand_decode_fwd(lora_a, B_buf, bi, base_output=o_output)
+        elif _use_triton_grouped_decode(bi):
+            lora_expand_grouped_v2_fwd(lora_a, B_buf, bi, base_output=o_output)
         else:
             lora_expand_fwd(lora_a, B_buf, bi, base_output=o_output)
         return o_output
@@ -693,7 +1207,36 @@ class LoraManager:
             if bi.max_len > _CHUNKED_THRESHOLD
             else lora_shrink_fwd(hidden_states, A_buf, bi, stack_num=2)
         )
-        if bi.max_len > _CHUNKED_THRESHOLD:
+        if _use_cutedsl_single_slot_gate_up(
+            bi,
+            lora_a.shape[0],
+            self.intermediate_per_tp,
+            bi.single_lora_rank,
+            input_dim=hidden_states.shape[1],
+        ):
+            lora_gate_up_single_slot_cutedsl_fwd(
+                lora_a,
+                B_buf,
+                bi,
+                self.intermediate_per_tp,
+                base_output=gate_up,
+                apply_scaling=True,
+                single_weight_index=bi.single_lora_slot,
+            )
+        elif _use_cutedsl_multi_slot_gate_up(
+            bi,
+            lora_a.shape[0],
+            self.intermediate_per_tp,
+        ):
+            lora_gate_up_batched_slots_cutedsl_fwd(
+                lora_a,
+                B_buf,
+                bi,
+                self.intermediate_per_tp,
+                base_output=gate_up,
+                apply_scaling=True,
+            )
+        elif bi.max_len > _CHUNKED_THRESHOLD:
             lora_expand_prefill_fwd(
                 lora_a,
                 B_buf,
@@ -744,7 +1287,35 @@ class LoraManager:
             if bi.max_len > _CHUNKED_THRESHOLD
             else lora_shrink_fwd(x, A_buf, bi, stack_num=1)
         )
-        if bi.max_len > _CHUNKED_THRESHOLD:
+        if _use_cutedsl_single_slot_expand(
+            bi,
+            lora_a.shape[0],
+            B_buf.shape[1],
+            bi.single_lora_rank,
+            input_dim=x.shape[1],
+        ):
+            lora_expand_single_slot_cutedsl_fwd(
+                lora_a,
+                B_buf,
+                bi,
+                base_output=down_output,
+                apply_scaling=True,
+                single_weight_index=bi.single_lora_slot,
+            )
+        elif _use_cutedsl_multi_slot_expand(
+            bi,
+            lora_a.shape[0],
+            B_buf.shape[1],
+            input_dim=x.shape[1],
+        ):
+            lora_expand_batched_slots_cutedsl_fwd(
+                lora_a,
+                B_buf,
+                bi,
+                base_output=down_output,
+                apply_scaling=True,
+            )
+        elif bi.max_len > _CHUNKED_THRESHOLD:
             lora_expand_prefill_fwd(
                 lora_a,
                 B_buf,
@@ -753,67 +1324,64 @@ class LoraManager:
                 self.hidden_size,
                 base_output=down_output,
             )
-        elif bi.num_groups > 0 and bi.bs // bi.num_groups >= 8:
-            lora_expand_decode_fwd(lora_a, B_buf, bi, base_output=down_output)
+        elif _use_triton_grouped_decode(bi):
+            lora_expand_grouped_v2_fwd(lora_a, B_buf, bi, base_output=down_output)
         else:
             lora_expand_fwd(lora_a, B_buf, bi, base_output=down_output)
         return down_output
 
+    def apply_moe_gate_up_lora(
+        self,
+        layer_id: int,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        gate_up_output: torch.Tensor,
+        *,
+        sorted_token_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Compatibility wrapper; MoE-specific work lives in MoeLoraContext."""
+        return self.moe_lora_context.apply_gate_up_lora(
+            layer_id,
+            hidden_states,
+            topk_ids,
+            gate_up_output,
+            sorted_token_ids=sorted_token_ids,
+        )
+
+    def apply_moe_down_lora(
+        self,
+        layer_id: int,
+        intermediate: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        down_output: torch.Tensor,
+        *,
+        sorted_token_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Compatibility wrapper; MoE-specific work lives in MoeLoraContext."""
+        return self.moe_lora_context.apply_down_lora(
+            layer_id,
+            intermediate,
+            topk_ids,
+            topk_weights,
+            down_output,
+            sorted_token_ids=sorted_token_ids,
+        )
+
     def set_adapter_scaling(self, name: str, scaling: float) -> None:
         slot = self._name_to_slot.get(name)
         if slot is not None:
+            self._slot_scalings[slot] = scaling
             self._scalings[slot] = scaling
 
     # ── Slot allocation ─────────────────────────────────────────────────────
-
-    def _alloc_gpu_buffers(self) -> None:
-        r = self.max_lora_rank
-        h = self.hidden_size
-        q = self.q_size_per_tp
-        kv = self.kv_size_per_tp
-        o_in = self.o_in_per_tp
-        i = self.intermediate_per_tp
-        n = self._n_slots
-
-        for _ in range(self.n_layers):
-            # ── attention ─────────────────────────────────────────────────
-            # qkv_A: stack q/k/v along dim 1.  All three see the full input.
-            self.qkv_A_buffers.append(
-                torch.zeros((n, 3 * r, h), dtype=self.dtype, device=self.device)
-            )
-            # qkv_B: stack q/k/v along dim 1, with their per-rank output sizes.
-            self.qkv_B_buffers.append(
-                torch.zeros((n, q + 2 * kv, r), dtype=self.dtype, device=self.device)
-            )
-            self.o_A_buffers.append(
-                torch.zeros((n, r, o_in), dtype=self.dtype, device=self.device)
-            )
-            self.o_B_buffers.append(
-                torch.zeros((n, h, r), dtype=self.dtype, device=self.device)
-            )
-            # ── MLP (TP-aware) ────────────────────────────────────────────
-            # gate_up_A: stack gate/up along dim 1; both see the full input.
-            self.gate_up_A_buffers.append(
-                torch.zeros((n, 2 * r, h), dtype=self.dtype, device=self.device)
-            )
-            # gate_up_B: column-parallel — output sharded to ``intermediate_per_tp``.
-            self.gate_up_B_buffers.append(
-                torch.zeros((n, 2 * i, r), dtype=self.dtype, device=self.device)
-            )
-            # down_A: row-parallel — input sharded to ``intermediate_per_tp``.
-            self.down_A_buffers.append(
-                torch.zeros((n, r, i), dtype=self.dtype, device=self.device)
-            )
-            self.down_B_buffers.append(
-                torch.zeros((n, h, r), dtype=self.dtype, device=self.device)
-            )
 
     def _ensure_in_gpu(self, name: str) -> int:
         if name in self._name_to_slot:
             return self._name_to_slot[name]
         # Tier-2 → Tier-1 promotion; may need to read from disk if the
         # CPU pool has evicted this adapter since registration.
-        self._ensure_in_cpu(name)
+        self._cpu_store.ensure(name)
         slot = self._find_free_slot()
         self._load_to_slot(name, slot)
         self._name_to_slot[name] = slot
@@ -834,151 +1402,12 @@ class LoraManager:
         already in flight.  Silently ignores unknown adapters (the
         request will fall back to base via slot 0).
         """
-        with self._lock:
-            if name in self._cpu_cache:
-                self._cpu_lru.move_to_end(name)
-                return
-            if name in self._pending_loads:
-                return
-            adapter_path = self._adapter_paths.get(name)
-            if adapter_path is None:
-                return
-            fut = self._loader_executor.submit(
-                self._async_load_weights, name, adapter_path
-            )
-            self._pending_loads[name] = fut
-
-    def _async_load_weights(self, name: str, adapter_path: str) -> None:
-        """Background worker: read the adapter from disk and install
-        into the CPU pool under the manager lock."""
-        try:
-            safetensors = os.path.join(adapter_path, "adapter_model.safetensors")
-            if not os.path.exists(safetensors):
-                safetensors = adapter_path
-            raw = _load_safetensors(safetensors)
-            weights = _parse_adapter_weights(raw)
-        except Exception:
-            logger.exception("Async LoRA load failed for '%s'", name)
-            with self._lock:
-                self._pending_loads.pop(name, None)
-            return
-        with self._lock:
-            try:
-                if name not in self._cpu_cache:
-                    self._install_in_cpu_locked(name, weights)
-            finally:
-                self._pending_loads.pop(name, None)
-
-    def _install_in_cpu_locked(
-        self,
-        name: str,
-        weights: dict[int, dict[str, tuple[torch.Tensor, torch.Tensor]]],
-    ) -> None:
-        """Insert *weights* into the CPU pool, evicting LRU as needed.
-        Caller must hold ``self._lock``.
-
-        GPU-resident adapters CAN be evicted from CPU — their weights
-        are still on GPU, and the cost of a future GPU re-promotion is
-        a disk read (which the async prefetcher hides on the next
-        request).  Only ``_pinned`` adapters are protected from CPU
-        eviction (they're a hard reservation).
-        """
-        while len(self._cpu_cache) >= self.max_loras_cpu:
-            evicted = False
-            # Prefer evicting non-GPU-resident entries first: they cost
-            # a disk read to bring back, while GPU-resident ones cost
-            # nothing until their GPU slot is also evicted.
-            for stage in ("non_gpu", "gpu_resident"):
-                for candidate in list(self._cpu_lru.keys()):
-                    if candidate == name:
-                        continue
-                    if candidate in self._pinned:
-                        continue
-                    is_gpu = candidate in self._name_to_slot
-                    if stage == "non_gpu" and is_gpu:
-                        continue
-                    self._evict_from_cpu_locked(candidate)
-                    evicted = True
-                    break
-                if evicted:
-                    break
-            if not evicted:
-                raise RuntimeError(
-                    f"CPU LoRA pool is full ({len(self._cpu_cache)}/"
-                    f"{self.max_loras_cpu}) and every entry is pinned. "
-                    f"cpu_lru={list(self._cpu_lru.keys())} "
-                    f"pinned={self._pinned} "
-                    "Increase max_loras_cpu or unpin an adapter."
-                )
-        self._cpu_cache[name] = weights
-        self._cpu_lru[name] = None
-
-    def _ensure_in_cpu(
-        self,
-        name: str,
-        weights: dict[int, dict[str, tuple[torch.Tensor, torch.Tensor]]] | None = None,
-    ) -> None:
-        """Synchronously ensure *name* is CPU-resident.
-
-        If a prefetch for the same name is already in flight, joins it
-        instead of starting a second disk read; otherwise falls back to a
-        sync read.  GPU-resident adapters are kept in CPU pool — see
-        ``_install_in_cpu_locked`` eviction policy.
-        """
-        # Fast path: already cached.
-        with self._lock:
-            if name in self._cpu_cache:
-                self._cpu_lru.move_to_end(name)
-                return
-            pending = self._pending_loads.get(name)
-
-        # Join an in-flight async prefetch instead of double-reading.
-        if pending is not None:
-            pending.result()
-            with self._lock:
-                if name in self._cpu_cache:
-                    self._cpu_lru.move_to_end(name)
-                    return
-            # Fall through (rare: the prefetch may have failed, or the
-            # adapter was evicted between our checks).
-
-        # Sync read + install.  Disk I/O happens outside the lock so the
-        # scheduler thread's other work is unblocked while we read.
-        if weights is None:
-            adapter_path = self._adapter_paths.get(name)
-            if adapter_path is None:
-                raise KeyError(f"Adapter '{name}' has no recorded disk path.")
-            safetensors = os.path.join(adapter_path, "adapter_model.safetensors")
-            if not os.path.exists(safetensors):
-                safetensors = adapter_path
-            raw = _load_safetensors(safetensors)
-            weights = _parse_adapter_weights(raw)
-
-        with self._lock:
-            if name in self._cpu_cache:
-                # Lost the race to a concurrent prefetch — just refresh LRU.
-                self._cpu_lru.move_to_end(name)
-                return
-            self._install_in_cpu_locked(name, weights)
-
-    def _evict_from_cpu_locked(self, name: str) -> None:
-        """Drop *name* from the CPU pool.  Caller holds the lock and is
-        responsible for ensuring the adapter is not GPU-resident."""
-        if name in self._cpu_cache:
-            del self._cpu_cache[name]
-            self._cpu_lru.pop(name, None)
-            logger.debug(
-                "Evicted '%s' from CPU pool (now %d/%d)",
-                name,
-                len(self._cpu_cache),
-                self.max_loras_cpu,
-            )
+        self._cpu_store.prefetch(name)
 
     def _evict_from_cpu(self, name: str) -> None:
         """Public helper, takes the lock.  Caller must ensure *name* is
         not currently GPU-resident."""
-        with self._lock:
-            self._evict_from_cpu_locked(name)
+        self._cpu_store.evict(name)
 
     def _find_free_slot(self) -> int:
         for slot in range(1, self._n_slots):
@@ -1003,68 +1432,13 @@ class LoraManager:
         rank = self._get_rank_for(name)
         scaling = self._get_scaling_for(name, rank)
         self._lora_ranks[slot] = rank
+        self._slot_ranks[slot] = rank
+        self._slot_scalings[slot] = scaling
         self._scalings[slot] = scaling
-
-        for layer_id, modules in cpu_weights.items():
-            for mod, (lora_A_full, lora_B_full) in modules.items():
-                actual_rank = lora_A_full.shape[0]
-                lora_A_gpu = lora_A_full.to(device=self.device, dtype=self.dtype)
-                lora_B_gpu = lora_B_full.to(device=self.device, dtype=self.dtype)
-
-                lora_A_shard, lora_B_shard = self._shard_weights(
-                    mod, lora_A_gpu, lora_B_gpu
-                )
-                r = min(actual_rank, self.max_lora_rank)
-
-                # Stacked LoRA-A: pack at ``stack_idx * actual_rank``
-                # (contiguous), NOT at multiples of ``max_lora_rank``.
-                # The lora_shrink kernel writes only the first
-                # ``rank * stack_num`` columns of its output and the
-                # downstream lora_qkv_expand / lora_gate_up_expand kernel
-                # reads ``x[:, stack_id * rank]``.  Both ends use ``rank``
-                # (the adapter's actual rank, not max_rank), so stacks
-                # must be contiguous in the buffer — gaps would be read
-                # as zero and silently kill the k/v / up deltas.
-                if mod in ("q_proj", "k_proj", "v_proj"):
-                    qkv_idx = ("q_proj", "k_proj", "v_proj").index(mod)
-                    rank_off = qkv_idx * r
-                    out_off, out_size = self._qkv_b_slice(mod)
-                    self.qkv_A_buffers[layer_id][
-                        slot, rank_off : rank_off + r, :
-                    ].copy_(lora_A_shard[:r])
-                    # B layout: kernel uses ``min(K, rank)`` so cols beyond
-                    # actual_rank are never read; just write [:, :r].
-                    self.qkv_B_buffers[layer_id][
-                        slot, out_off : out_off + out_size, :r
-                    ].copy_(lora_B_shard[:, :r])
-                elif mod == "o_proj":
-                    self.o_A_buffers[layer_id][slot, :r, :].copy_(lora_A_shard[:r])
-                    self.o_B_buffers[layer_id][slot, :, :r].copy_(lora_B_shard[:, :r])
-                elif mod in ("gate_proj", "up_proj"):
-                    gate_up_idx = 0 if mod == "gate_proj" else 1
-                    rank_off = gate_up_idx * r
-                    out_off = gate_up_idx * self.intermediate_per_tp
-                    self.gate_up_A_buffers[layer_id][
-                        slot, rank_off : rank_off + r, :
-                    ].copy_(lora_A_shard[:r])
-                    self.gate_up_B_buffers[layer_id][
-                        slot, out_off : out_off + self.intermediate_per_tp, :r
-                    ].copy_(lora_B_shard[:, :r])
-                else:  # down_proj
-                    self.down_A_buffers[layer_id][slot, :r, :].copy_(lora_A_shard[:r])
-                    self.down_B_buffers[layer_id][slot, :, :r].copy_(
-                        lora_B_shard[:, :r]
-                    )
+        self._weight_buffers.load_adapter_to_slot(cpu_weights, slot, rank)
+        self._moe_lora_buffers.load_adapter_to_slot(cpu_weights, slot, rank)
 
         logger.debug("Loaded adapter '%s' into GPU slot %d (rank=%d)", name, slot, rank)
-
-    def _qkv_b_slice(self, module: str) -> tuple[int, int]:
-        """``(offset, size)`` of one projection inside the fused QKV B buffer."""
-        if module == "q_proj":
-            return 0, self.q_size_per_tp
-        if module == "k_proj":
-            return self.q_size_per_tp, self.kv_size_per_tp
-        return self.q_size_per_tp + self.kv_size_per_tp, self.kv_size_per_tp
 
     def _get_rank_for(self, name: str) -> int:
         cpu_weights = self._cpu_cache.get(name, {})
@@ -1072,63 +1446,25 @@ class LoraManager:
             return self.max_lora_rank
         # Read the rank from whichever module is present in layer 0 — the
         # adapter may target attention only, MLP only, or both.
-        for mod in (*_PEFT_ATTN_MODULES, *_PEFT_MLP_MODULES):
+        for mod in PEFT_MODULES:
             if mod in cpu_weights[0]:
                 return cpu_weights[0][mod][0].shape[0]
+        for mod, tensors in cpu_weights[0].items():
+            if mod.startswith("experts."):
+                return tensors[0].shape[0]
         return self.max_lora_rank
 
     def _get_scaling_for(self, name: str, rank: int) -> float:
-        adapter_path = self._adapter_paths.get(name)
-        if adapter_path:
-            config_file = os.path.join(adapter_path, "adapter_config.json")
-            if os.path.exists(config_file):
-                try:
-                    with open(config_file) as f:
-                        cfg = json.load(f)
-                    alpha = float(cfg.get("lora_alpha", rank))
-                    r = int(cfg.get("r", rank))
-                    return alpha / r if r > 0 else 1.0
-                except Exception:
-                    pass
-        return 1.0
-
-    def _shard_weights(
-        self,
-        module: str,
-        lora_A: torch.Tensor,
-        lora_B: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.tp_size == 1:
-            return lora_A, lora_B
-        # Column-parallel (attn q/k/v, MLP gate/up): shard B along output dim.
-        if module in ("q_proj", "k_proj", "v_proj", "gate_proj", "up_proj"):
-            out_total = lora_B.shape[0]
-            out_per = out_total // self.tp_size
-            return (
-                lora_A,
-                lora_B[self.tp_rank * out_per : (self.tp_rank + 1) * out_per],
-            )
-        # Row-parallel (attn o_proj, MLP down_proj): shard A along input dim.
-        in_total = lora_A.shape[1]
-        in_per = in_total // self.tp_size
-        return (
-            lora_A[:, self.tp_rank * in_per : (self.tp_rank + 1) * in_per],
-            lora_B,
-        )
+        return read_adapter_scaling(self._adapter_paths.get(name), rank)
 
     def _evict_by_name(self, name: str) -> None:
         if name in self._name_to_slot:
             slot = self._name_to_slot.pop(name)
             self._slot_to_name[slot] = None
-            for layer_id in range(self.n_layers):
-                self.qkv_A_buffers[layer_id][slot].zero_()
-                self.qkv_B_buffers[layer_id][slot].zero_()
-                self.o_A_buffers[layer_id][slot].zero_()
-                self.o_B_buffers[layer_id][slot].zero_()
-                self.gate_up_A_buffers[layer_id][slot].zero_()
-                self.gate_up_B_buffers[layer_id][slot].zero_()
-                self.down_A_buffers[layer_id][slot].zero_()
-                self.down_B_buffers[layer_id][slot].zero_()
+            self._weight_buffers.zero_slot(slot)
+            self._moe_lora_buffers.clear_slot(slot)
             self._lora_ranks[slot] = 0
+            self._slot_ranks[slot] = 0
+            self._slot_scalings[slot] = 0.0
             self._scalings[slot] = 0.0
         self._gpu_lru.pop(name, None)
