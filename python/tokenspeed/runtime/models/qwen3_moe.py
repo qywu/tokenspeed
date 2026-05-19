@@ -190,9 +190,10 @@ class Qwen3MoeModel(Qwen3Model):
                 cos_sin=None,
             )
 
-        hidden_states = layer.comm_manager.final_norm(
-            hidden_states, residual, ctx, self.norm
-        )
+        if not ctx.forward_mode.is_idle():
+            hidden_states = layer.comm_manager.final_norm(
+                hidden_states, residual, ctx, self.norm
+            )
         return hidden_states, None
 
 

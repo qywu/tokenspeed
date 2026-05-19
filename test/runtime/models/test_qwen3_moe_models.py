@@ -2,9 +2,12 @@ import json
 import unittest
 
 import torch
+from torch import nn
 
 from tokenspeed.runtime.configs.qwen3_moe_config import Qwen3MoeConfig
 from tokenspeed.runtime.distributed.mapping import Mapping
+from tokenspeed.runtime.execution.context import ForwardContext
+from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.hf_transformers_utils import _CONFIG_REGISTRY, get_config
 
@@ -167,6 +170,53 @@ class TestQwen3MoeConfig(unittest.TestCase):
         w2 = params["model.layers.0.mlp.experts.w2_weight"]
         self.assertEqual(w2.shape[0], 1)
         self.assertEqual(w2[0].mean().item(), 21.0)
+
+    def test_idle_forward_skips_final_norm(self):
+        from tokenspeed.runtime.models.qwen3_moe import Qwen3MoeForCausalLM
+
+        class FailingCommManager:
+            def final_norm(self, *args, **kwargs):
+                raise AssertionError("final_norm should not run for idle forwards")
+
+        class IdleLayer(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.comm_manager = FailingCommManager()
+
+            def forward(
+                self,
+                positions,
+                hidden_states,
+                ctx,
+                out_cache_loc,
+                residual,
+                cos_sin=None,
+            ):
+                return hidden_states, residual
+
+        model = Qwen3MoeForCausalLM(
+            _tiny_qwen3_moe_config(),
+            mapping=_single_rank_mapping(),
+        )
+        model.model.layers = nn.ModuleList([IdleLayer()])
+        ctx = ForwardContext(
+            attn_backend=None,
+            token_to_kv_pool=None,
+            bs=0,
+            num_extends=0,
+            input_num_tokens=0,
+            forward_mode=ForwardMode.IDLE,
+        )
+
+        hidden_states, residual = model.model(
+            input_ids=torch.empty(0, dtype=torch.long),
+            positions=torch.empty(0, dtype=torch.long),
+            ctx=ctx,
+            out_cache_loc=torch.empty(0, dtype=torch.long),
+        )
+
+        self.assertEqual(hidden_states.shape, (0, 16))
+        self.assertIsNone(residual)
 
 
 if __name__ == "__main__":
