@@ -184,6 +184,8 @@ def _use_cutedsl_single_slot_expand(
         return False
     if bi.max_len == 1:
         if out_dim >= _CUTEDSL_SINGLE_SLOT_DECODE_MIN_OUT_DIM:
+            if input_dim >= 7168 and lora_rank > 8 and lora_rank < 32:
+                return total_tokens >= 32
             if lora_rank > 8 and lora_rank < 32:
                 return total_tokens >= 64
             return lora_rank >= 8 and total_tokens >= 32
@@ -192,21 +194,52 @@ def _use_cutedsl_single_slot_expand(
                 return total_tokens >= 32
             if lora_rank >= 32:
                 return total_tokens >= 64
+            if (
+                input_dim >= 8192
+                and lora_rank == 8
+                and out_dim == _CUTEDSL_SINGLE_SLOT_PREFILL_MIN_OUT_DIM
+            ):
+                return total_tokens >= 32
+            if (
+                input_dim >= 8192
+                and lora_rank >= 16
+                and lora_rank < 32
+                and out_dim == _CUTEDSL_SINGLE_SLOT_PREFILL_MIN_OUT_DIM
+            ):
+                return total_tokens >= 32
+            if (
+                input_dim >= 7168
+                and lora_rank >= 8
+                and lora_rank < 32
+                and out_dim == _CUTEDSL_SINGLE_SLOT_PREFILL_MIN_OUT_DIM
+            ):
+                return total_tokens >= 64
             if lora_rank >= 8 and out_dim == _CUTEDSL_SINGLE_SLOT_PREFILL_MIN_OUT_DIM:
                 return total_tokens >= 128
             return lora_rank >= 16 and total_tokens >= 128
         return (
             out_dim >= _CUTEDSL_SINGLE_SLOT_LOW_RANK_MIN_OUT_DIM
-            and lora_rank >= 64
-            and total_tokens >= _CUTEDSL_SINGLE_SLOT_LOW_OUT_DECODE_MIN_TOKENS
+            and (
+                lora_rank >= 64
+                or (
+                    input_dim >= 7168
+                    and out_dim == _CUTEDSL_SINGLE_SLOT_LOW_RANK_MIN_OUT_DIM
+                    and lora_rank >= 8
+                )
+            )
+            and (total_tokens >= _CUTEDSL_SINGLE_SLOT_LOW_OUT_DECODE_MIN_TOKENS)
         )
     if out_dim >= _CUTEDSL_SINGLE_SLOT_LOW_RANK_MIN_OUT_DIM and out_dim < (
         _CUTEDSL_SINGLE_SLOT_PREFILL_MIN_OUT_DIM
     ):
-        if input_dim >= 8192:
+        if input_dim >= 7168:
             return bi.max_len > _CHUNKED_THRESHOLD and (
-                (lora_rank >= 16 and total_tokens >= 256)
-                or (lora_rank >= 8 and total_tokens >= 512)
+                lora_rank >= 8 and total_tokens >= 64
+            )
+        if input_dim == 4096 and out_dim == _CUTEDSL_SINGLE_SLOT_LOW_RANK_MIN_OUT_DIM:
+            return bi.max_len > _CHUNKED_THRESHOLD and (
+                (lora_rank >= 64 and total_tokens >= 256)
+                or (lora_rank >= 8 and lora_rank <= 16 and total_tokens >= 64)
             )
         return bi.max_len > _CHUNKED_THRESHOLD and (
             (
@@ -218,6 +251,18 @@ def _use_cutedsl_single_slot_expand(
         )
     if out_dim >= _CUTEDSL_SINGLE_SLOT_PREFILL_MIN_OUT_DIM:
         if out_dim < _CUTEDSL_SINGLE_SLOT_DECODE_MIN_OUT_DIM:
+            if input_dim >= 7168:
+                return (
+                    bi.max_len > _CHUNKED_THRESHOLD
+                    and lora_rank >= 8
+                    and total_tokens >= 64
+                )
+            if (
+                input_dim == 4096
+                and out_dim == _CUTEDSL_SINGLE_SLOT_PREFILL_MIN_OUT_DIM
+                and lora_rank == 8
+            ):
+                return bi.max_len > _CHUNKED_THRESHOLD and total_tokens >= 64
             return (
                 bi.max_len > _CHUNKED_THRESHOLD
                 and lora_rank >= 8
@@ -274,6 +319,57 @@ def _use_cutedsl_multi_slot_expand(
         and not (bi.multi_lora_rank >= 64 and bi.multi_lora_segment_len >= 128)
     ):
         return False
+    if (
+        out_dim >= _CUTEDSL_GATE_UP_LARGE_OUT_DIM
+        and bi.multi_lora_segment_len >= 64
+        and (
+            (
+                bi.multi_lora_rank >= 16
+                and (bi.multi_lora_count >= 4 or input_dim >= 5120)
+            )
+            or (bi.multi_lora_rank >= 8 and bi.multi_lora_count >= 4)
+        )
+    ):
+        return bi.max_len > _CHUNKED_THRESHOLD and total_tokens > _CHUNKED_THRESHOLD
+    if (
+        input_dim >= 5120
+        and input_dim < 7168
+        and out_dim >= 4096
+        and out_dim <= 8192
+        and bi.multi_lora_rank >= 8
+        and (
+            bi.multi_lora_segment_len >= 128
+            or (out_dim >= 8192 and bi.multi_lora_segment_len >= 64)
+        )
+    ):
+        return bi.max_len > _CHUNKED_THRESHOLD and total_tokens > _CHUNKED_THRESHOLD
+    if (
+        input_dim == 7168
+        and out_dim >= 8192
+        and out_dim <= 8192
+        and bi.multi_lora_count >= 4
+        and bi.multi_lora_rank >= 16
+        and bi.multi_lora_segment_len >= 128
+    ):
+        return bi.max_len > _CHUNKED_THRESHOLD and total_tokens > _CHUNKED_THRESHOLD
+    if (
+        input_dim == 4096
+        and out_dim == 8192
+        and bi.multi_lora_count >= 4
+        and bi.multi_lora_rank >= 16
+        and bi.multi_lora_segment_len >= 64
+    ):
+        return bi.max_len > _CHUNKED_THRESHOLD and total_tokens > _CHUNKED_THRESHOLD
+    if input_dim == 7168 and out_dim < 8192 and bi.multi_lora_rank < 64:
+        return False
+    if (
+        input_dim >= 8192
+        and out_dim >= 4096
+        and out_dim <= 8192
+        and bi.multi_lora_rank >= 8
+        and bi.multi_lora_segment_len >= 128
+    ):
+        return bi.max_len > _CHUNKED_THRESHOLD and total_tokens > _CHUNKED_THRESHOLD
     return (
         bi.max_len > _CHUNKED_THRESHOLD
         and bi.multi_lora_rank >= 8
@@ -367,6 +463,10 @@ def _use_cutedsl_single_slot_gate_up(
         if output_dim >= _CUTEDSL_GATE_UP_SMALL_OUT_DIM:
             return lora_rank >= 8 and total_tokens >= 32
         if output_dim >= 2048:
+            if input_dim >= 7168 and lora_rank >= 8:
+                return total_tokens >= 32
+            if input_dim >= 5120 and lora_rank >= 16 and lora_rank < 32:
+                return total_tokens >= 32
             if lora_rank >= 8 and total_tokens >= 64:
                 return True
             if lora_rank >= 16 and total_tokens >= 64:
@@ -375,7 +475,19 @@ def _use_cutedsl_single_slot_gate_up(
                 lora_rank >= 32 and total_tokens >= 64
             )
         return output_dim >= _CUTEDSL_SINGLE_SLOT_GATE_UP_SMALL_OUT_DIM and (
-            (lora_rank >= 64 and total_tokens >= 32)
+            (
+                input_dim >= 8192
+                and output_dim == _CUTEDSL_SINGLE_SLOT_GATE_UP_SMALL_OUT_DIM
+                and lora_rank >= 8
+                and total_tokens >= 32
+            )
+            or (
+                input_dim >= 5120
+                and output_dim == _CUTEDSL_SINGLE_SLOT_GATE_UP_SMALL_OUT_DIM
+                and lora_rank >= 8
+                and total_tokens >= 64
+            )
+            or (lora_rank >= 64 and total_tokens >= 32)
             or (lora_rank >= 16 and total_tokens >= 128)
         )
     if bi.max_len <= _CHUNKED_THRESHOLD:
@@ -385,6 +497,16 @@ def _use_cutedsl_single_slot_gate_up(
             return lora_rank >= 8 and total_tokens >= 64
         if output_dim >= _CUTEDSL_GATE_UP_MEDIUM_OUT_DIM:
             return lora_rank >= 8 and total_tokens >= 64
+        if input_dim >= 7168 and output_dim >= _CUTEDSL_GATE_UP_SMALL_OUT_DIM:
+            return (lora_rank == 8 and total_tokens >= 64) or (
+                lora_rank == 16 and total_tokens >= 128
+            )
+        if (
+            input_dim >= 5120
+            and input_dim < 7168
+            and output_dim >= _CUTEDSL_GATE_UP_SMALL_OUT_DIM
+        ):
+            return lora_rank >= 8 and lora_rank <= 16 and total_tokens >= 96
         if lora_rank < 64:
             return lora_rank >= 8 and total_tokens >= 256
         return (lora_rank >= 64 and total_tokens >= 80) or (
@@ -392,11 +514,13 @@ def _use_cutedsl_single_slot_gate_up(
         )
     if output_dim >= _CUTEDSL_SINGLE_SLOT_GATE_UP_SMALL_OUT_DIM:
         if output_dim < 2048:
+            if input_dim >= 8192:
+                return lora_rank >= 8 and total_tokens >= 128
             return (lora_rank >= 64 and total_tokens >= 512) or (
-                lora_rank >= 8 and total_tokens >= 1024
+                lora_rank >= 8 and total_tokens >= 512
             )
         if input_dim >= 8192 and lora_rank >= 8:
-            return total_tokens >= 256
+            return total_tokens >= 128
         if output_dim >= 3072 and lora_rank >= 8:
             return total_tokens >= 256
         return (
@@ -545,18 +669,24 @@ def _use_cutedsl_single_slot_qkv(
             return total_tokens >= 32
         if lora_rank >= 32:
             if kv_dim < 1024:
-                if input_dim >= 8192:
-                    return total_tokens >= 96
+                if input_dim >= 5120:
+                    return total_tokens >= 64
                 return total_tokens >= 128
             return total_tokens >= 64
         if lora_rank >= 16:
             if kv_dim < 1024:
                 return total_tokens >= 96
+            if input_dim >= 5120 and q_dim >= 8192:
+                return total_tokens >= 64
             return q_dim >= 8192 or total_tokens >= 96
+        if input_dim >= 5120 and q_dim >= 8192 and kv_dim >= 1024:
+            return total_tokens >= 64
         return False
     if bi.max_len <= _CHUNKED_THRESHOLD:
         return False
     if lora_rank >= 64:
+        return total_tokens >= 1536
+    if input_dim >= 7168 and q_dim >= 8192 and kv_dim >= 1024 and lora_rank == 16:
         return total_tokens >= 1536
     return (
         (q_dim >= 8192 and kv_dim >= 1024 and lora_rank >= 32 and total_tokens >= 1536)
@@ -579,6 +709,7 @@ def _use_cutedsl_multi_slot_gate_up(
     bi: LoraBatchInfo,
     total_tokens: int,
     output_dim: int,
+    input_dim: int = 4096,
 ) -> bool:
     """Return whether equal-length consecutive multi-slot gate/up should win."""
     if bi.multi_lora_start_slot <= 0:
@@ -590,6 +721,13 @@ def _use_cutedsl_multi_slot_gate_up(
     if bi.multi_lora_rank < 64:
         return False
     if output_dim >= _CUTEDSL_GATE_UP_LARGE_OUT_DIM:
+        if (
+            output_dim == _CUTEDSL_GATE_UP_LARGE_OUT_DIM
+            and input_dim >= 5120
+            and bi.multi_lora_count >= 4
+            and bi.multi_lora_segment_len >= 64
+        ):
+            return True
         return bi.multi_lora_segment_len >= 256 or (
             bi.multi_lora_count >= 4 and bi.multi_lora_segment_len >= 128
         )
@@ -1227,6 +1365,7 @@ class LoraManager:
             bi,
             lora_a.shape[0],
             self.intermediate_per_tp,
+            input_dim=hidden_states.shape[1],
         ):
             lora_gate_up_batched_slots_cutedsl_fwd(
                 lora_a,
@@ -1451,7 +1590,10 @@ class LoraManager:
                 return cpu_weights[0][mod][0].shape[0]
         for mod, tensors in cpu_weights[0].items():
             if mod.startswith("experts."):
-                return tensors[0].shape[0]
+                lora_A = tensors[0]
+                if lora_A.dim() == 3:
+                    return lora_A.shape[1]
+                return lora_A.shape[0]
         return self.max_lora_rank
 
     def _get_scaling_for(self, name: str, rank: int) -> float:

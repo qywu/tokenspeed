@@ -98,7 +98,7 @@ def _lora_gate_up_expand_kernel(
     seg_start = tl.load(seg_indptr + batch_id)
     n_start = gate_up_id * output_dim
     scaling = tl.load(scalings + w_index)
-    K = tl.multiple_of(tl.minimum(K, rank), BLOCK_K)
+    K = tl.minimum(K, rank)
 
     num_pid_n = tl.cdiv(output_dim, BLOCK_N)
     pid_s = pid // num_pid_n
@@ -125,16 +125,17 @@ def _lora_gate_up_expand_kernel(
     s_mask = s_offset[:, None] < seg_len
     n_mask = n_offset[None, :] < output_dim
     partial_sum = tl.zeros((BLOCK_S, BLOCK_N), dtype=tl.float32)
-    for k in range(0, K // BLOCK_K):
+    for k in range(0, tl.cdiv(K, BLOCK_K)):
+        k_remaining = K - k * BLOCK_K
         x_tile = tl.load(
             x_ptrs,
-            mask=s_mask,
+            mask=s_mask & (k_offset[None, :] < k_remaining),
             other=0.0,
             eviction_policy="evict_first",
         )
         w_tile = tl.load(
             w_ptrs,
-            mask=n_mask,
+            mask=(k_offset[:, None] < k_remaining) & n_mask,
             other=0.0,
             eviction_policy="evict_last",
         )

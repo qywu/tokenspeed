@@ -77,7 +77,11 @@ _DECODE_EXPAND_CONFIGS = [
 ]
 
 
-@triton.autotune(configs=_DECODE_EXPAND_CONFIGS, key=["N", "MAX_RANK"])
+@triton.autotune(
+    configs=_DECODE_EXPAND_CONFIGS,
+    key=["N", "MAX_RANK"],
+    restore_value=["out_sorted"],
+)
 @triton.jit
 def _lora_expand_decode_kernel(
     x_sorted,  # (bs, MAX_RANK) contiguous — sorted by adapter group

@@ -72,6 +72,7 @@ _PREFILL_EXPAND_CONFIGS = [
 @triton.autotune(
     configs=_PREFILL_EXPAND_CONFIGS,
     key=["OUTPUT_DIM", "MAX_RANK", "NUM_SLICES"],
+    restore_value=["output"],
 )
 @triton.jit(do_not_specialize=["output_stride_0", "output_stride_1"])
 def _lora_expand_prefill_kernel(
