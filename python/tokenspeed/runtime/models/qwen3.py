@@ -26,6 +26,7 @@ from collections.abc import Iterable
 from typing import Any
 
 import torch
+from tokenspeed_kernel.ops.layernorm.triton import qk_rmsnorm
 from torch import nn
 
 from tokenspeed.runtime.configs.qwen3_config import Qwen3Config
@@ -196,17 +197,13 @@ class Qwen3Attention(nn.Module):
     def _apply_qk_norm(
         self, q: torch.Tensor, k: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Per-head RMSNorm via the fused flashinfer kernel.  An earlier
-        # ``--enable-lora`` workaround dispatched a pure-PyTorch RMSNorm
-        # here to dodge a JIT-dtype mismatch in the rmsnorm_cute (PDL)
-        # path; that's now obsolete because ``--enable-lora`` forces
-        # ``disable_pdl=True`` so the fused flashinfer rmsnorm is used.
-        # The pure-PyTorch path cost ~138 us / layer in eager decode (24%
-        # of step time) due to many small kernel launches per call.
-        q_shape, k_shape = q.shape, k.shape
-        q = self.q_norm(q.reshape(-1, self.head_dim)).view(q_shape)
-        k = self.k_norm(k.reshape(-1, self.head_dim)).view(k_shape)
-        return q, k
+        return qk_rmsnorm(
+            q,
+            k,
+            self.q_norm.weight.data,
+            self.k_norm.weight.data,
+            self.q_norm.variance_epsilon,
+        )
 
     def _rotate_half(self, x):
         x1 = x[..., : x.shape[-1] // 2]

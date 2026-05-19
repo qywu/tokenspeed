@@ -80,14 +80,14 @@ _DECODE_EXPAND_CONFIGS = [
 @triton.autotune(configs=_DECODE_EXPAND_CONFIGS, key=["N", "MAX_RANK"])
 @triton.jit
 def _lora_expand_decode_kernel(
-    x_sorted,     # (bs, MAX_RANK) contiguous — sorted by adapter group
-    weights,      # (n_slots, N, MAX_RANK) contiguous
-    out_sorted,   # (bs, N) contiguous — add-into (pre-filled with base_output)
+    x_sorted,  # (bs, MAX_RANK) contiguous — sorted by adapter group
+    weights,  # (n_slots, N, MAX_RANK) contiguous
+    out_sorted,  # (bs, N) contiguous — add-into (pre-filled with base_output)
     group_slots,  # (num_groups,) int32
-    group_starts, # (num_groups,) int32 — first row in x_sorted for this group
+    group_starts,  # (num_groups,) int32 — first row in x_sorted for this group
     group_sizes,  # (num_groups,) int32 — number of tokens in this group
-    scalings,     # (n_slots,) float32
-    lora_ranks,   # (n_slots,) int32
+    scalings,  # (n_slots,) float32
+    lora_ranks,  # (n_slots,) int32
     N: tl.constexpr,
     MAX_RANK: tl.constexpr,
     BLOCK_S: tl.constexpr,
@@ -99,36 +99,36 @@ def _lora_expand_decode_kernel(
     x_stride_0: tl.constexpr = MAX_RANK
     x_stride_1: tl.constexpr = 1
     w_stride_0: tl.constexpr = N * MAX_RANK
-    w_stride_1: tl.constexpr = MAX_RANK   # row stride of (N, MAX_RANK) slice
+    w_stride_1: tl.constexpr = MAX_RANK  # row stride of (N, MAX_RANK) slice
     w_stride_2: tl.constexpr = 1
     out_stride_0: tl.constexpr = N
     out_stride_1: tl.constexpr = 1
 
     group_id = tl.program_id(axis=1)
-    pid_n    = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=0)
 
-    w_index  = tl.load(group_slots  + group_id)
-    g_size   = tl.load(group_sizes  + group_id)
+    w_index = tl.load(group_slots + group_id)
+    g_size = tl.load(group_sizes + group_id)
     if g_size == 0:
         return
-    rank     = tl.load(lora_ranks   + w_index)
+    rank = tl.load(lora_ranks + w_index)
     if rank == 0:
         return
-    g_start  = tl.load(group_starts + group_id)
-    scaling  = tl.load(scalings     + w_index)
-    K        = tl.minimum(MAX_RANK, rank)
+    g_start = tl.load(group_starts + group_id)
+    scaling = tl.load(scalings + w_index)
+    K = tl.minimum(MAX_RANK, rank)
 
     n_offset = tl.arange(0, BLOCK_N) + pid_n * BLOCK_N
     k_offset = tl.max_contiguous(tl.arange(0, BLOCK_K), BLOCK_K)
-    n_mask   = n_offset[None, :] < N
+    n_mask = n_offset[None, :] < N
 
     # Process the group in BLOCK_S-wide GEMM tiles.  When the group size is a
     # multiple of BLOCK_S (e.g. 16 tokens with BLOCK_S=16) every tile is
     # fully packed and tensor cores run at 100% efficiency.
     for tile_s in range(0, tl.cdiv(g_size, BLOCK_S)):
         s_offset = tl.arange(0, BLOCK_S)
-        abs_s    = g_start + tile_s * BLOCK_S + s_offset
-        s_mask   = (s_offset < g_size - tile_s * BLOCK_S)[:, None]
+        abs_s = g_start + tile_s * BLOCK_S + s_offset
+        s_mask = (s_offset < g_size - tile_s * BLOCK_S)[:, None]
 
         x_ptrs = x_sorted + abs_s[:, None] * x_stride_0 + k_offset[None, :] * x_stride_1
         w_ptrs = (weights + w_index * w_stride_0) + (
@@ -137,27 +137,31 @@ def _lora_expand_decode_kernel(
 
         partial = tl.zeros((BLOCK_S, BLOCK_N), dtype=tl.float32)
         for k in range(0, tl.cdiv(K, BLOCK_K)):
-            k_rem   = K - k * BLOCK_K
-            x_tile  = tl.load(
+            k_rem = K - k * BLOCK_K
+            x_tile = tl.load(
                 x_ptrs,
                 mask=s_mask & (k_offset[None, :] < k_rem),
                 other=0.0,
                 eviction_policy="evict_first",
             )
-            w_tile  = tl.load(
+            w_tile = tl.load(
                 w_ptrs,
                 mask=(k_offset[:, None] < k_rem) & n_mask,
                 other=0.0,
                 eviction_policy="evict_last",  # shared across all tiles of this group
             )
             partial += tl.dot(x_tile, w_tile)
-            x_ptrs  += BLOCK_K * x_stride_1
-            w_ptrs  += BLOCK_K * w_stride_2
+            x_ptrs += BLOCK_K * x_stride_1
+            w_ptrs += BLOCK_K * w_stride_2
 
         partial *= scaling
-        partial  = partial.to(x_sorted.dtype.element_ty)
+        partial = partial.to(x_sorted.dtype.element_ty)
 
-        out_ptrs = out_sorted + abs_s[:, None] * out_stride_0 + n_offset[None, :] * out_stride_1
+        out_ptrs = (
+            out_sorted
+            + abs_s[:, None] * out_stride_0
+            + n_offset[None, :] * out_stride_1
+        )
         out_mask = s_mask & n_mask
         partial += tl.load(out_ptrs, mask=out_mask, other=0.0)
         tl.store(out_ptrs, partial, mask=out_mask)
@@ -180,9 +184,9 @@ def lora_expand_decode_fwd(
     assert x.is_contiguous()
     assert weights.is_contiguous()
 
-    bs      = batch_info.bs
-    S, R    = x.shape
-    N       = weights.shape[-2]
+    bs = batch_info.bs
+    S, R = x.shape
+    N = weights.shape[-2]
     dev, dt = x.device, x.dtype
 
     sort_order = batch_info.sort_order[:bs]
