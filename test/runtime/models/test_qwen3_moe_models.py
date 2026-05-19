@@ -16,7 +16,7 @@ def _tiny_qwen3_moe_config() -> Qwen3MoeConfig:
         hidden_size=16,
         intermediate_size=32,
         num_hidden_layers=2,
-        num_attention_heads=2,
+        num_attention_heads=4,
         num_key_value_heads=1,
         head_dim=8,
         max_position_embeddings=128,
@@ -28,6 +28,12 @@ def _tiny_qwen3_moe_config() -> Qwen3MoeConfig:
 
 def _single_rank_mapping() -> Mapping:
     mapping = Mapping(rank=0, world_size=1)
+    global_server_args_dict["mapping"] = mapping
+    return mapping
+
+
+def _ep_rank_mapping(rank: int) -> Mapping:
+    mapping = Mapping(rank=rank, world_size=4, moe_ep_size=4)
     global_server_args_dict["mapping"] = mapping
     return mapping
 
@@ -135,6 +141,31 @@ class TestQwen3MoeConfig(unittest.TestCase):
         w2 = params["model.layers.0.mlp.experts.w2_weight"]
         self.assertEqual(w13[0, :8].mean().item(), 1.0)
         self.assertEqual(w13[0, 8:].mean().item(), 11.0)
+        self.assertEqual(w2[0].mean().item(), 21.0)
+
+    def test_skips_nonlocal_expert_weights_under_expert_parallelism(self):
+        from tokenspeed.runtime.models.qwen3_moe import Qwen3MoeForCausalLM
+
+        model = Qwen3MoeForCausalLM(
+            _tiny_qwen3_moe_config(),
+            mapping=_ep_rank_mapping(rank=0),
+        )
+        model.load_weights(
+            [
+                (
+                    "model.layers.0.mlp.experts.0.down_proj.weight",
+                    torch.full((16, 8), 21.0),
+                ),
+                (
+                    "model.layers.0.mlp.experts.3.down_proj.weight",
+                    torch.full((16, 8), 24.0),
+                ),
+            ]
+        )
+
+        params = dict(model.named_parameters())
+        w2 = params["model.layers.0.mlp.experts.w2_weight"]
+        self.assertEqual(w2.shape[0], 1)
         self.assertEqual(w2[0].mean().item(), 21.0)
 
 
