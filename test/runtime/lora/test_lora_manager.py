@@ -32,7 +32,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tokenspeed.runtime.lora.lora_manager import LoraManager
+from tokenspeed.runtime.lora.lora_batch import NO_LORA_SLOT
+from tokenspeed.runtime.lora.lora_manager import (
+    LoraManager,
+    _use_triton_grouped_decode,
+)
 
 
 def _model_config():
@@ -89,7 +93,7 @@ def test_prepare_loras_uniform_decode(manager):
     torch.cuda.synchronize()
     assert bi.seg_lens[:4].tolist() == [1, 1, 1, 1]
     assert bi.seg_indptr[:5].tolist() == [0, 1, 2, 3, 4]
-    assert bi.weight_indices[:4].tolist() == [0, 0, 0, 0]
+    assert bi.weight_indices[:4].tolist() == [NO_LORA_SLOT] * 4
 
 
 def test_prepare_loras_target_verify_repeats(manager):
@@ -115,11 +119,11 @@ def test_prepare_loras_variable_segments(manager):
     assert bi.seg_indptr[:4].tolist() == [0, 5, 6, 8]
 
 
-def test_prepare_loras_unknown_id_falls_back_to_slot_zero(manager):
+def test_prepare_loras_unknown_id_falls_back_to_no_lora_slot(manager):
     n = manager.prepare_loras([99], per_request_token_counts=2)
     assert n == 2
     torch.cuda.synchronize()
-    assert manager.batch_info.weight_indices[:1].tolist() == [0]
+    assert manager.batch_info.weight_indices[:1].tolist() == [NO_LORA_SLOT]
 
 
 def test_prepare_loras_overflow_raises(manager):
@@ -132,12 +136,13 @@ def test_prepare_loras_mismatched_lengths_raises(manager):
         manager.prepare_loras([0, 0], per_request_token_counts=[1, 2, 3])
 
 
-def test_no_adapter_slot_has_zero_rank_and_scaling(manager):
-    # Slot 0 stays at rank 0 / scaling 0 forever — it's the no-op sentinel
-    # the Triton kernels short-circuit on.
+def test_manager_allocates_only_real_adapter_slots(manager):
+    # Match vLLM's layout: the GPU pool contains only real adapter slots.
+    # Base/no-LoRA requests use NO_LORA_SLOT in per-step metadata.
     torch.cuda.synchronize()
-    assert manager.batch_info.lora_ranks[0].item() == 0
-    assert manager.batch_info.scalings[0].item() == 0.0
+    assert manager._n_slots == manager.max_loras
+    assert len(manager._slot_to_name) == manager.max_loras
+    assert manager.batch_info.weight_indices[0].item() == NO_LORA_SLOT
 
 
 def test_has_active_lora_flag(manager):
@@ -145,15 +150,10 @@ def test_has_active_lora_flag(manager):
     # the no-LoRA captured graph variant (skip the per-step Triton kernels).
     manager.prepare_loras([0, 0, 0])
     assert manager.has_active_lora is False
-    # Unknown id falls back to slot 0 → still no active adapter.
+    # Unknown id falls back to NO_LORA_SLOT → still no active adapter.
     manager.prepare_loras([99])
     assert manager.has_active_lora is False
-
-
-# ──────────────────────────────────────────────────────────────────────────
-# Tiered GPU↔CPU↔disk pool tests.  These don't actually do GEMMs, just
-# verify the residence + eviction bookkeeping under various loads.
-# ──────────────────────────────────────────────────────────────────────────
+    assert manager.batch_info.single_lora_slot == NO_LORA_SLOT
 
 
 def _write_dummy_adapter(tmp_path, rank: int, hidden: int, n_layers: int) -> str:
@@ -164,12 +164,12 @@ def _write_dummy_adapter(tmp_path, rank: int, hidden: int, n_layers: int) -> str
 
     tensors = {}
     for layer in range(n_layers):
-        for mod in ("q_proj", "k_proj", "v_proj", "o_proj"):
-            base = f"base_model.model.model.layers.{layer}.self_attn.{mod}"
-            tensors[f"{base}.lora_A.weight"] = torch.randn(
+        prefix = f"base_model.model.model.layers.{layer}.self_attn"
+        for proj in ("q_proj", "k_proj", "v_proj", "o_proj"):
+            tensors[f"{prefix}.{proj}.lora_A.weight"] = torch.randn(
                 rank, hidden, dtype=torch.float32
             )
-            tensors[f"{base}.lora_B.weight"] = torch.randn(
+            tensors[f"{prefix}.{proj}.lora_B.weight"] = torch.randn(
                 hidden, rank, dtype=torch.float32
             )
     save_file(tensors, str(tmp_path / "adapter_model.safetensors"))
@@ -193,16 +193,79 @@ def adapter_paths(tmp_path):
     return paths
 
 
-def _tiered_manager(max_loras_cpu: int) -> LoraManager:
+def _tiered_manager(
+    max_loras_cpu: int,
+    max_num_tokens: int = 64,
+) -> LoraManager:
     return LoraManager(
         model_config=_model_config(),
         max_loras=2,
         max_lora_rank=8,
-        max_num_tokens=64,
+        max_num_tokens=max_num_tokens,
         max_loras_cpu=max_loras_cpu,
         dtype=torch.float16,
         device=torch.device("cuda:0"),
     )
+
+
+def test_prepare_loras_single_lora_slot_metadata(adapter_paths):
+    if not torch.cuda.is_available():
+        pytest.skip("LoraManager allocates GPU buffers")
+    m = _tiered_manager(max_loras_cpu=4, max_num_tokens=128)
+    m.load_adapter("a0", adapter_paths["a0"])
+    m.load_adapter("a1", adapter_paths["a1"])
+    a0_id = m.get_id("a0")
+    a1_id = m.get_id("a1")
+
+    m.prepare_loras([a0_id, a0_id], per_request_token_counts=16)
+    slot = m.batch_info.weight_indices[0].item()
+    assert slot != NO_LORA_SLOT
+    assert m.batch_info.single_lora_slot == slot
+
+    m.prepare_loras([a0_id, a1_id], per_request_token_counts=16)
+    assert m.batch_info.single_lora_slot == NO_LORA_SLOT
+
+    m.prepare_loras([0, a0_id], per_request_token_counts=16)
+    assert m.batch_info.single_lora_slot == NO_LORA_SLOT
+
+
+def test_prepare_loras_multi_lora_slot_metadata(adapter_paths):
+    if not torch.cuda.is_available():
+        pytest.skip("LoraManager allocates GPU buffers")
+    m = _tiered_manager(max_loras_cpu=4, max_num_tokens=128)
+    m.load_adapter("a0", adapter_paths["a0"])
+    m.load_adapter("a1", adapter_paths["a1"])
+    a0_id = m.get_id("a0")
+    a1_id = m.get_id("a1")
+
+    m.prepare_loras([a0_id, a1_id], per_request_token_counts=64)
+    assert m.batch_info.single_lora_slot == NO_LORA_SLOT
+    assert m.batch_info.multi_lora_start_slot == m.batch_info.weight_indices[0].item()
+    assert m.batch_info.multi_lora_count == 2
+    assert m.batch_info.multi_lora_segment_len == 64
+    assert m.batch_info.multi_lora_rank > 0
+
+    m.prepare_loras([a0_id, a1_id], per_request_token_counts=[64, 32])
+    assert m.batch_info.multi_lora_start_slot == NO_LORA_SLOT
+
+    m.prepare_loras([a1_id, a0_id], per_request_token_counts=64)
+    assert m.batch_info.multi_lora_start_slot == NO_LORA_SLOT
+
+
+def test_triton_grouped_decode_threshold():
+    bi = SimpleNamespace(single_lora_slot=NO_LORA_SLOT, num_groups=4, bs=128)
+    assert _use_triton_grouped_decode(bi)
+
+    bi.bs = 64
+    assert not _use_triton_grouped_decode(bi)
+
+    bi.bs = 128
+    bi.single_lora_slot = 1
+    assert not _use_triton_grouped_decode(bi)
+
+    bi.single_lora_slot = NO_LORA_SLOT
+    bi.num_groups = 0
+    assert not _use_triton_grouped_decode(bi)
 
 
 def test_max_loras_cpu_ge_max_loras(adapter_paths):

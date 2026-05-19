@@ -78,6 +78,7 @@ class W8A8PerTokenPerChannelFp8TritonBackend(MoEBackend):
         topk_output,
         num_global_tokens,
         max_num_tokens_per_gpu,
+        moe_lora_context=None,
     ):
         del num_global_tokens, max_num_tokens_per_gpu
         return triton_forward(
@@ -88,7 +89,12 @@ class W8A8PerTokenPerChannelFp8TritonBackend(MoEBackend):
             layer,
             hidden_states,
             topk_output,
+            moe_lora_context=moe_lora_context,
         )
+
+    @property
+    def supports_moe_lora(self) -> bool:
+        return True
 
 
 W8A8Fp8TritonBackend = W8A8PerTokenPerChannelFp8TritonBackend

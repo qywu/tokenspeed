@@ -374,6 +374,7 @@ class CudaGraphWrapper:
             device=self.device,
         )
 
+        from tokenspeed.runtime.execution.context import bind_forward_context
         from tokenspeed.runtime.grammar.capturable_grammar import (
             bind_grammar_mask_buf,
         )
@@ -401,7 +402,8 @@ class CudaGraphWrapper:
                 self.capturable_grammar.add_batch(
                     grammars=[None] * bs, bs=bs, has_candidates=False
                 )
-            return self._forward_func(bs=bs, ctx=ctx, sampling_info=sampling_info)
+            with bind_forward_context(ctx):
+                return self._forward_func(bs=bs, ctx=ctx, sampling_info=sampling_info)
 
         # Warm up before capture.
         for _ in range(4):
@@ -918,7 +920,10 @@ class CudaGraphWrapper:
                 **mamba_kwargs,
             )
 
-            result = self._forward_func(bs=bs, ctx=ctx, sampling_info=sampling_info)
+            from tokenspeed.runtime.execution.context import bind_forward_context
+
+            with bind_forward_context(ctx):
+                result = self._forward_func(bs=bs, ctx=ctx, sampling_info=sampling_info)
 
         # Update mamba/GDN state after speculative verify
         if (

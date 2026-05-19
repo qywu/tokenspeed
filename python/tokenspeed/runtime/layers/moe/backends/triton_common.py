@@ -121,6 +121,7 @@ def triton_forward(
     layer: nn.Module,
     hidden_states: torch.Tensor,
     topk_output: object,
+    moe_lora_context=None,
 ) -> torch.Tensor:
     from tokenspeed.runtime.layers.activation import silu_and_mul
 
@@ -208,6 +209,14 @@ def triton_forward(
         b_use_tma=gate_up_moe_use_tma,
         c_sorted=down_moe_use_tma,
     )
+    if moe_lora_context is not None:
+        moe_lora_context.apply_gate_up_lora(
+            layer.layer_index,
+            hidden_states,
+            topk_ids,
+            intermediate_cache1,
+            sorted_token_ids=sorted_token_ids if down_moe_use_tma else None,
+        )
 
     if activation == "silu":
         silu_and_mul(
@@ -231,6 +240,15 @@ def triton_forward(
         a_use_tma=down_moe_use_tma,
         b_use_tma=down_moe_use_tma,
     )
+    if moe_lora_context is not None:
+        moe_lora_context.apply_down_lora(
+            layer.layer_index,
+            intermediate_cache2,
+            topk_ids,
+            topk_weights,
+            intermediate_cache3,
+            sorted_token_ids=sorted_token_ids if down_moe_use_tma else None,
+        )
 
     out_hidden_states = torch.empty_like(hidden_states)
     # Current limitation: Should avoid using runtime shapes as traits

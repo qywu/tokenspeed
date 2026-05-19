@@ -22,21 +22,6 @@ from tokenspeed_kernel.profiling import bootstrap_profiling_from_env
 
 bootstrap_profiling_from_env()
 
-from tokenspeed_kernel.ops.attention import (
-    mha_decode_scheduler_metadata,
-    mha_decode_with_kvcache,
-    mha_prefill,
-    mha_prefill_with_kvcache,
-)
-from tokenspeed_kernel.ops.gemm import mm
-from tokenspeed_kernel.ops.moe import (
-    moe_combine,
-    moe_dispatch,
-    moe_experts,
-    moe_fused,
-    moe_route,
-)
-
 __all__ = [
     "mm",
     "moe_route",
@@ -47,5 +32,20 @@ __all__ = [
     "mha_prefill",
     "mha_prefill_with_kvcache",
     "mha_decode_with_kvcache",
-    "mha_decode_scheduler_metadata",
 ]
+
+
+def __getattr__(name: str):
+    if name == "mm":
+        from tokenspeed_kernel.ops.gemm import mm
+
+        return mm
+    if name in {"moe_route", "moe_dispatch", "moe_experts", "moe_combine", "moe_fused"}:
+        from tokenspeed_kernel.ops import moe
+
+        return getattr(moe, name)
+    if name in {"mha_prefill", "mha_prefill_with_kvcache", "mha_decode_with_kvcache"}:
+        from tokenspeed_kernel.ops import attention
+
+        return getattr(attention, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

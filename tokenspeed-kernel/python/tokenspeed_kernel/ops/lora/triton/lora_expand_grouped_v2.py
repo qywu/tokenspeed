@@ -106,6 +106,8 @@ def _lora_expand_grouped_v2_kernel(
     pid_n = pid_flat % cta_n_num
 
     w_index = tl.load(group_slots + group_id)
+    if w_index < 0:
+        return
     g_size = tl.load(group_sizes + group_id)
     if g_size == 0:
         return
@@ -195,11 +197,19 @@ def lora_expand_grouped_v2_fwd(
 
     num_groups = batch_info.num_groups
 
-    M = batch_info.bs  # upper bound on per-group token count
+    # Use the largest group size for the M dimension, not the total batch size.
+    # This makes the grid tight for both extremes:
+    #   • n_unique = n  (all different): max_group_size = 1
+    #     → grid = (1 × cdiv(N,BLOCK_N), n) ≡ segmented layout, zero wasted CTAs
+    #   • n_unique = 1  (all same):      max_group_size = n
+    #     → grid = (n/BLOCK_S × cdiv(N,BLOCK_N), 1) ≡ grpv2 layout
+    # max_group_size is pre-computed on CPU in prepare_loras — no GPU sync here.
+    max_group_size = batch_info.max_group_size
 
     def grid(meta):
         return (
-            triton.cdiv(M, meta["BLOCK_S"]) * triton.cdiv(N, meta["BLOCK_N"]),
+            triton.cdiv(max_group_size, meta["BLOCK_S"])
+            * triton.cdiv(N, meta["BLOCK_N"]),
             num_groups,
         )
 

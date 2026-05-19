@@ -34,9 +34,8 @@ For each layer the manager owns:
   A, sharded along input dim.
 * ``o_B_buffers[layer]``:   ``(n_slots, hidden, max_rank)`` — full B.
 
-Slot 0 is the no-adapter sentinel (rank 0, scaling 0).  The Triton
-kernels short-circuit on slot 0, so the captured CUDA graph stays a no-op
-when no request uses an adapter.
+No-LoRA requests use ``NO_LORA_SLOT`` (-1), matching vLLM's convention.
+Real adapters occupy slots ``0 .. max_loras - 1``.
 
 Tensor parallelism
 ------------------
@@ -56,13 +55,6 @@ import os
 from collections import OrderedDict
 
 import torch
-from tokenspeed_kernel.ops.lora.cutedsl import (
-    lora_expand_batched_slots_cutedsl_fwd,
-    lora_expand_single_slot_cutedsl_fwd,
-    lora_gate_up_batched_slots_cutedsl_fwd,
-    lora_gate_up_single_slot_cutedsl_fwd,
-    lora_qkv_single_slot_cutedsl_fwd,
-)
 from tokenspeed_kernel.ops.lora.triton import (
     lora_expand_fwd,
     lora_expand_grouped_v2_fwd,
@@ -78,8 +70,12 @@ from tokenspeed.runtime.lora.adapter_io import (
     read_adapter_scaling,
     resolve_adapter_weight_path,
 )
-from tokenspeed.runtime.lora.lora_batch import LoraBatchInfo, build_decode_lora_groups
-from tokenspeed.runtime.lora.lora_buffers import LoraWeightBuffers
+from tokenspeed.runtime.lora.lora_batch import (
+    NO_LORA_SLOT,
+    LoraBatchInfo,
+    build_decode_lora_groups,
+)
+from tokenspeed.runtime.lora.lora_buffers import LORA_BUFFER_GROUPS, LoraWeightBuffers
 from tokenspeed.runtime.lora.lora_cache import LoraCpuCache
 from tokenspeed.runtime.lora.moe_lora import MoeLoraBuffers, MoeLoraContext
 from tokenspeed.runtime.utils import get_colorful_logger
@@ -90,24 +86,10 @@ from tokenspeed.runtime.utils import get_colorful_logger
 # benchmarks: chunked-SGMV wins above ~32 tokens/segment at rank ≥ 64.
 _CHUNKED_THRESHOLD = 32
 
-# The CuTeDSL single-slot expand path lowers LoRA-B expand to dense GEMM-adds.
-# Thresholds are based on H100 full-path measurements, including the Triton
-# shrink that still feeds the CuTeDSL expand.
-_CUTEDSL_SINGLE_SLOT_DECODE_MIN_OUT_DIM = 3072
-_CUTEDSL_SINGLE_SLOT_LOW_RANK_MIN_OUT_DIM = 1024
-_CUTEDSL_SINGLE_SLOT_PREFILL_MIN_OUT_DIM = 2048
-_CUTEDSL_SINGLE_SLOT_LOW_OUT_MIN_TOKENS = 256
-_CUTEDSL_SINGLE_SLOT_LOW_OUT_DECODE_MIN_TOKENS = 64
-_CUTEDSL_MULTI_SLOT_MIN_OUT_DIM = 3072
-_CUTEDSL_MULTI_SLOT_LOW_OUT_DIM = 2048
-_CUTEDSL_SINGLE_SLOT_SMALL_PREFILL_MIN_TOKENS = 128
-_CUTEDSL_SINGLE_SLOT_GATE_UP_SMALL_OUT_DIM = 1024
-_CUTEDSL_SINGLE_SLOT_GATE_UP_SMALL_MIN_TOKENS = 256
-_CUTEDSL_SINGLE_SLOT_GATE_UP_LOW_OUT_MIN_TOKENS = 512
-_CUTEDSL_GATE_UP_SMALL_OUT_DIM = 4096
-_CUTEDSL_GATE_UP_MEDIUM_OUT_DIM = 8192
-_CUTEDSL_GATE_UP_LARGE_OUT_DIM = 12288
-_TRITON_GROUPED_DECODE_MIN_GROUP_SIZE = 32
+# With max_group_size-based grid, the kernel degenerates to the segmented
+# layout when every group has 1 token (n_unique = n), so no threshold is
+# needed for correctness.  Keep a minimum of 1 (always use grpv2).
+_TRITON_GROUPED_DECODE_MIN_GROUP_SIZE = 1
 
 logger = get_colorful_logger(__name__)
 
@@ -115,637 +97,10 @@ logger = get_colorful_logger(__name__)
 # ── Manager ─────────────────────────────────────────────────────────────────
 
 
-def _use_cutedsl_single_slot_expand(
-    bi: LoraBatchInfo,
-    total_tokens: int,
-    out_dim: int,
-    lora_rank: int,
-    input_dim: int = 4096,
-) -> bool:
-    """Return whether the single-slot CuTeDSL expand is faster than Triton.
-
-    The dense CuTeDSL path wins for single-adapter prefill shapes once the
-    output tile and token count are large enough; smaller output tiles stay on
-    Triton.
-    """
-    if bi.single_lora_slot <= 0:
-        return False
-    if input_dim < 4096:
-        if input_dim < 3072:
-            if input_dim < 2048 and bi.max_len == 1:
-                if out_dim >= _CUTEDSL_SINGLE_SLOT_PREFILL_MIN_OUT_DIM:
-                    return (lora_rank >= 64 and total_tokens >= 64) or (
-                        lora_rank >= 32 and total_tokens >= 128
-                    )
-                return (
-                    out_dim >= _CUTEDSL_SINGLE_SLOT_LOW_RANK_MIN_OUT_DIM
-                    and lora_rank >= 64
-                    and total_tokens >= 128
-                )
-            if bi.max_len == 1:
-                if out_dim >= _CUTEDSL_SINGLE_SLOT_PREFILL_MIN_OUT_DIM:
-                    return lora_rank >= 64 and total_tokens >= 64
-                return (
-                    out_dim >= _CUTEDSL_SINGLE_SLOT_LOW_RANK_MIN_OUT_DIM
-                    and lora_rank >= 64
-                    and total_tokens >= 128
-                )
-            if bi.max_len <= _CHUNKED_THRESHOLD:
-                return False
-            if input_dim >= 1536 and input_dim < 2048:
-                if out_dim >= _CUTEDSL_SINGLE_SLOT_PREFILL_MIN_OUT_DIM:
-                    return (lora_rank >= 64 and total_tokens >= 512) or (
-                        lora_rank >= 32 and total_tokens >= 1024
-                    )
-                if out_dim >= _CUTEDSL_SINGLE_SLOT_LOW_RANK_MIN_OUT_DIM:
-                    return lora_rank >= 64 and total_tokens >= 512
-                return False
-            if out_dim >= _CUTEDSL_SINGLE_SLOT_PREFILL_MIN_OUT_DIM:
-                return lora_rank >= 64 and total_tokens >= 512
-            if out_dim >= _CUTEDSL_SINGLE_SLOT_LOW_RANK_MIN_OUT_DIM:
-                return lora_rank >= 64 and total_tokens >= 1024
-            return False
-        if bi.max_len == 1:
-            if out_dim < _CUTEDSL_SINGLE_SLOT_PREFILL_MIN_OUT_DIM:
-                return (
-                    out_dim >= _CUTEDSL_SINGLE_SLOT_LOW_RANK_MIN_OUT_DIM
-                    and lora_rank >= 64
-                    and total_tokens >= 64
-                )
-            return (lora_rank >= 64 and total_tokens >= 32) or (
-                lora_rank >= 16 and total_tokens >= 128
-            )
-        if bi.max_len <= _CHUNKED_THRESHOLD:
-            return False
-        if out_dim >= _CUTEDSL_SINGLE_SLOT_PREFILL_MIN_OUT_DIM:
-            return lora_rank >= 16 and total_tokens >= 512
-        if out_dim >= _CUTEDSL_SINGLE_SLOT_LOW_RANK_MIN_OUT_DIM:
-            return lora_rank >= 64 and total_tokens >= 512
-        return False
-    if bi.max_len == 1:
-        if out_dim >= _CUTEDSL_SINGLE_SLOT_DECODE_MIN_OUT_DIM:
-            if input_dim >= 7168 and lora_rank > 8 and lora_rank < 32:
-                return total_tokens >= 32
-            if lora_rank > 8 and lora_rank < 32:
-                return total_tokens >= 64
-            return lora_rank >= 8 and total_tokens >= 32
-        if out_dim >= _CUTEDSL_SINGLE_SLOT_PREFILL_MIN_OUT_DIM:
-            if lora_rank >= 128:
-                return total_tokens >= 32
-            if lora_rank >= 32:
-                return total_tokens >= 64
-            if (
-                input_dim >= 8192
-                and lora_rank == 8
-                and out_dim == _CUTEDSL_SINGLE_SLOT_PREFILL_MIN_OUT_DIM
-            ):
-                return total_tokens >= 32
-            if (
-                input_dim >= 8192
-                and lora_rank >= 16
-                and lora_rank < 32
-                and out_dim == _CUTEDSL_SINGLE_SLOT_PREFILL_MIN_OUT_DIM
-            ):
-                return total_tokens >= 32
-            if (
-                input_dim >= 7168
-                and lora_rank >= 8
-                and lora_rank < 32
-                and out_dim == _CUTEDSL_SINGLE_SLOT_PREFILL_MIN_OUT_DIM
-            ):
-                return total_tokens >= 64
-            if lora_rank >= 8 and out_dim == _CUTEDSL_SINGLE_SLOT_PREFILL_MIN_OUT_DIM:
-                return total_tokens >= 128
-            return lora_rank >= 16 and total_tokens >= 128
-        return (
-            out_dim >= _CUTEDSL_SINGLE_SLOT_LOW_RANK_MIN_OUT_DIM
-            and (
-                lora_rank >= 64
-                or (
-                    input_dim >= 7168
-                    and out_dim == _CUTEDSL_SINGLE_SLOT_LOW_RANK_MIN_OUT_DIM
-                    and lora_rank >= 8
-                )
-            )
-            and (total_tokens >= _CUTEDSL_SINGLE_SLOT_LOW_OUT_DECODE_MIN_TOKENS)
-        )
-    if out_dim >= _CUTEDSL_SINGLE_SLOT_LOW_RANK_MIN_OUT_DIM and out_dim < (
-        _CUTEDSL_SINGLE_SLOT_PREFILL_MIN_OUT_DIM
-    ):
-        if input_dim >= 7168:
-            return bi.max_len > _CHUNKED_THRESHOLD and (
-                lora_rank >= 8 and total_tokens >= 64
-            )
-        if input_dim == 4096 and out_dim == _CUTEDSL_SINGLE_SLOT_LOW_RANK_MIN_OUT_DIM:
-            return bi.max_len > _CHUNKED_THRESHOLD and (
-                (lora_rank >= 64 and total_tokens >= 256)
-                or (lora_rank >= 8 and lora_rank <= 16 and total_tokens >= 64)
-            )
-        return bi.max_len > _CHUNKED_THRESHOLD and (
-            (
-                lora_rank >= 64
-                and total_tokens >= _CUTEDSL_SINGLE_SLOT_LOW_OUT_MIN_TOKENS
-            )
-            or (lora_rank >= 16 and total_tokens >= 512)
-            or (lora_rank >= 8 and total_tokens >= 1024)
-        )
-    if out_dim >= _CUTEDSL_SINGLE_SLOT_PREFILL_MIN_OUT_DIM:
-        if out_dim < _CUTEDSL_SINGLE_SLOT_DECODE_MIN_OUT_DIM:
-            if input_dim >= 7168:
-                return (
-                    bi.max_len > _CHUNKED_THRESHOLD
-                    and lora_rank >= 8
-                    and total_tokens >= 64
-                )
-            if (
-                input_dim == 4096
-                and out_dim == _CUTEDSL_SINGLE_SLOT_PREFILL_MIN_OUT_DIM
-                and lora_rank == 8
-            ):
-                return bi.max_len > _CHUNKED_THRESHOLD and total_tokens >= 64
-            return (
-                bi.max_len > _CHUNKED_THRESHOLD
-                and lora_rank >= 8
-                and total_tokens >= _CUTEDSL_SINGLE_SLOT_SMALL_PREFILL_MIN_TOKENS
-            )
-        return (
-            bi.max_len > _CHUNKED_THRESHOLD
-            and lora_rank >= 8
-            and total_tokens > _CHUNKED_THRESHOLD
-        )
-    return False
-
-
-def _use_cutedsl_multi_slot_expand(
-    bi: LoraBatchInfo,
-    total_tokens: int,
-    out_dim: int,
-    input_dim: int = 4096,
-) -> bool:
-    """Return whether equal-length consecutive multi-slot CuTeDSL should win."""
-    if input_dim < 4096:
-        if not (
-            input_dim >= 3072
-            and bi.multi_lora_start_slot > 0
-            and bi.max_len > _CHUNKED_THRESHOLD
-            and total_tokens > _CHUNKED_THRESHOLD
-        ):
-            return False
-        if (
-            bi.multi_lora_count == 4
-            and bi.multi_lora_segment_len >= 128
-            and bi.multi_lora_rank >= 32
-            and out_dim >= 4096
-        ):
-            return True
-        return (
-            bi.multi_lora_count >= 2
-            and bi.multi_lora_count <= 4
-            and out_dim >= 8192
-            and bi.multi_lora_rank >= 16
-            and bi.multi_lora_segment_len >= 128
-        )
-    if bi.multi_lora_start_slot <= 0:
-        return False
-    if bi.multi_lora_count < 2 or bi.multi_lora_count > 4:
-        return False
-    if out_dim < _CUTEDSL_MULTI_SLOT_LOW_OUT_DIM:
-        return False
-    if out_dim < 4096 and bi.multi_lora_rank < 64:
-        return False
-    if (
-        out_dim < _CUTEDSL_MULTI_SLOT_MIN_OUT_DIM
-        and bi.multi_lora_segment_len < 256
-        and not (bi.multi_lora_rank >= 64 and bi.multi_lora_segment_len >= 128)
-    ):
-        return False
-    if (
-        out_dim >= _CUTEDSL_GATE_UP_LARGE_OUT_DIM
-        and bi.multi_lora_segment_len >= 64
-        and (
-            (
-                bi.multi_lora_rank >= 16
-                and (bi.multi_lora_count >= 4 or input_dim >= 5120)
-            )
-            or (bi.multi_lora_rank >= 8 and bi.multi_lora_count >= 4)
-        )
-    ):
-        return bi.max_len > _CHUNKED_THRESHOLD and total_tokens > _CHUNKED_THRESHOLD
-    if (
-        input_dim >= 5120
-        and input_dim < 7168
-        and out_dim >= 4096
-        and out_dim <= 8192
-        and bi.multi_lora_rank >= 8
-        and (
-            bi.multi_lora_segment_len >= 128
-            or (out_dim >= 8192 and bi.multi_lora_segment_len >= 64)
-        )
-    ):
-        return bi.max_len > _CHUNKED_THRESHOLD and total_tokens > _CHUNKED_THRESHOLD
-    if (
-        input_dim == 7168
-        and out_dim >= 8192
-        and out_dim <= 8192
-        and bi.multi_lora_count >= 4
-        and bi.multi_lora_rank >= 16
-        and bi.multi_lora_segment_len >= 128
-    ):
-        return bi.max_len > _CHUNKED_THRESHOLD and total_tokens > _CHUNKED_THRESHOLD
-    if (
-        input_dim == 4096
-        and out_dim == 8192
-        and bi.multi_lora_count >= 4
-        and bi.multi_lora_rank >= 16
-        and bi.multi_lora_segment_len >= 64
-    ):
-        return bi.max_len > _CHUNKED_THRESHOLD and total_tokens > _CHUNKED_THRESHOLD
-    if input_dim == 7168 and out_dim < 8192 and bi.multi_lora_rank < 64:
-        return False
-    if (
-        input_dim >= 8192
-        and out_dim >= 4096
-        and out_dim <= 8192
-        and bi.multi_lora_rank >= 8
-        and bi.multi_lora_segment_len >= 128
-    ):
-        return bi.max_len > _CHUNKED_THRESHOLD and total_tokens > _CHUNKED_THRESHOLD
-    return (
-        bi.max_len > _CHUNKED_THRESHOLD
-        and bi.multi_lora_rank >= 8
-        and total_tokens > _CHUNKED_THRESHOLD
-        and (
-            (bi.multi_lora_rank >= 64 and bi.multi_lora_segment_len >= 64)
-            or (
-                out_dim >= 8192
-                and bi.multi_lora_rank >= 16
-                and bi.multi_lora_segment_len >= 128
-            )
-            or bi.multi_lora_segment_len >= 256
-            or (bi.multi_lora_count >= 4 and bi.multi_lora_segment_len >= 128)
-        )
-    )
-
-
-def _use_cutedsl_single_slot_gate_up(
-    bi: LoraBatchInfo,
-    total_tokens: int,
-    output_dim: int,
-    lora_rank: int,
-    input_dim: int = 4096,
-) -> bool:
-    """Return whether the two-GEMM CuTeDSL gate/up path should beat Triton."""
-    if bi.single_lora_slot <= 0:
-        return False
-    if input_dim < 4096:
-        if input_dim < 3072:
-            if input_dim < 2048:
-                if bi.max_len == 1:
-                    if output_dim >= 2048:
-                        return (lora_rank >= 64 and total_tokens >= 64) or (
-                            lora_rank >= 32 and total_tokens >= 128
-                        )
-                    return (
-                        output_dim >= _CUTEDSL_SINGLE_SLOT_GATE_UP_SMALL_OUT_DIM
-                        and lora_rank >= 64
-                        and total_tokens >= 64
-                    )
-                if bi.max_len <= _CHUNKED_THRESHOLD:
-                    return False
-                if output_dim >= 2048:
-                    return lora_rank >= 64 and total_tokens >= 512
-                return (
-                    output_dim >= _CUTEDSL_SINGLE_SLOT_GATE_UP_SMALL_OUT_DIM
-                    and lora_rank >= 64
-                    and total_tokens >= 1024
-                )
-            if bi.max_len == 1:
-                if output_dim >= 2048:
-                    return lora_rank >= 64 and total_tokens >= 64
-                return (
-                    output_dim >= _CUTEDSL_SINGLE_SLOT_GATE_UP_SMALL_OUT_DIM
-                    and lora_rank >= 64
-                    and total_tokens >= 128
-                )
-            if bi.max_len <= _CHUNKED_THRESHOLD:
-                return False
-            return (
-                output_dim >= _CUTEDSL_SINGLE_SLOT_GATE_UP_SMALL_OUT_DIM
-                and lora_rank >= 64
-                and total_tokens >= 512
-            )
-        if bi.max_len == 1:
-            if output_dim >= _CUTEDSL_GATE_UP_SMALL_OUT_DIM:
-                return (lora_rank >= 64 and total_tokens >= 32) or (
-                    lora_rank >= 16 and total_tokens >= 64
-                )
-            if output_dim >= 2048:
-                return (lora_rank >= 64 and total_tokens >= 64) or (
-                    lora_rank >= 16 and total_tokens >= 128
-                )
-            if output_dim >= _CUTEDSL_SINGLE_SLOT_GATE_UP_SMALL_OUT_DIM:
-                return lora_rank >= 64 and total_tokens >= 64
-            return False
-        if bi.max_len <= _CHUNKED_THRESHOLD:
-            return False
-        if output_dim >= _CUTEDSL_GATE_UP_SMALL_OUT_DIM:
-            return (lora_rank >= 64 and total_tokens >= 256) or (
-                lora_rank >= 16 and total_tokens >= 512
-            )
-        if output_dim >= 2048:
-            return (lora_rank >= 64 and total_tokens >= 512) or (
-                lora_rank >= 16 and total_tokens >= 1024
-            )
-        if output_dim >= _CUTEDSL_SINGLE_SLOT_GATE_UP_SMALL_OUT_DIM:
-            return lora_rank >= 64 and total_tokens >= 512
-        return False
-    if bi.max_len == 1:
-        if output_dim >= _CUTEDSL_GATE_UP_SMALL_OUT_DIM:
-            return lora_rank >= 8 and total_tokens >= 32
-        if output_dim >= 2048:
-            if input_dim >= 7168 and lora_rank >= 8:
-                return total_tokens >= 32
-            if input_dim >= 5120 and lora_rank >= 16 and lora_rank < 32:
-                return total_tokens >= 32
-            if lora_rank >= 8 and total_tokens >= 64:
-                return True
-            if lora_rank >= 16 and total_tokens >= 64:
-                return True
-            return (lora_rank >= 64 and total_tokens >= 32) or (
-                lora_rank >= 32 and total_tokens >= 64
-            )
-        return output_dim >= _CUTEDSL_SINGLE_SLOT_GATE_UP_SMALL_OUT_DIM and (
-            (
-                input_dim >= 8192
-                and output_dim == _CUTEDSL_SINGLE_SLOT_GATE_UP_SMALL_OUT_DIM
-                and lora_rank >= 8
-                and total_tokens >= 32
-            )
-            or (
-                input_dim >= 5120
-                and output_dim == _CUTEDSL_SINGLE_SLOT_GATE_UP_SMALL_OUT_DIM
-                and lora_rank >= 8
-                and total_tokens >= 64
-            )
-            or (lora_rank >= 64 and total_tokens >= 32)
-            or (lora_rank >= 16 and total_tokens >= 128)
-        )
-    if bi.max_len <= _CHUNKED_THRESHOLD:
-        return False
-    if output_dim >= _CUTEDSL_GATE_UP_SMALL_OUT_DIM:
-        if output_dim >= _CUTEDSL_GATE_UP_LARGE_OUT_DIM:
-            return lora_rank >= 8 and total_tokens >= 64
-        if output_dim >= _CUTEDSL_GATE_UP_MEDIUM_OUT_DIM:
-            return lora_rank >= 8 and total_tokens >= 64
-        if input_dim >= 7168 and output_dim >= _CUTEDSL_GATE_UP_SMALL_OUT_DIM:
-            return (lora_rank == 8 and total_tokens >= 64) or (
-                lora_rank == 16 and total_tokens >= 128
-            )
-        if (
-            input_dim >= 5120
-            and input_dim < 7168
-            and output_dim >= _CUTEDSL_GATE_UP_SMALL_OUT_DIM
-        ):
-            return lora_rank >= 8 and lora_rank <= 16 and total_tokens >= 96
-        if lora_rank < 64:
-            return lora_rank >= 8 and total_tokens >= 256
-        return (lora_rank >= 64 and total_tokens >= 80) or (
-            lora_rank >= 8 and total_tokens >= 128
-        )
-    if output_dim >= _CUTEDSL_SINGLE_SLOT_GATE_UP_SMALL_OUT_DIM:
-        if output_dim < 2048:
-            if input_dim >= 8192:
-                return lora_rank >= 8 and total_tokens >= 128
-            return (lora_rank >= 64 and total_tokens >= 512) or (
-                lora_rank >= 8 and total_tokens >= 512
-            )
-        if input_dim >= 8192 and lora_rank >= 8:
-            return total_tokens >= 128
-        if output_dim >= 3072 and lora_rank >= 8:
-            return total_tokens >= 256
-        return (
-            (lora_rank >= 64 and total_tokens >= 256)
-            or (lora_rank >= 16 and total_tokens >= 512)
-            or (lora_rank >= 8 and total_tokens >= 512)
-        )
-    return False
-
-
-def _use_cutedsl_single_slot_qkv(
-    bi: LoraBatchInfo,
-    total_tokens: int,
-    q_dim: int,
-    kv_dim: int,
-    lora_rank: int,
-    input_dim: int = 4096,
-) -> bool:
-    """Return whether the single-slot CuTeDSL QKV path should win."""
-    if bi.single_lora_slot <= 0:
-        return False
-    if input_dim < 4096:
-        if input_dim < 3072:
-            if input_dim < 2048:
-                if bi.max_len == 1:
-                    if lora_rank >= 64 and q_dim >= 4096 and kv_dim >= 512:
-                        return total_tokens >= 64
-                    if lora_rank == 32 and q_dim >= 4096 and kv_dim >= 512:
-                        if q_dim >= 8192 and kv_dim >= 1024:
-                            return total_tokens >= 64
-                        return total_tokens >= 96
-                    return (
-                        lora_rank == 16
-                        and q_dim >= 8192
-                        and kv_dim >= 1024
-                        and total_tokens >= 96
-                    )
-                if bi.max_len <= _CHUNKED_THRESHOLD:
-                    return False
-                if input_dim >= 1536 and input_dim < 2048:
-                    return (
-                        (
-                            lora_rank >= 64
-                            and q_dim >= 4096
-                            and kv_dim >= 512
-                            and total_tokens >= 1536
-                        )
-                        or (
-                            lora_rank >= 32
-                            and q_dim >= 4096
-                            and kv_dim >= 1024
-                            and total_tokens >= 3072
-                        )
-                        or (
-                            lora_rank >= 16
-                            and q_dim >= 8192
-                            and kv_dim >= 1024
-                            and total_tokens >= 3072
-                        )
-                    )
-                return (
-                    lora_rank >= 64
-                    and q_dim >= 4096
-                    and kv_dim >= 512
-                    and total_tokens >= 3072
-                ) or (
-                    lora_rank >= 16
-                    and q_dim >= 8192
-                    and kv_dim >= 1024
-                    and total_tokens >= 3072
-                )
-            if bi.max_len == 1:
-                if lora_rank >= 64 and q_dim >= 4096 and kv_dim >= 512:
-                    return total_tokens >= 64
-                if lora_rank == 32 and q_dim >= 4096 and kv_dim >= 512:
-                    if q_dim >= 8192 and kv_dim >= 1024:
-                        return total_tokens >= 64
-                    return total_tokens >= 96
-                return (
-                    lora_rank == 16
-                    and q_dim >= 8192
-                    and kv_dim >= 1024
-                    and total_tokens >= 96
-                )
-            if bi.max_len <= _CHUNKED_THRESHOLD:
-                return False
-            return (
-                (
-                    lora_rank >= 64
-                    and q_dim >= 4096
-                    and kv_dim >= 512
-                    and total_tokens >= 1536
-                )
-                or (
-                    lora_rank >= 32
-                    and q_dim >= 4096
-                    and kv_dim >= 1024
-                    and total_tokens >= 3072
-                )
-                or (
-                    lora_rank >= 16
-                    and q_dim >= 8192
-                    and kv_dim >= 1024
-                    and total_tokens >= 3072
-                )
-            )
-        if bi.max_len == 1:
-            if (
-                input_dim >= 3072
-                and lora_rank >= 64
-                and q_dim >= 4096
-                and kv_dim >= 512
-            ):
-                return total_tokens >= 64
-            if (
-                input_dim >= 3072
-                and lora_rank == 32
-                and q_dim >= 4096
-                and kv_dim >= 512
-            ):
-                return total_tokens >= 96
-            if (
-                input_dim >= 3072
-                and lora_rank == 16
-                and q_dim >= 4096
-                and kv_dim >= 512
-            ):
-                return total_tokens >= 128 or (
-                    q_dim >= 8192 and kv_dim >= 1024 and total_tokens >= 96
-                )
-            return False
-        return (
-            input_dim >= 3072
-            and bi.max_len > _CHUNKED_THRESHOLD
-            and (total_tokens >= 1536 if lora_rank >= 32 else total_tokens >= 3072)
-            and (
-                lora_rank >= 64
-                or (q_dim >= 8192 and kv_dim >= 1024 and lora_rank >= 32)
-                or (q_dim >= 8192 and kv_dim >= 1024 and lora_rank >= 16)
-            )
-        )
-    if q_dim < 4096 or kv_dim < 512:
-        return False
-    if bi.max_len == 1:
-        if lora_rank >= 64:
-            return total_tokens >= 32
-        if lora_rank >= 32:
-            if kv_dim < 1024:
-                if input_dim >= 5120:
-                    return total_tokens >= 64
-                return total_tokens >= 128
-            return total_tokens >= 64
-        if lora_rank >= 16:
-            if kv_dim < 1024:
-                return total_tokens >= 96
-            if input_dim >= 5120 and q_dim >= 8192:
-                return total_tokens >= 64
-            return q_dim >= 8192 or total_tokens >= 96
-        if input_dim >= 5120 and q_dim >= 8192 and kv_dim >= 1024:
-            return total_tokens >= 64
-        return False
-    if bi.max_len <= _CHUNKED_THRESHOLD:
-        return False
-    if lora_rank >= 64:
-        return total_tokens >= 1536
-    if input_dim >= 7168 and q_dim >= 8192 and kv_dim >= 1024 and lora_rank == 16:
-        return total_tokens >= 1536
-    return (
-        (q_dim >= 8192 and kv_dim >= 1024 and lora_rank >= 32 and total_tokens >= 1536)
-        or (
-            q_dim >= 4096
-            and kv_dim >= 512
-            and lora_rank >= 32
-            and total_tokens >= (1536 if input_dim >= 8192 else 3072)
-        )
-        or (
-            q_dim >= 8192
-            and kv_dim >= 1024
-            and lora_rank >= 16
-            and total_tokens >= (1536 if input_dim >= 8192 else 3072)
-        )
-    )
-
-
-def _use_cutedsl_multi_slot_gate_up(
-    bi: LoraBatchInfo,
-    total_tokens: int,
-    output_dim: int,
-    input_dim: int = 4096,
-) -> bool:
-    """Return whether equal-length consecutive multi-slot gate/up should win."""
-    if bi.multi_lora_start_slot <= 0:
-        return False
-    if bi.multi_lora_count < 2 or bi.multi_lora_count > 4:
-        return False
-    if bi.max_len <= _CHUNKED_THRESHOLD or total_tokens <= _CHUNKED_THRESHOLD:
-        return False
-    if bi.multi_lora_rank < 64:
-        return False
-    if output_dim >= _CUTEDSL_GATE_UP_LARGE_OUT_DIM:
-        if (
-            output_dim == _CUTEDSL_GATE_UP_LARGE_OUT_DIM
-            and input_dim >= 5120
-            and bi.multi_lora_count >= 4
-            and bi.multi_lora_segment_len >= 64
-        ):
-            return True
-        return bi.multi_lora_segment_len >= 256 or (
-            bi.multi_lora_count >= 4 and bi.multi_lora_segment_len >= 128
-        )
-    if output_dim >= _CUTEDSL_GATE_UP_MEDIUM_OUT_DIM:
-        if bi.multi_lora_rank >= 128 and bi.multi_lora_segment_len >= 128:
-            return True
-        return bi.multi_lora_segment_len >= 256 or (
-            bi.multi_lora_count >= 4 and bi.multi_lora_segment_len >= 128
-        )
-    if output_dim >= _CUTEDSL_GATE_UP_SMALL_OUT_DIM:
-        return bi.multi_lora_rank >= 128 and bi.multi_lora_segment_len >= 256
-    return False
-
-
 def _use_triton_grouped_decode(bi: LoraBatchInfo) -> bool:
     """Return whether grouped Triton decode expand should beat basic decode."""
     return (
-        bi.single_lora_slot <= 0
+        bi.single_lora_slot == NO_LORA_SLOT
         and bi.num_groups > 0
         and bi.bs // bi.num_groups >= _TRITON_GROUPED_DECODE_MIN_GROUP_SIZE
     )
@@ -776,6 +131,8 @@ class LoraManager:
         tp_size: int = 1,
         tp_group=None,
         max_loras_cpu: int | None = None,
+        lora_buffer_groups: set[str] | frozenset[str] = LORA_BUFFER_GROUPS,
+        lora_moe_compressed_shared_outer: bool = False,
     ) -> None:
         self.max_loras = max_loras
         self.max_lora_rank = max_lora_rank
@@ -785,7 +142,15 @@ class LoraManager:
         self.tp_rank = tp_rank
         self.tp_size = tp_size
         self.tp_group = tp_group
-        # Tier-2 (CPU pinned) cap.  Defaults to 4× the GPU pool so adapter
+        unknown_groups = set(lora_buffer_groups) - LORA_BUFFER_GROUPS
+        if unknown_groups:
+            raise ValueError(f"Unknown LoRA buffer groups: {sorted(unknown_groups)}")
+        self.lora_buffer_groups = frozenset(lora_buffer_groups)
+        self.enable_attn_lora = "attn" in self.lora_buffer_groups
+        self.enable_mlp_lora = "mlp" in self.lora_buffer_groups
+        self.enable_moe_lora = "moe" in self.lora_buffer_groups
+        self.lora_moe_compressed_shared_outer = lora_moe_compressed_shared_outer
+        # Tier-2 CPU cache cap. Defaults to 4× the GPU pool so adapter
         # spill-out to disk is rare in steady state.
         self.max_loras_cpu: int = (
             max_loras_cpu if max_loras_cpu is not None else 4 * max_loras
@@ -818,21 +183,36 @@ class LoraManager:
             model_config, "intermediate_size", 4 * hidden
         )
         self.intermediate_per_tp: int = self.intermediate_size // self.tp_size
+        self.moe_intermediate_size: int = getattr(
+            model_config, "moe_intermediate_size", self.intermediate_size
+        )
+        self.moe_intermediate_per_tp: int = self.moe_intermediate_size // self.tp_size
+        self.num_experts: int = int(
+            getattr(
+                model_config,
+                "num_experts",
+                getattr(
+                    model_config,
+                    "num_local_experts",
+                    getattr(model_config, "n_routed_experts", 0),
+                ),
+            )
+        )
 
         # CPU-side flag: True when at least one segment in the current
-        # batch_info uses a real adapter (slot != 0).  CudaGraphWrapper
+        # batch_info uses a real adapter. CudaGraphWrapper
         # reads this to pick the with-LoRA vs no-LoRA captured graph.
         self.has_active_lora: bool = False
 
-        # Slot 0 = no-adapter sentinel.  Real adapters take 1 .. max_loras.
         # ── Tier 1: GPU pool ─────────────────────────────────────────────
-        # Slot 0 = no-adapter sentinel.  Real adapters take 1 .. max_loras.
-        self._n_slots: int = max_loras + 1
+        # Real adapters take slots 0 .. max_loras - 1. Base/no-LoRA requests
+        # use NO_LORA_SLOT in batch metadata and do not consume a GPU slot.
+        self._n_slots: int = max_loras
         self._slot_to_name: list[str | None] = [None] * self._n_slots
         self._name_to_slot: dict[str, int] = {}
         self._gpu_lru: OrderedDict[str, None] = OrderedDict()  # alias of _lru
 
-        # ── Tier 2: CPU pinned pool ─────────────────────────────────────
+        # ── Tier 2: pinned CPU pool ─────────────────────────────────────
         # ``_cpu_cache[name]`` holds parsed weights in pinned host memory.
         # ``_cpu_lru`` tracks LRU order for CPU eviction back to disk.  An
         # adapter is "CPU-resident" iff its name is in ``_cpu_cache``.
@@ -851,12 +231,10 @@ class LoraManager:
         # Compatibility aliases for existing tests/debug tooling.
         self._cpu_cache = self._cpu_store.cache
         self._cpu_lru = self._cpu_store.lru
-        self._pinned = self._cpu_store.pinned
         self._adapter_paths = self._cpu_store.adapter_paths
         self._pending_loads = self._cpu_store.pending_loads
 
-        # Per-slot rank + scaling.  Rank 0 means "no adapter"; the Triton
-        # kernels skip on rank 0, so slot 0's row is permanently zero.
+        # Per-slot rank + scaling for real adapter slots only.
         self._lora_ranks: torch.Tensor = torch.zeros(
             self._n_slots, dtype=torch.int32, device=device
         )
@@ -879,8 +257,8 @@ class LoraManager:
             seg_indptr=torch.zeros(
                 max_num_tokens + 1, dtype=torch.int32, device=device
             ),
-            weight_indices=torch.zeros(
-                max_num_tokens, dtype=torch.int32, device=device
+            weight_indices=torch.full(
+                (max_num_tokens,), NO_LORA_SLOT, dtype=torch.int32, device=device
             ),
             lora_ranks=self._lora_ranks,
             scalings=self._scalings,
@@ -891,8 +269,8 @@ class LoraManager:
         self._seg_lens_cpu = torch.zeros(
             max_num_tokens, dtype=torch.int32, pin_memory=True
         )
-        self._weight_indices_cpu = torch.zeros(
-            max_num_tokens, dtype=torch.int32, pin_memory=True
+        self._weight_indices_cpu = torch.full(
+            (max_num_tokens,), NO_LORA_SLOT, dtype=torch.int32, pin_memory=True
         )
         # Adapter-group buffers for the decode grouped expand kernel.
         # Computed on CPU in prepare_loras (no GPU sync) and transferred
@@ -937,6 +315,7 @@ class LoraManager:
             device=self.device,
             tp_rank=self.tp_rank,
             tp_size=self.tp_size,
+            buffer_groups=self.lora_buffer_groups,
         )
         self.qkv_A_buffers = self._weight_buffers.qkv_A_buffers
         self.qkv_B_buffers = self._weight_buffers.qkv_B_buffers
@@ -952,11 +331,17 @@ class LoraManager:
         self._gate_up_slice_offsets = self._weight_buffers.gate_up_slice_offsets
         self._down_slice_offsets = self._weight_buffers.down_slice_offsets
         self._moe_lora_buffers = MoeLoraBuffers(
+            n_layers=self.n_layers,
+            n_slots=self._n_slots,
+            max_lora_rank=self.max_lora_rank,
+            num_experts=self.num_experts,
             hidden_size=self.hidden_size,
-            intermediate_per_tp=self.intermediate_per_tp,
+            intermediate_per_tp=self.moe_intermediate_per_tp,
             dtype=self.dtype,
             device=self.device,
             shard_weights=self._weight_buffers.shard_weights,
+            enabled=self.enable_moe_lora,
+            compressed_shared_outer=self.lora_moe_compressed_shared_outer,
         )
         # Compatibility alias for tests/debug tooling that inspected the old
         # manager-owned storage directly.
@@ -964,13 +349,16 @@ class LoraManager:
 
         logger.info(
             "LoraManager initialized: max_loras=%d max_rank=%d "
-            "tp_rank=%d/%d device=%s dtype=%s",
+            "tp_rank=%d/%d device=%s dtype=%s buffer_groups=%s "
+            "moe_compressed_shared_outer=%s",
             max_loras,
             max_lora_rank,
             tp_rank,
             tp_size,
             device,
             dtype,
+            ",".join(sorted(self.lora_buffer_groups)),
+            self.lora_moe_compressed_shared_outer,
         )
 
     # ── Public API ──────────────────────────────────────────────────────────
@@ -987,7 +375,7 @@ class LoraManager:
             has_active_lora=self.has_active_lora,
         )
 
-    def load_adapter(self, name: str, path: str, pinned: bool = False) -> int:
+    def load_adapter(self, name: str, path: str) -> int:
         """Register a PEFT adapter from *path* and warm the CPU pool.
 
         ``path`` is recorded as the adapter's durable disk path; it must
@@ -1015,7 +403,7 @@ class LoraManager:
         self._next_id += 1
         self._name_to_id[name] = lora_id
         self._id_to_name[lora_id] = name
-        self._cpu_store.set_path(name, adapter_path, pinned=pinned)
+        self._cpu_store.set_path(name, adapter_path)
 
         # Warm the CPU pool — bounded by ``max_loras_cpu``, may evict
         # other CPU-resident adapters back to disk.
@@ -1060,12 +448,12 @@ class LoraManager:
         per_request_slots: list[int] = []
         for lid in lora_ids:
             if lid == 0:
-                per_request_slots.append(0)
+                per_request_slots.append(NO_LORA_SLOT)
                 continue
             name = self._id_to_name.get(lid)
             if name is None:
                 logger.warning("Unknown lora_id %d; treating as base model.", lid)
-                per_request_slots.append(0)
+                per_request_slots.append(NO_LORA_SLOT)
                 continue
             slot = self._ensure_in_gpu(name)
             per_request_slots.append(slot)
@@ -1098,7 +486,10 @@ class LoraManager:
                 build_decode_lora_groups(per_request_slots)
             )
             ng = len(group_slots)
-            self._sort_order_cpu[:bs] = torch.as_tensor(sort_order, dtype=torch.int64)
+            active_count = len(sort_order)
+            self._sort_order_cpu[:active_count] = torch.as_tensor(
+                sort_order, dtype=torch.int64
+            )
             self._group_slots_cpu[:ng] = torch.as_tensor(group_slots, dtype=torch.int32)
             self._group_starts_cpu[:ng] = torch.as_tensor(
                 group_starts, dtype=torch.int32
@@ -1108,34 +499,41 @@ class LoraManager:
             bi.group_slots = self._group_slots_buf
             bi.group_starts = self._group_starts_buf
             bi.group_sizes = self._group_sizes_buf
-            bi.sort_order[:bs].copy_(self._sort_order_cpu[:bs], non_blocking=True)
+            bi.sort_order[:active_count].copy_(
+                self._sort_order_cpu[:active_count], non_blocking=True
+            )
             bi.group_slots[:ng].copy_(self._group_slots_cpu[:ng], non_blocking=True)
             bi.group_starts[:ng].copy_(self._group_starts_cpu[:ng], non_blocking=True)
             bi.group_sizes[:ng].copy_(self._group_sizes_cpu[:ng], non_blocking=True)
             bi.num_groups = ng
+            bi.max_group_size = max(group_sizes) if group_sizes else 0
         else:
             bi.sort_order = bi.group_slots = bi.group_starts = bi.group_sizes = None
             bi.num_groups = 0
+            bi.max_group_size = 0
 
-        first_slot = per_request_slots[0] if per_request_slots else 0
+        first_slot = per_request_slots[0] if per_request_slots else NO_LORA_SLOT
         bi.single_lora_slot = (
             first_slot
-            if first_slot != 0 and all(slot == first_slot for slot in per_request_slots)
-            else -1
+            if first_slot != NO_LORA_SLOT
+            and all(slot == first_slot for slot in per_request_slots)
+            else NO_LORA_SLOT
         )
         bi.single_lora_rank = (
-            self._slot_ranks[bi.single_lora_slot] if bi.single_lora_slot > 0 else 0
+            self._slot_ranks[bi.single_lora_slot]
+            if bi.single_lora_slot != NO_LORA_SLOT
+            else 0
         )
-        bi.multi_lora_start_slot = -1
+        bi.multi_lora_start_slot = NO_LORA_SLOT
         bi.multi_lora_count = 0
         bi.multi_lora_segment_len = 0
         bi.multi_lora_rank = 0
         if (
             bs > 1
-            and bi.single_lora_slot <= 0
+            and bi.single_lora_slot == NO_LORA_SLOT
             and max_len > _CHUNKED_THRESHOLD
             and len(set(seg_lens_list)) == 1
-            and all(slot > 0 for slot in per_request_slots)
+            and all(slot != NO_LORA_SLOT for slot in per_request_slots)
         ):
             start_slot = per_request_slots[0]
             consecutive_slots = all(
@@ -1173,7 +571,7 @@ class LoraManager:
         # adapter slot.  The CudaGraphWrapper reads this before each replay
         # to pick the no-LoRA graph variant when the whole batch is
         # base-model — saving the per-step Triton-kernel launches.
-        self.has_active_lora = any(s != 0 for s in per_request_slots)
+        self.has_active_lora = any(s != NO_LORA_SLOT for s in per_request_slots)
         return total_tokens
 
     def apply_qkv_lora(
@@ -1190,8 +588,10 @@ class LoraManager:
         """
         if hidden_states.shape[0] == 0:
             return qkv
+        if not self.enable_attn_lora:
+            return qkv
         bi = self._batch_info
-        if bi.bs == 0:
+        if bi.bs == 0 or not self.has_active_lora:
             return qkv
 
         A_buf = self.qkv_A_buffers[layer_id]
@@ -1202,25 +602,7 @@ class LoraManager:
             if bi.max_len > _CHUNKED_THRESHOLD
             else lora_shrink_fwd(hidden_states, A_buf, bi, stack_num=3)
         )
-        if _use_cutedsl_single_slot_qkv(
-            bi,
-            lora_a.shape[0],
-            self.q_size_per_tp,
-            self.kv_size_per_tp,
-            bi.single_lora_rank,
-            input_dim=hidden_states.shape[1],
-        ):
-            lora_qkv_single_slot_cutedsl_fwd(
-                lora_a,
-                B_buf,
-                bi,
-                self.q_size_per_tp,
-                self.kv_size_per_tp,
-                qkv,
-                apply_scaling=True,
-                single_weight_index=bi.single_lora_slot,
-            )
-        elif bi.max_len > _CHUNKED_THRESHOLD:
+        if bi.max_len > _CHUNKED_THRESHOLD:
             lora_expand_prefill_fwd(
                 lora_a,
                 B_buf,
@@ -1262,8 +644,10 @@ class LoraManager:
         """
         if attn_output.shape[0] == 0:
             return o_output
+        if not self.enable_attn_lora:
+            return o_output
         bi = self._batch_info
-        if bi.bs == 0:
+        if bi.bs == 0 or not self.has_active_lora:
             return o_output
 
         A_buf = self.o_A_buffers[layer_id]
@@ -1275,35 +659,7 @@ class LoraManager:
             if bi.max_len > _CHUNKED_THRESHOLD
             else lora_shrink_fwd(attn_output, A_buf, bi, stack_num=1)
         )
-        if _use_cutedsl_single_slot_expand(
-            bi,
-            lora_a.shape[0],
-            B_buf.shape[1],
-            bi.single_lora_rank,
-            input_dim=attn_output.shape[1],
-        ):
-            lora_expand_single_slot_cutedsl_fwd(
-                lora_a,
-                B_buf,
-                bi,
-                base_output=o_output,
-                apply_scaling=True,
-                single_weight_index=bi.single_lora_slot,
-            )
-        elif _use_cutedsl_multi_slot_expand(
-            bi,
-            lora_a.shape[0],
-            B_buf.shape[1],
-            input_dim=attn_output.shape[1],
-        ):
-            lora_expand_batched_slots_cutedsl_fwd(
-                lora_a,
-                B_buf,
-                bi,
-                base_output=o_output,
-                apply_scaling=True,
-            )
-        elif bi.max_len > _CHUNKED_THRESHOLD:
+        if bi.max_len > _CHUNKED_THRESHOLD:
             lora_expand_prefill_fwd(
                 lora_a,
                 B_buf,
@@ -1333,8 +689,10 @@ class LoraManager:
         """
         if hidden_states.shape[0] == 0:
             return gate_up
+        if not self.enable_mlp_lora:
+            return gate_up
         bi = self._batch_info
-        if bi.bs == 0:
+        if bi.bs == 0 or not self.has_active_lora:
             return gate_up
 
         A_buf = self.gate_up_A_buffers[layer_id]
@@ -1345,37 +703,7 @@ class LoraManager:
             if bi.max_len > _CHUNKED_THRESHOLD
             else lora_shrink_fwd(hidden_states, A_buf, bi, stack_num=2)
         )
-        if _use_cutedsl_single_slot_gate_up(
-            bi,
-            lora_a.shape[0],
-            self.intermediate_per_tp,
-            bi.single_lora_rank,
-            input_dim=hidden_states.shape[1],
-        ):
-            lora_gate_up_single_slot_cutedsl_fwd(
-                lora_a,
-                B_buf,
-                bi,
-                self.intermediate_per_tp,
-                base_output=gate_up,
-                apply_scaling=True,
-                single_weight_index=bi.single_lora_slot,
-            )
-        elif _use_cutedsl_multi_slot_gate_up(
-            bi,
-            lora_a.shape[0],
-            self.intermediate_per_tp,
-            input_dim=hidden_states.shape[1],
-        ):
-            lora_gate_up_batched_slots_cutedsl_fwd(
-                lora_a,
-                B_buf,
-                bi,
-                self.intermediate_per_tp,
-                base_output=gate_up,
-                apply_scaling=True,
-            )
-        elif bi.max_len > _CHUNKED_THRESHOLD:
+        if bi.max_len > _CHUNKED_THRESHOLD:
             lora_expand_prefill_fwd(
                 lora_a,
                 B_buf,
@@ -1415,8 +743,10 @@ class LoraManager:
         """
         if x.shape[0] == 0:
             return down_output
+        if not self.enable_mlp_lora:
+            return down_output
         bi = self._batch_info
-        if bi.bs == 0:
+        if bi.bs == 0 or not self.has_active_lora:
             return down_output
 
         A_buf = self.down_A_buffers[layer_id]
@@ -1426,35 +756,7 @@ class LoraManager:
             if bi.max_len > _CHUNKED_THRESHOLD
             else lora_shrink_fwd(x, A_buf, bi, stack_num=1)
         )
-        if _use_cutedsl_single_slot_expand(
-            bi,
-            lora_a.shape[0],
-            B_buf.shape[1],
-            bi.single_lora_rank,
-            input_dim=x.shape[1],
-        ):
-            lora_expand_single_slot_cutedsl_fwd(
-                lora_a,
-                B_buf,
-                bi,
-                base_output=down_output,
-                apply_scaling=True,
-                single_weight_index=bi.single_lora_slot,
-            )
-        elif _use_cutedsl_multi_slot_expand(
-            bi,
-            lora_a.shape[0],
-            B_buf.shape[1],
-            input_dim=x.shape[1],
-        ):
-            lora_expand_batched_slots_cutedsl_fwd(
-                lora_a,
-                B_buf,
-                bi,
-                base_output=down_output,
-                apply_scaling=True,
-            )
-        elif bi.max_len > _CHUNKED_THRESHOLD:
+        if bi.max_len > _CHUNKED_THRESHOLD:
             lora_expand_prefill_fwd(
                 lora_a,
                 B_buf,
@@ -1479,6 +781,8 @@ class LoraManager:
         sorted_token_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Compatibility wrapper; MoE-specific work lives in MoeLoraContext."""
+        if not self.enable_moe_lora:
+            return gate_up_output
         return self.moe_lora_context.apply_gate_up_lora(
             layer_id,
             hidden_states,
@@ -1498,6 +802,8 @@ class LoraManager:
         sorted_token_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Compatibility wrapper; MoE-specific work lives in MoeLoraContext."""
+        if not self.enable_moe_lora:
+            return down_output
         return self.moe_lora_context.apply_down_lora(
             layer_id,
             intermediate,
@@ -1539,7 +845,7 @@ class LoraManager:
 
         No-op when the adapter is already CPU-resident or a load is
         already in flight.  Silently ignores unknown adapters (the
-        request will fall back to base via slot 0).
+        request will fall back to base via NO_LORA_SLOT).
         """
         self._cpu_store.prefetch(name)
 
@@ -1549,27 +855,24 @@ class LoraManager:
         self._cpu_store.evict(name)
 
     def _find_free_slot(self) -> int:
-        for slot in range(1, self._n_slots):
+        for slot in range(self._n_slots):
             if self._slot_to_name[slot] is None:
                 return slot
         for candidate_name in list(self._gpu_lru.keys()):
-            if candidate_name in self._pinned:
-                continue
             slot = self._name_to_slot[candidate_name]
             logger.debug("Evicting adapter '%s' from GPU slot %d", candidate_name, slot)
-            del self._name_to_slot[candidate_name]
-            self._slot_to_name[slot] = None
-            del self._gpu_lru[candidate_name]
+            self._evict_by_name(candidate_name)
             return slot
         raise RuntimeError(
-            "LoRA GPU pool is full and all adapters are pinned. "
-            f"Increase max_loras (current: {self.max_loras}) or unpin an adapter."
+            "LoRA GPU pool is full and no evictable adapter was found. "
+            f"Increase max_loras (current: {self.max_loras})."
         )
 
     def _load_to_slot(self, name: str, slot: int) -> None:
         cpu_weights = self._cpu_cache[name]
         rank = self._get_rank_for(name)
         scaling = self._get_scaling_for(name, rank)
+        self._reset_slot(slot)
         self._lora_ranks[slot] = rank
         self._slot_ranks[slot] = rank
         self._slot_scalings[slot] = scaling
@@ -1603,10 +906,13 @@ class LoraManager:
         if name in self._name_to_slot:
             slot = self._name_to_slot.pop(name)
             self._slot_to_name[slot] = None
-            self._weight_buffers.zero_slot(slot)
-            self._moe_lora_buffers.clear_slot(slot)
-            self._lora_ranks[slot] = 0
-            self._slot_ranks[slot] = 0
-            self._slot_scalings[slot] = 0.0
-            self._scalings[slot] = 0.0
+            self._reset_slot(slot)
         self._gpu_lru.pop(name, None)
+
+    def _reset_slot(self, slot: int) -> None:
+        self._weight_buffers.zero_slot(slot)
+        self._moe_lora_buffers.clear_slot(slot)
+        self._lora_ranks[slot] = 0
+        self._slot_ranks[slot] = 0
+        self._slot_scalings[slot] = 0.0
+        self._scalings[slot] = 0.0

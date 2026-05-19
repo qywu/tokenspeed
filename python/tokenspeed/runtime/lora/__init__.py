@@ -21,6 +21,13 @@
 """LoRA adapter serving runtime."""
 
 from tokenspeed.runtime.lora.lora_config import LoraConfig
-from tokenspeed.runtime.lora.lora_registry import LoraRegistry
 
 __all__ = ["LoraConfig", "LoraRegistry"]
+
+
+def __getattr__(name: str):
+    if name == "LoraRegistry":
+        from tokenspeed.runtime.lora.lora_registry import LoraRegistry
+
+        return LoraRegistry
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

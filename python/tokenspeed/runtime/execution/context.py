@@ -20,7 +20,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -34,6 +37,23 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
     from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
     from tokenspeed.runtime.lora.lora_manager import LoraManager
+
+_CURRENT_LORA_MANAGER: ContextVar[Optional["LoraManager"]] = ContextVar(
+    "tokenspeed_current_lora_manager", default=None
+)
+
+
+def get_current_lora_manager() -> Optional["LoraManager"]:
+    return _CURRENT_LORA_MANAGER.get()
+
+
+@contextmanager
+def bind_forward_context(ctx: "ForwardContext") -> Iterator[None]:
+    token = _CURRENT_LORA_MANAGER.set(ctx.lora_manager)
+    try:
+        yield
+    finally:
+        _CURRENT_LORA_MANAGER.reset(token)
 
 
 @dataclass
