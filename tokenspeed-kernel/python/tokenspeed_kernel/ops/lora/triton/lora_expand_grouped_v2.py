@@ -71,15 +71,15 @@ _GROUPED_V2_CONFIGS = [
 )
 @triton.jit(do_not_specialize=["output_stride_0", "output_stride_1"])
 def _lora_expand_grouped_v2_kernel(
-    x,              # (M, MAX_RANK)  original unsorted token order
-    weights,        # (n_slots, N, MAX_RANK)
-    output,         # (M, N)  written at original token positions
-    group_slots,    # (num_groups,) int32 — weight-slot index per group
-    group_starts,   # (num_groups,) int32 — start in token_indices
-    group_sizes,    # (num_groups,) int32 — tokens per group
+    x,  # (M, MAX_RANK)  original unsorted token order
+    weights,  # (n_slots, N, MAX_RANK)
+    output,  # (M, N)  written at original token positions
+    group_slots,  # (num_groups,) int32 — weight-slot index per group
+    group_starts,  # (num_groups,) int32 — start in token_indices
+    group_sizes,  # (num_groups,) int32 — tokens per group
     token_indices,  # (M,) int32  — token positions sorted by adapter
-    scalings,       # (n_slots,) float32
-    lora_ranks,     # (n_slots,) int32
+    scalings,  # (n_slots,) float32
+    lora_ranks,  # (n_slots,) int32
     output_stride_0,
     output_stride_1,
     N: tl.constexpr,
@@ -92,7 +92,7 @@ def _lora_expand_grouped_v2_kernel(
     x_stride_0: tl.constexpr = MAX_RANK
     x_stride_1: tl.constexpr = 1
     w_stride_0: tl.constexpr = N * MAX_RANK
-    w_stride_1: tl.constexpr = MAX_RANK   # row stride inside (N, MAX_RANK) slice
+    w_stride_1: tl.constexpr = MAX_RANK  # row stride inside (N, MAX_RANK) slice
     w_stride_2: tl.constexpr = 1
 
     group_id = tl.program_id(axis=1)
@@ -100,13 +100,13 @@ def _lora_expand_grouped_v2_kernel(
     # Grid: (cdiv(M, BLOCK_S) * cdiv(N, BLOCK_N), num_groups) — mirrors vLLM's
     # (M_tiles × N_tiles, num_active_loras) layout.  CTAs whose M-tile exceeds
     # the group size exit immediately (same early-exit pattern as vLLM).
-    pid_flat  = tl.program_id(axis=0)
+    pid_flat = tl.program_id(axis=0)
     cta_n_num = tl.cdiv(N, BLOCK_N)
-    pid_m     = pid_flat // cta_n_num
-    pid_n     = pid_flat %  cta_n_num
+    pid_m = pid_flat // cta_n_num
+    pid_n = pid_flat % cta_n_num
 
-    w_index = tl.load(group_slots  + group_id)
-    g_size  = tl.load(group_sizes  + group_id)
+    w_index = tl.load(group_slots + group_id)
+    g_size = tl.load(group_sizes + group_id)
     if g_size == 0:
         return
     rank = tl.load(lora_ranks + w_index)
@@ -118,19 +118,19 @@ def _lora_expand_grouped_v2_kernel(
         return  # early exit for M-tiles beyond this group's token count
 
     g_start = tl.load(group_starts + group_id)
-    scaling = tl.load(scalings     + w_index)
-    K       = tl.multiple_of(tl.minimum(MAX_RANK, rank), BLOCK_K)
+    scaling = tl.load(scalings + w_index)
+    K = tl.minimum(MAX_RANK, rank)
 
     n_offset = tl.arange(0, BLOCK_N) + pid_n * BLOCK_N
     k_offset = tl.max_contiguous(tl.arange(0, BLOCK_K), BLOCK_K)
-    n_mask   = n_offset[None, :] < N
+    n_mask = n_offset[None, :] < N
 
     # Load physical token positions for this M-tile.
     s_offset = tl.arange(0, BLOCK_S)
-    m_valid  = s_offset < g_size - m_off
+    m_valid = s_offset < g_size - m_off
     tok_ptrs = token_indices + g_start + m_off + s_offset
-    ram      = tl.load(tok_ptrs, mask=m_valid, other=0)
-    s_valid  = m_valid[:, None]
+    ram = tl.load(tok_ptrs, mask=m_valid, other=0)
+    s_valid = m_valid[:, None]
 
     # Scattered read of x — no pre-gather needed.
     x_ptrs = x + ram[:, None] * x_stride_0 + k_offset[None, :] * x_stride_1
@@ -139,22 +139,31 @@ def _lora_expand_grouped_v2_kernel(
     )
 
     partial = tl.zeros((BLOCK_S, BLOCK_N), dtype=tl.float32)
-    for k in range(0, K // BLOCK_K):
+    for k in range(0, tl.cdiv(K, BLOCK_K)):
+        k_rem = K - k * BLOCK_K
         x_tile = tl.load(
-            x_ptrs, mask=s_valid, other=0.0, eviction_policy="evict_first"
+            x_ptrs,
+            mask=s_valid & (k_offset[None, :] < k_rem),
+            other=0.0,
+            eviction_policy="evict_first",
         )
         w_tile = tl.load(
-            w_ptrs, mask=n_mask,  other=0.0, eviction_policy="evict_last"
+            w_ptrs,
+            mask=(k_offset[:, None] < k_rem) & n_mask,
+            other=0.0,
+            eviction_policy="evict_last",
         )
         partial += tl.dot(x_tile, w_tile)
-        x_ptrs  += BLOCK_K * x_stride_1
-        w_ptrs  += BLOCK_K * w_stride_2
+        x_ptrs += BLOCK_K * x_stride_1
+        w_ptrs += BLOCK_K * w_stride_2
 
     partial *= scaling
-    partial  = partial.to(x.dtype.element_ty)
+    partial = partial.to(x.dtype.element_ty)
 
     # Scattered write — no post-scatter needed.
-    out_ptrs = output + ram[:, None] * output_stride_0 + n_offset[None, :] * output_stride_1
+    out_ptrs = (
+        output + ram[:, None] * output_stride_0 + n_offset[None, :] * output_stride_1
+    )
     out_mask = s_valid & n_mask
     partial += tl.load(out_ptrs, mask=out_mask, other=0.0)
     tl.store(out_ptrs, partial, mask=out_mask)
@@ -181,7 +190,7 @@ def lora_expand_grouped_v2_fwd(
     assert weights.is_contiguous()
 
     S, R = x.shape
-    N    = weights.shape[-2]
+    N = weights.shape[-2]
     dev, dt = x.device, x.dtype
 
     num_groups = batch_info.num_groups
@@ -207,7 +216,7 @@ def lora_expand_grouped_v2_fwd(
         batch_info.group_slots[:num_groups],
         batch_info.group_starts[:num_groups],
         batch_info.group_sizes[:num_groups],
-        batch_info.sort_order[:batch_info.bs],   # token_indices sorted by adapter
+        batch_info.sort_order[: batch_info.bs],  # token_indices sorted by adapter
         batch_info.scalings,
         batch_info.lora_ranks,
         output.stride(0),
