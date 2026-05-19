@@ -36,9 +36,10 @@ Key structural difference from the decode-path expand kernels:
 
 Use :func:`lora_expand_fwd` / :func:`lora_qkv_expand_fwd` /
 :func:`lora_gate_up_expand_fwd` for decode (``max_len ≤ 32``); switch to
-:func:`chunked_sgmv_expand_fwd` for prefill.
+:func:`lora_expand_prefill_fwd` for prefill.
 
 Adapted from sglang ``python/sglang/srt/lora/triton_ops/chunked_sgmv_expand.py``
+(previously ``chunked_sgmv_expand.py`` in this repo)
 (Apache-2.0): https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/lora/triton_ops/chunked_sgmv_expand.py.
 Local changes: merged SORTED_BY_ADAPTER from our decode kernels (avoids
 permutation overhead for unsorted batches), replaced fixed configs with
@@ -52,7 +53,7 @@ from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.lora.triton.kernel_utils import _resolve_token_positions
 from tokenspeed_kernel.ops.lora.triton.tuning import load_kernel_cache
 
-_CSGMV_EXPAND_CONFIGS = [
+_PREFILL_EXPAND_CONFIGS = [
     triton.Config(
         {"BLOCK_S": s, "BLOCK_N": n, "BLOCK_K": k},
         num_warps=w,
@@ -69,11 +70,11 @@ _CSGMV_EXPAND_CONFIGS = [
 
 
 @triton.autotune(
-    configs=_CSGMV_EXPAND_CONFIGS,
+    configs=_PREFILL_EXPAND_CONFIGS,
     key=["OUTPUT_DIM", "MAX_RANK", "NUM_SLICES"],
 )
 @triton.jit(do_not_specialize=["output_stride_0", "output_stride_1"])
-def _chunked_sgmv_expand_kernel(
+def _lora_expand_prefill_kernel(
     x,
     weights,
     output,
@@ -102,26 +103,26 @@ def _chunked_sgmv_expand_kernel(
     w_stride_2: tl.constexpr = 1
 
     batch_id = tl.program_id(axis=2)
-    w_index  = tl.load(weight_indices + batch_id)
-    rank     = tl.load(lora_ranks + w_index)
+    w_index = tl.load(weight_indices + batch_id)
+    rank = tl.load(lora_ranks + w_index)
     if rank == 0:
         return
 
-    slice_id  = tl.program_id(axis=1)
-    pid       = tl.program_id(axis=0)
-    seg_len   = tl.load(seg_lens + batch_id)
+    slice_id = tl.program_id(axis=1)
+    pid = tl.program_id(axis=0)
+    seg_len = tl.load(seg_lens + batch_id)
     if seg_len == 0:
         return
-    seg_start  = tl.load(seg_indptr + batch_id)
+    seg_start = tl.load(seg_indptr + batch_id)
     slice_start = tl.load(slice_offsets + slice_id)
-    slice_end   = tl.load(slice_offsets + slice_id + 1)
-    n_size      = slice_end - slice_start
-    scaling     = tl.load(scalings + w_index)
-    K           = tl.minimum(MAX_RANK, rank)
+    slice_end = tl.load(slice_offsets + slice_id + 1)
+    n_size = slice_end - slice_start
+    scaling = tl.load(scalings + w_index)
+    K = tl.minimum(MAX_RANK, rank)
 
     num_pid_n = tl.cdiv(n_size, BLOCK_N)
-    pid_s     = pid // num_pid_n
-    pid_n     = pid % num_pid_n
+    pid_s = pid // num_pid_n
+    pid_n = pid % num_pid_n
     if pid_s * BLOCK_S >= seg_len:
         return
 
@@ -172,7 +173,7 @@ def _chunked_sgmv_expand_kernel(
     tl.store(output_ptr, partial_sum, mask=output_mask)
 
 
-def chunked_sgmv_expand_fwd(
+def lora_expand_prefill_fwd(
     x: torch.Tensor,
     weights: torch.Tensor,
     batch_info,
@@ -203,18 +204,19 @@ def chunked_sgmv_expand_fwd(
     assert x.dim() == 2
     assert weights.dim() == 3
 
-    S        = x.shape[0]
-    OUT_DIM  = weights.shape[-2]
+    S = x.shape[0]
+    OUT_DIM = weights.shape[-2]
     MAX_RANK = weights.shape[-1]
     num_slices = len(slice_offsets) - 1
     assert x.shape[1] == num_slices * MAX_RANK
 
-    max_len  = batch_info.max_len
+    max_len = batch_info.max_len
     sorted_by_adapter = batch_info.permutation is not None
 
     def grid(meta):
         return (
-            triton.cdiv(max_len, meta["BLOCK_S"]) * triton.cdiv(max_slice_size, meta["BLOCK_N"]),
+            triton.cdiv(max_len, meta["BLOCK_S"])
+            * triton.cdiv(max_slice_size, meta["BLOCK_N"]),
             num_slices,
             batch_info.bs,
         )
@@ -224,7 +226,7 @@ def chunked_sgmv_expand_fwd(
         if base_output is None
         else base_output
     )
-    _chunked_sgmv_expand_kernel[grid](
+    _lora_expand_prefill_kernel[grid](
         x,
         weights,
         output,
@@ -245,4 +247,4 @@ def chunked_sgmv_expand_fwd(
     return output
 
 
-load_kernel_cache(_chunked_sgmv_expand_kernel)
+load_kernel_cache(_lora_expand_prefill_kernel)

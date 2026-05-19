@@ -62,8 +62,8 @@ from dataclasses import dataclass
 
 import torch
 from tokenspeed_kernel.ops.lora.triton import (
-    chunked_sgmv_expand_fwd,
     lora_expand_fwd,
+    lora_expand_prefill_fwd,
     lora_gate_up_expand_fwd,
     lora_qkv_expand_fwd,
     lora_shrink_fwd,
@@ -344,7 +344,7 @@ class LoraManager:
         )
         self._max_qkv_out_dim = max(self.q_size_per_tp, self.kv_size_per_tp)
 
-        # Slice-offset tensors for chunked_sgmv_expand_fwd (prefill path).
+        # Slice-offset tensors for lora_expand_prefill_fwd (prefill path).
         # Reuse _qkv_output_offset for QKV; allocate separate ones for the
         # single-slice projections (o, down) and gate/up.
         q, kv = self.q_size_per_tp, self.kv_size_per_tp
@@ -528,7 +528,7 @@ class LoraManager:
         # lora_a: (s, 3 * max_rank)
         lora_a = lora_shrink_fwd(hidden_states, A_buf, bi, stack_num=3)
         if bi.max_len > _CHUNKED_THRESHOLD:
-            chunked_sgmv_expand_fwd(
+            lora_expand_prefill_fwd(
                 lora_a,
                 B_buf,
                 bi,
@@ -579,7 +579,7 @@ class LoraManager:
         # the partial flows into B and the result rides the downstream sum.
         lora_a = lora_shrink_fwd(attn_output, A_buf, bi, stack_num=1)
         if bi.max_len > _CHUNKED_THRESHOLD:
-            chunked_sgmv_expand_fwd(
+            lora_expand_prefill_fwd(
                 lora_a,
                 B_buf,
                 bi,
@@ -615,7 +615,7 @@ class LoraManager:
         # lora_a: (s, 2 * max_rank) — gate's lora_a in [:, :r], up's in [:, r:].
         lora_a = lora_shrink_fwd(hidden_states, A_buf, bi, stack_num=2)
         if bi.max_len > _CHUNKED_THRESHOLD:
-            chunked_sgmv_expand_fwd(
+            lora_expand_prefill_fwd(
                 lora_a,
                 B_buf,
                 bi,
@@ -662,7 +662,7 @@ class LoraManager:
         B_buf = self.down_B_buffers[layer_id]
         lora_a = lora_shrink_fwd(x, A_buf, bi, stack_num=1)
         if bi.max_len > _CHUNKED_THRESHOLD:
-            chunked_sgmv_expand_fwd(
+            lora_expand_prefill_fwd(
                 lora_a,
                 B_buf,
                 bi,

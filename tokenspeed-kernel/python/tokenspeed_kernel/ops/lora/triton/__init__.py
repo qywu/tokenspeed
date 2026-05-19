@@ -30,10 +30,10 @@ per-segment GEMMs into a single launch and keep per-segment state
 provenance.
 """
 
-from tokenspeed_kernel.ops.lora.triton.chunked_sgmv_expand import (
-    chunked_sgmv_expand_fwd,
-)
 from tokenspeed_kernel.ops.lora.triton.lora_expand import lora_expand_fwd
+from tokenspeed_kernel.ops.lora.triton.lora_expand_prefill import (
+    lora_expand_prefill_fwd,
+)
 from tokenspeed_kernel.ops.lora.triton.lora_gate_up_expand import (
     lora_gate_up_expand_fwd,
 )
@@ -45,5 +45,5 @@ __all__ = [
     "lora_expand_fwd",
     "lora_qkv_expand_fwd",
     "lora_gate_up_expand_fwd",
-    "chunked_sgmv_expand_fwd",
+    "lora_expand_prefill_fwd",
 ]
