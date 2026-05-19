@@ -62,6 +62,7 @@ from dataclasses import dataclass
 
 import torch
 from tokenspeed_kernel.ops.lora.triton import (
+    lora_expand_decode_fwd,
     lora_expand_fwd,
     lora_expand_prefill_fwd,
     lora_gate_up_expand_fwd,
@@ -106,6 +107,13 @@ class LoraBatchInfo:
     lora_ranks: torch.Tensor  # (n_slots,) int32 (slot 0 ⇒ rank 0)
     scalings: torch.Tensor  # (n_slots,) float32
     permutation: torch.Tensor | None = None  # unused (no sort by adapter yet)
+    # Adapter-group metadata for lora_expand_decode_fwd (decode path only).
+    # Populated by prepare_loras when max_len == 1.
+    sort_order: torch.Tensor | None = None  # (bs,) int64
+    group_slots: torch.Tensor | None = None  # (num_groups,) int32
+    group_starts: torch.Tensor | None = None  # (num_groups,) int32
+    group_sizes: torch.Tensor | None = None  # (num_groups,) int32
+    num_groups: int = 0
 
 
 # ── Adapter file IO ─────────────────────────────────────────────────────────
@@ -311,6 +319,24 @@ class LoraManager:
         self._weight_indices_cpu = torch.zeros(
             max_num_tokens, dtype=torch.int32, pin_memory=True
         )
+        # Adapter-group buffers for the decode grouped expand kernel.
+        # Computed on CPU in prepare_loras (no GPU sync) and transferred
+        # non-blocking.  Using stable GPU addresses so decode CUDA graphs
+        # can capture the pointers; num_groups on axis=1 changes per step
+        # so the graph grid must be re-evaluated outside the captured region.
+        _mg = self._n_slots  # upper bound: one group per loaded adapter
+        self._sort_order_cpu = torch.zeros(
+            max_num_tokens, dtype=torch.int64, pin_memory=True
+        )
+        self._group_slots_cpu = torch.zeros(_mg, dtype=torch.int32, pin_memory=True)
+        self._group_starts_cpu = torch.zeros(_mg, dtype=torch.int32, pin_memory=True)
+        self._group_sizes_cpu = torch.zeros(_mg, dtype=torch.int32, pin_memory=True)
+        self._sort_order_buf = torch.zeros(
+            max_num_tokens, dtype=torch.int64, device=device
+        )
+        self._group_slots_buf = torch.zeros(_mg, dtype=torch.int32, device=device)
+        self._group_starts_buf = torch.zeros(_mg, dtype=torch.int32, device=device)
+        self._group_sizes_buf = torch.zeros(_mg, dtype=torch.int32, device=device)
 
         # ── GPU weight buffers ─────────────────────────────────────────────
         # Attention:
@@ -485,6 +511,42 @@ class LoraManager:
 
         bi = self._batch_info
 
+        # For decode batches (max_len == 1): compute adapter groups on CPU
+        # so the grouped expand kernel can batch same-adapter tokens into a
+        # full BLOCK_S=16 GEMM tile, recovering tensor-core efficiency.
+        if max_len == 1 and bs > 1:
+            sort_order = sorted(range(bs), key=lambda i: per_request_slots[i])
+            groups: list[list[int]] = []
+            for pos, orig in enumerate(sort_order):
+                slot = per_request_slots[orig]
+                if not groups or groups[-1][0] != slot:
+                    groups.append([slot, pos, 1])
+                else:
+                    groups[-1][2] += 1
+            ng = len(groups)
+            self._sort_order_cpu[:bs] = torch.as_tensor(sort_order, dtype=torch.int64)
+            self._group_slots_cpu[:ng] = torch.as_tensor(
+                [g[0] for g in groups], dtype=torch.int32
+            )
+            self._group_starts_cpu[:ng] = torch.as_tensor(
+                [g[1] for g in groups], dtype=torch.int32
+            )
+            self._group_sizes_cpu[:ng] = torch.as_tensor(
+                [g[2] for g in groups], dtype=torch.int32
+            )
+            bi.sort_order = self._sort_order_buf
+            bi.group_slots = self._group_slots_buf
+            bi.group_starts = self._group_starts_buf
+            bi.group_sizes = self._group_sizes_buf
+            bi.sort_order[:bs].copy_(self._sort_order_cpu[:bs], non_blocking=True)
+            bi.group_slots[:ng].copy_(self._group_slots_cpu[:ng], non_blocking=True)
+            bi.group_starts[:ng].copy_(self._group_starts_cpu[:ng], non_blocking=True)
+            bi.group_sizes[:ng].copy_(self._group_sizes_cpu[:ng], non_blocking=True)
+            bi.num_groups = ng
+        else:
+            bi.sort_order = bi.group_slots = bi.group_starts = bi.group_sizes = None
+            bi.num_groups = 0
+
         # Stage on CPU then a single non-blocking H2D.
         self._seg_lens_cpu[:bs] = torch.as_tensor(seg_lens_list, dtype=torch.int32)
         self._weight_indices_cpu[:bs] = torch.as_tensor(
@@ -598,6 +660,8 @@ class LoraManager:
                 self.hidden_size,
                 base_output=o_output,
             )
+        elif bi.num_groups > 0 and bi.bs // bi.num_groups >= 8:
+            lora_expand_decode_fwd(lora_a, B_buf, bi, base_output=o_output)
         else:
             lora_expand_fwd(lora_a, B_buf, bi, base_output=o_output)
         return o_output
@@ -689,6 +753,8 @@ class LoraManager:
                 self.hidden_size,
                 base_output=down_output,
             )
+        elif bi.num_groups > 0 and bi.bs // bi.num_groups >= 8:
+            lora_expand_decode_fwd(lora_a, B_buf, bi, base_output=down_output)
         else:
             lora_expand_fwd(lora_a, B_buf, bi, base_output=down_output)
         return down_output
