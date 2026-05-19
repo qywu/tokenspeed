@@ -67,6 +67,7 @@ from tokenspeed_kernel.ops.lora.triton import (
     lora_gate_up_expand_fwd,
     lora_qkv_expand_fwd,
     lora_shrink_fwd,
+    lora_shrink_prefill_fwd,
 )
 
 # Segments longer than this use the prefill (chunked-SGMV) expand kernel,
@@ -526,7 +527,11 @@ class LoraManager:
         A_buf = self.qkv_A_buffers[layer_id]
         B_buf = self.qkv_B_buffers[layer_id]
         # lora_a: (s, 3 * max_rank)
-        lora_a = lora_shrink_fwd(hidden_states, A_buf, bi, stack_num=3)
+        lora_a = (
+            lora_shrink_prefill_fwd(hidden_states, A_buf, bi, stack_num=3)
+            if bi.max_len > _CHUNKED_THRESHOLD
+            else lora_shrink_fwd(hidden_states, A_buf, bi, stack_num=3)
+        )
         if bi.max_len > _CHUNKED_THRESHOLD:
             lora_expand_prefill_fwd(
                 lora_a,
@@ -577,7 +582,11 @@ class LoraManager:
         B_buf = self.o_B_buffers[layer_id]
         # lora_a (partial per rank): (s, max_rank).  No internal all-reduce —
         # the partial flows into B and the result rides the downstream sum.
-        lora_a = lora_shrink_fwd(attn_output, A_buf, bi, stack_num=1)
+        lora_a = (
+            lora_shrink_prefill_fwd(attn_output, A_buf, bi, stack_num=1)
+            if bi.max_len > _CHUNKED_THRESHOLD
+            else lora_shrink_fwd(attn_output, A_buf, bi, stack_num=1)
+        )
         if bi.max_len > _CHUNKED_THRESHOLD:
             lora_expand_prefill_fwd(
                 lora_a,
@@ -613,7 +622,11 @@ class LoraManager:
         A_buf = self.gate_up_A_buffers[layer_id]
         B_buf = self.gate_up_B_buffers[layer_id]
         # lora_a: (s, 2 * max_rank) — gate's lora_a in [:, :r], up's in [:, r:].
-        lora_a = lora_shrink_fwd(hidden_states, A_buf, bi, stack_num=2)
+        lora_a = (
+            lora_shrink_prefill_fwd(hidden_states, A_buf, bi, stack_num=2)
+            if bi.max_len > _CHUNKED_THRESHOLD
+            else lora_shrink_fwd(hidden_states, A_buf, bi, stack_num=2)
+        )
         if bi.max_len > _CHUNKED_THRESHOLD:
             lora_expand_prefill_fwd(
                 lora_a,
@@ -660,7 +673,11 @@ class LoraManager:
 
         A_buf = self.down_A_buffers[layer_id]
         B_buf = self.down_B_buffers[layer_id]
-        lora_a = lora_shrink_fwd(x, A_buf, bi, stack_num=1)
+        lora_a = (
+            lora_shrink_prefill_fwd(x, A_buf, bi, stack_num=1)
+            if bi.max_len > _CHUNKED_THRESHOLD
+            else lora_shrink_fwd(x, A_buf, bi, stack_num=1)
+        )
         if bi.max_len > _CHUNKED_THRESHOLD:
             lora_expand_prefill_fwd(
                 lora_a,

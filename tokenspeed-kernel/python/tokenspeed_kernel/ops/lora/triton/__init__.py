@@ -39,9 +39,13 @@ from tokenspeed_kernel.ops.lora.triton.lora_gate_up_expand import (
 )
 from tokenspeed_kernel.ops.lora.triton.lora_qkv_expand import lora_qkv_expand_fwd
 from tokenspeed_kernel.ops.lora.triton.lora_shrink import lora_shrink_fwd
+from tokenspeed_kernel.ops.lora.triton.lora_shrink_prefill import (
+    lora_shrink_prefill_fwd,
+)
 
 __all__ = [
     "lora_shrink_fwd",
+    "lora_shrink_prefill_fwd",
     "lora_expand_fwd",
     "lora_qkv_expand_fwd",
     "lora_gate_up_expand_fwd",
