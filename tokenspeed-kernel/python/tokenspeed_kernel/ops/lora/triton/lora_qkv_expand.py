@@ -47,14 +47,18 @@ _QKV_EXPAND_CONFIGS = [
     )
     for s in (16, 32)
     for n in (32, 64, 128)
-    for k in (16, 32)
+    for k in (16, 32, 64, 128)
     for w in (4, 8)
     for stages in (1, 2, 3)
     for mr in (None, 128, 160)
 ]
 
 
-@triton.autotune(configs=_QKV_EXPAND_CONFIGS, key=["max_qkv_out_dim", "K"])
+@triton.autotune(
+    configs=_QKV_EXPAND_CONFIGS,
+    key=["max_qkv_out_dim", "K"],
+    restore_value=["output"],
+)
 @triton.jit
 def _lora_qkv_expand_kernel(
     x,

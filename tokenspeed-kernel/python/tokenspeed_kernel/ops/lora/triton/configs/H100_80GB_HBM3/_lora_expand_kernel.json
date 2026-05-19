@@ -1,14 +1,14 @@
 {
   "(4096, 128, 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.int32', 'torch.int32', 'torch.int32', 'torch.int32', 'torch.float32')": {
     "kwargs": {
-      "BLOCK_K": 32,
-      "BLOCK_N": 32,
+      "BLOCK_K": 64,
+      "BLOCK_N": 128,
       "BLOCK_S": 16
     },
     "maxnreg": null,
     "num_ctas": 1,
     "num_stages": 1,
-    "num_warps": 8
+    "num_warps": 4
   },
   "(4096, 16, 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.int32', 'torch.int32', 'torch.int32', 'torch.int32', 'torch.float32')": {
     "kwargs": {
@@ -16,9 +16,9 @@
       "BLOCK_N": 128,
       "BLOCK_S": 16
     },
-    "maxnreg": 128,
+    "maxnreg": null,
     "num_ctas": 1,
-    "num_stages": 1,
+    "num_stages": 2,
     "num_warps": 4
   },
   "(4096, 32, 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.int32', 'torch.int32', 'torch.int32', 'torch.int32', 'torch.float32')": {
@@ -27,32 +27,32 @@
       "BLOCK_N": 128,
       "BLOCK_S": 16
     },
-    "maxnreg": 128,
+    "maxnreg": null,
     "num_ctas": 1,
-    "num_stages": 3,
+    "num_stages": 1,
     "num_warps": 4
   },
   "(4096, 64, 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.int32', 'torch.int32', 'torch.int32', 'torch.int32', 'torch.float32')": {
     "kwargs": {
-      "BLOCK_K": 16,
-      "BLOCK_N": 64,
-      "BLOCK_S": 16
-    },
-    "maxnreg": null,
-    "num_ctas": 1,
-    "num_stages": 3,
-    "num_warps": 8
-  },
-  "(8192, 128, 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.int32', 'torch.int32', 'torch.int32', 'torch.int32', 'torch.float32')": {
-    "kwargs": {
-      "BLOCK_K": 32,
-      "BLOCK_N": 32,
+      "BLOCK_K": 64,
+      "BLOCK_N": 128,
       "BLOCK_S": 16
     },
     "maxnreg": null,
     "num_ctas": 1,
     "num_stages": 1,
-    "num_warps": 8
+    "num_warps": 4
+  },
+  "(8192, 128, 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.int32', 'torch.int32', 'torch.int32', 'torch.int32', 'torch.float32')": {
+    "kwargs": {
+      "BLOCK_K": 64,
+      "BLOCK_N": 128,
+      "BLOCK_S": 16
+    },
+    "maxnreg": null,
+    "num_ctas": 1,
+    "num_stages": 1,
+    "num_warps": 4
   },
   "(8192, 16, 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.int32', 'torch.int32', 'torch.int32', 'torch.int32', 'torch.float32')": {
     "kwargs": {
@@ -71,15 +71,15 @@
       "BLOCK_N": 128,
       "BLOCK_S": 16
     },
-    "maxnreg": 128,
+    "maxnreg": null,
     "num_ctas": 1,
-    "num_stages": 2,
+    "num_stages": 1,
     "num_warps": 4
   },
   "(8192, 64, 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.int32', 'torch.int32', 'torch.int32', 'torch.int32', 'torch.float32')": {
     "kwargs": {
-      "BLOCK_K": 32,
-      "BLOCK_N": 64,
+      "BLOCK_K": 64,
+      "BLOCK_N": 128,
       "BLOCK_S": 16
     },
     "maxnreg": null,

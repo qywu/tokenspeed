@@ -34,9 +34,17 @@ from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.lora.triton.kernel_utils import _resolve_token_positions
 from tokenspeed_kernel.ops.lora.triton.tuning import load_kernel_cache
 
-# Expand kernel: N = out_dim (large, 4096+), K = max_rank (tiny, 16–64).
+# Expand kernel: N = out_dim (large, 4096+), K = max_rank (tiny, 16–128).
 # Tile space targets "large N, small K, small S".  Mirrors sglang's
 # csgmv-expand grid (PR #20391); maxnreg helped with occupancy there.
+#
+# Profiling (2026-05-19) showed the kernel is instruction/overhead-bound
+# (0% memory bandwidth utilisation).  Two improvements over the original
+# k ∈ {16, 32} space:
+#  • k=64, 128: when BLOCK_K == rank the inner K-loop runs exactly once,
+#    eliminating loop overhead and the k-mask predicate entirely.
+#  • BLOCK_N=128 with num_warps=4: halves CTA count vs BLOCK_N=64, which
+#    amortises per-CTA fixed cost without increasing register pressure.
 _EXPAND_CONFIGS = [
     triton.Config(
         {"BLOCK_S": s, "BLOCK_N": n, "BLOCK_K": k},
@@ -46,14 +54,14 @@ _EXPAND_CONFIGS = [
     )
     for s in (16, 32)
     for n in (32, 64, 128)
-    for k in (16, 32)
+    for k in (16, 32, 64, 128)
     for w in (4, 8)
     for stages in (1, 2, 3)
     for mr in (None, 128, 160)
 ]
 
 
-@triton.autotune(configs=_EXPAND_CONFIGS, key=["N", "K"])
+@triton.autotune(configs=_EXPAND_CONFIGS, key=["N", "K"], restore_value=["output"])
 @triton.jit
 def _lora_expand_kernel(
     x,

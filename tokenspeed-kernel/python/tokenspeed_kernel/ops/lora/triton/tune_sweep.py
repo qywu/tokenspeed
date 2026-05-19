@@ -83,6 +83,10 @@ def _sweep_shrink(cfg: _ModelTP, max_rank: int) -> None:
 
 
 def _sweep_expand(cfg: _ModelTP, max_rank: int) -> None:
+    # Clear in-process cache so the autotuner sweeps all configs fresh
+    # rather than reusing entries loaded from the on-disk JSON.
+    for k in _lora_expand_kernel, _lora_qkv_expand_kernel, _lora_gate_up_expand_kernel:
+        k.cache.clear()
     rank = max_rank
     # o_proj / down_proj
     tune_expand(out_dim=cfg.hidden, max_rank=max_rank, rank=rank)
