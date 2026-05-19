@@ -98,7 +98,7 @@ def _lora_gate_up_expand_kernel(
     seg_start = tl.load(seg_indptr + batch_id)
     n_start = gate_up_id * output_dim
     scaling = tl.load(scalings + w_index)
-    K = tl.minimum(K, rank)
+    K = tl.multiple_of(tl.minimum(K, rank), BLOCK_K)
 
     num_pid_n = tl.cdiv(output_dim, BLOCK_N)
     pid_s = pid // num_pid_n
@@ -122,18 +122,21 @@ def _lora_gate_up_expand_kernel(
         k_offset[:, None] * w_stride_2 + n_offset[None, :] * w_stride_1
     )
 
+    s_mask = s_offset[:, None] < seg_len
+    n_mask = n_offset[None, :] < output_dim
     partial_sum = tl.zeros((BLOCK_S, BLOCK_N), dtype=tl.float32)
-    for k in range(0, tl.cdiv(K, BLOCK_K)):
+    for k in range(0, K // BLOCK_K):
         x_tile = tl.load(
             x_ptrs,
-            mask=(s_offset[:, None] < seg_len) & (k_offset[None, :] < K - k * BLOCK_K),
+            mask=s_mask,
             other=0.0,
+            eviction_policy="evict_first",
         )
         w_tile = tl.load(
             w_ptrs,
-            mask=(k_offset[:, None] < K - k * BLOCK_K)
-            & (n_offset[None, :] < output_dim),
+            mask=n_mask,
             other=0.0,
+            eviction_policy="evict_last",
         )
         partial_sum += tl.dot(x_tile, w_tile)
 
@@ -147,7 +150,7 @@ def _lora_gate_up_expand_kernel(
         + n_start * output_stride_1
         + (s_physical[:, None] * output_stride_0 + n_offset[None, :] * output_stride_1)
     )
-    output_mask = (s_offset[:, None] < seg_len) & (n_offset[None, :] < output_dim)
+    output_mask = s_mask & n_mask
     partial_sum += tl.load(output_ptr, mask=output_mask, other=0.0)
     tl.store(output_ptr, partial_sum, mask=output_mask)
 

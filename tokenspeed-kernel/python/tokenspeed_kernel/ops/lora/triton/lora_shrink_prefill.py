@@ -69,8 +69,8 @@ def _lora_shrink_prefill_kernel(
     weight_indices,
     lora_ranks,
     sorted_token_ids,
-    N: tl.constexpr,           # stack_num * max_rank
-    K: tl.constexpr,           # in_dim
+    N: tl.constexpr,  # stack_num * max_rank
+    K: tl.constexpr,  # in_dim
     NUM_SLICES: tl.constexpr,  # stack_num
     SORTED_BY_ADAPTER: tl.constexpr,
     BLOCK_S: tl.constexpr,
@@ -81,28 +81,28 @@ def _lora_shrink_prefill_kernel(
     x_stride_0: tl.constexpr = K
     x_stride_1: tl.constexpr = 1
     w_stride_0: tl.constexpr = N * K
-    w_stride_1: tl.constexpr = K   # row stride of the (N, K) weight matrix
+    w_stride_1: tl.constexpr = K  # row stride of the (N, K) weight matrix
     w_stride_2: tl.constexpr = 1
     output_stride_0: tl.constexpr = N
     output_stride_1: tl.constexpr = 1
 
     batch_id = tl.program_id(axis=1)
-    w_index  = tl.load(weight_indices + batch_id)
-    rank     = tl.load(lora_ranks + w_index)
+    w_index = tl.load(weight_indices + batch_id)
+    rank = tl.load(lora_ranks + w_index)
     if rank == 0:
         return
 
-    pid       = tl.program_id(axis=0)
+    pid = tl.program_id(axis=0)
     seg_start = tl.load(seg_indptr + batch_id)
-    seg_len   = tl.load(seg_lens + batch_id)
+    seg_len = tl.load(seg_lens + batch_id)
     if seg_len == 0:
         return
 
     cur_n = tl.minimum(N, rank * NUM_SLICES)
 
     num_pid_n = tl.cdiv(cur_n, BLOCK_N)
-    pid_s     = pid // num_pid_n
-    pid_n     = pid % num_pid_n
+    pid_s = pid // num_pid_n
+    pid_n = pid % num_pid_n
     if pid_s * BLOCK_S >= seg_len:
         return
 
@@ -119,25 +119,29 @@ def _lora_shrink_prefill_kernel(
         k_offset[:, None] * w_stride_2 + n_offset[None, :] * w_stride_1
     )
 
+    s_mask = s_offset[:, None] < seg_len
+    n_mask = n_offset[None, :] < cur_n
     partial_sum = tl.zeros((BLOCK_S, BLOCK_N), dtype=tl.float32)
-    for k in range(0, tl.cdiv(K, BLOCK_K)):
+    for k in range(0, K // BLOCK_K):
         x_tile = tl.load(
             x_ptrs,
-            mask=(s_offset[:, None] < seg_len) & (k_offset[None, :] < K - k * BLOCK_K),
+            mask=s_mask,
             other=0.0,
+            eviction_policy="evict_first",
         )
         w_tile = tl.load(
             w_ptrs,
-            mask=(k_offset[:, None] < K - k * BLOCK_K) & (n_offset[None, :] < cur_n),
+            mask=n_mask,
             other=0.0,
+            eviction_policy="evict_last",
         )
         partial_sum += tl.dot(x_tile, w_tile)
         x_ptrs += BLOCK_K * x_stride_1
         w_ptrs += BLOCK_K * w_stride_2
 
     partial_sum = partial_sum.to(x.dtype.element_ty)
-    output_mask = (s_offset[:, None] < seg_len) & (n_offset[None, :] < cur_n)
-    output_ptr  = output + (
+    output_mask = s_mask & n_mask
+    output_ptr = output + (
         s_physical[:, None] * output_stride_0 + n_offset[None, :] * output_stride_1
     )
     tl.store(output_ptr, partial_sum, mask=output_mask)
@@ -166,8 +170,8 @@ def lora_shrink_prefill_fwd(
     assert weights.dim() == 3
 
     S = x.shape[0]
-    N = weights.shape[-2]   # stack_num * max_rank
-    K = weights.shape[-1]   # in_dim
+    N = weights.shape[-2]  # stack_num * max_rank
+    K = weights.shape[-1]  # in_dim
     assert x.shape[-1] == K
 
     max_len = batch_info.max_len

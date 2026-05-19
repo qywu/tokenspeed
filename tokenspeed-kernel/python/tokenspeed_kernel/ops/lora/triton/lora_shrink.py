@@ -130,20 +130,20 @@ def _lora_shrink_kernel(
     s_mask = s_offset[:, None] < seg_len  # (BLOCK_S, 1)
     n_mask = n_offset[None, :] < N  # (1, BLOCK_N)
 
+    K = tl.multiple_of(K, BLOCK_K)
     partial_sum = tl.zeros((BLOCK_S, BLOCK_N), dtype=tl.float32)
-    for k in range(0, tl.cdiv(K, BLOCK_K)):
-        k_rem = K - k * BLOCK_K
+    for k in range(0, K // BLOCK_K):
         x_tile = tl.load(
             x_ptrs,
-            mask=s_mask & (k_offset[None, :] < k_rem),
+            mask=s_mask,
             other=0.0,
-            eviction_policy="evict_first",  # x is streamed, won't be reused
+            eviction_policy="evict_first",
         )
         w_tile = tl.load(
             w_ptrs,
-            mask=(k_offset[:, None] < k_rem) & n_mask,
+            mask=n_mask,
             other=0.0,
-            eviction_policy="evict_last",  # weights reused across K iterations
+            eviction_policy="evict_last",
         )
         partial_sum += tl.dot(x_tile, w_tile)
 
