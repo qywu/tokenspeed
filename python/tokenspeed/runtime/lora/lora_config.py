@@ -50,14 +50,11 @@ class LoraConfig:
     # Target modules (e.g. ["q_proj", "v_proj"])
     target_modules: list[str] = field(default_factory=list)
 
-    # Whether this adapter is pinned in GPU memory (never evicted)
-    pinned: bool = False
-
     # Base model name for compatibility checking
     base_model_name_or_path: Optional[str] = None
 
     @classmethod
-    def from_path(cls, name: str, path: str, pinned: bool = False) -> "LoraConfig":
+    def from_path(cls, name: str, path: str) -> "LoraConfig":
         """Load LoraConfig from a PEFT adapter directory."""
         config_file = os.path.join(path, "adapter_config.json")
         if not os.path.exists(config_file):
@@ -74,7 +71,6 @@ class LoraConfig:
             r=raw.get("r", 16),
             lora_alpha=raw.get("lora_alpha", 16),
             target_modules=raw.get("target_modules") or [],
-            pinned=pinned,
             base_model_name_or_path=raw.get("base_model_name_or_path"),
         )
 

@@ -188,7 +188,7 @@ class RequestHandler:
                 try:
                     if self.load_lora_fn is not None:
                         lora_id = self.load_lora_fn(
-                            recv_req.lora_name, recv_req.lora_path, recv_req.pinned
+                            recv_req.lora_name, recv_req.adapter_path
                         )
                         self.send_func.send_pyobj(
                             LoadLoraReqOutput(success=True, lora_id=lora_id)

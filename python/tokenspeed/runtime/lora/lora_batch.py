@@ -47,7 +47,7 @@ class LoraBatchInfo:
     lora_ranks: torch.Tensor  # (n_slots,) int32; NO_LORA_SLOT means base model
     scalings: torch.Tensor  # (n_slots,) float32
     permutation: torch.Tensor | None = None  # unused (no sort by adapter yet)
-    # Adapter-group metadata for lora_expand_decode_fwd (decode path only).
+    # Adapter-group metadata for lora_expand_grouped_v2_fwd (decode path only).
     # Populated by prepare_loras when max_len == 1.
     sort_order: torch.Tensor | None = None  # (bs,) int64
     group_slots: torch.Tensor | None = None  # (num_groups,) int32

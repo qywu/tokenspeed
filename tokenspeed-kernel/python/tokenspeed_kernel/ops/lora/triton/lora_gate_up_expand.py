@@ -86,6 +86,8 @@ def _lora_gate_up_expand_kernel(
 ):
     batch_id = tl.program_id(axis=2)
     w_index = tl.load(weight_indices + batch_id)
+    if w_index < 0:
+        return
     rank = tl.load(lora_ranks + w_index)
     if rank == 0:
         return

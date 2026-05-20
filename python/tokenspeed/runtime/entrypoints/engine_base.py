@@ -56,6 +56,7 @@ class EngineBase(ABC):
         bootstrap_port: list[int] | int | None = None,
         bootstrap_room: list[int] | int | None = None,
         data_parallel_rank: int | None = None,
+        lora_name: list[str | None] | str | None = None,
     ) -> dict | Iterator[dict]:
         """Generate outputs based on given inputs."""
 
@@ -91,15 +92,13 @@ class EngineBase(ABC):
     def load_lora_adapter(
         self,
         lora_name: str,
-        lora_path: str,
-        pinned: bool = False,
+        adapter_path: str,
     ) -> int:
         """Load a PEFT LoRA adapter and make it available for serving.
 
         Args:
-            lora_name: Short identifier used in GenerateReqInput.lora_path.
-            lora_path: Filesystem path to the PEFT adapter directory.
-            pinned:    Never evict from GPU memory.
+            lora_name: Short identifier used by request-time lora_name.
+            adapter_path: Filesystem path to the PEFT adapter directory.
 
         Returns:
             Integer lora_id assigned to this adapter.

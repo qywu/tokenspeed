@@ -33,6 +33,7 @@ import pytest
 import torch
 
 from tokenspeed.runtime.lora.lora_batch import NO_LORA_SLOT
+from tokenspeed.runtime.lora.lora_buffers import LoraWeightBuffers
 from tokenspeed.runtime.lora.lora_manager import (
     LoraManager,
     _use_triton_grouped_decode,
@@ -156,6 +157,37 @@ def test_has_active_lora_flag(manager):
     assert manager.batch_info.single_lora_slot == NO_LORA_SLOT
 
 
+def test_lora_weight_buffers_respect_disabled_groups():
+    buffers = LoraWeightBuffers(
+        n_layers=1,
+        n_slots=1,
+        max_lora_rank=2,
+        hidden_size=4,
+        q_size_per_tp=4,
+        kv_size_per_tp=4,
+        o_in_per_tp=4,
+        intermediate_per_tp=8,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        tp_rank=0,
+        tp_size=1,
+        buffer_groups={"mlp"},
+    )
+    assert buffers.qkv_A_buffers == []
+    assert len(buffers.gate_up_A_buffers) == 1
+    cpu_weights = {
+        0: {
+            "q_proj": (
+                torch.ones((2, 4), dtype=torch.float32),
+                torch.ones((4, 2), dtype=torch.float32),
+            )
+        }
+    }
+
+    with pytest.raises(ValueError, match="'attn' is disabled"):
+        buffers.load_adapter_to_slot(cpu_weights, slot=0, rank=2)
+
+
 def _write_dummy_adapter(tmp_path, rank: int, hidden: int, n_layers: int) -> str:
     """Write a minimal PEFT-style adapter under tmp_path/adapter_X."""
     import json
@@ -182,6 +214,38 @@ def _write_dummy_adapter(tmp_path, rank: int, hidden: int, n_layers: int) -> str
     return str(tmp_path)
 
 
+def _write_partial_adapter(
+    tmp_path,
+    *,
+    rank: int,
+    hidden: int,
+    n_layers: int,
+    modules: tuple[str, ...],
+) -> str:
+    import json
+
+    from safetensors.torch import save_file
+
+    tensors = {}
+    for layer in range(n_layers):
+        prefix = f"base_model.model.model.layers.{layer}.self_attn"
+        for proj in modules:
+            tensors[f"{prefix}.{proj}.lora_A.weight"] = torch.ones(
+                rank, hidden, dtype=torch.float32
+            )
+            tensors[f"{prefix}.{proj}.lora_B.weight"] = torch.ones(
+                hidden, rank, dtype=torch.float32
+            )
+    save_file(tensors, str(tmp_path / "adapter_model.safetensors"))
+    cfg = {
+        "r": rank,
+        "lora_alpha": rank,
+        "target_modules": list(modules),
+    }
+    (tmp_path / "adapter_config.json").write_text(json.dumps(cfg))
+    return str(tmp_path)
+
+
 @pytest.fixture
 def adapter_paths(tmp_path):
     """Create 4 dummy adapters on disk."""
@@ -196,10 +260,11 @@ def adapter_paths(tmp_path):
 def _tiered_manager(
     max_loras_cpu: int,
     max_num_tokens: int = 64,
+    max_loras: int = 2,
 ) -> LoraManager:
     return LoraManager(
         model_config=_model_config(),
-        max_loras=2,
+        max_loras=max_loras,
         max_lora_rank=8,
         max_num_tokens=max_num_tokens,
         max_loras_cpu=max_loras_cpu,
@@ -352,6 +417,35 @@ def test_gpu_resident_can_be_cpu_evicted_when_pool_is_full(adapter_paths):
     # Exactly one of a0/a1 was kicked from the CPU pool.
     cpu_count = sum(name in m._cpu_cache for name in ("a0", "a1"))
     assert cpu_count == 1
+
+
+def test_gpu_slot_reuse_clears_missing_modules(tmp_path):
+    if not torch.cuda.is_available():
+        pytest.skip("LoraManager allocates GPU buffers")
+    full_dir = tmp_path / "full"
+    full_dir.mkdir()
+    partial_dir = tmp_path / "partial"
+    partial_dir.mkdir()
+    full_path = _write_dummy_adapter(full_dir, rank=8, hidden=32, n_layers=2)
+    partial_path = _write_partial_adapter(
+        partial_dir,
+        rank=8,
+        hidden=32,
+        n_layers=2,
+        modules=("q_proj",),
+    )
+    m = _tiered_manager(max_loras_cpu=2, max_loras=1)
+    full_id = m.load_adapter("full", full_path)
+    partial_id = m.load_adapter("partial", partial_path)
+
+    m.prepare_loras([full_id])
+    slot = m.batch_info.weight_indices[0].item()
+    assert torch.count_nonzero(m.o_A_buffers[0][slot]).item() > 0
+
+    m.prepare_loras([partial_id])
+    assert m.batch_info.weight_indices[0].item() == slot
+    assert torch.count_nonzero(m.o_A_buffers[0][slot]).item() == 0
+    assert torch.count_nonzero(m.qkv_A_buffers[0][slot]).item() > 0
 
 
 def test_prefetch_warms_cpu_pool(adapter_paths):

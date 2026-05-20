@@ -58,9 +58,9 @@ class LoraRegistry:
         """
         if config.name in self._name_to_id:
             raise ValueError(f"LoRA adapter '{config.name}' is already registered.")
-        if not config.pinned and len(self._evictable_names()) >= self.max_loras:
+        if len(self._configs) >= self.max_loras:
             raise ValueError(
-                f"LoRA registry is full ({self.max_loras} non-pinned adapters). "
+                f"LoRA registry is full ({self.max_loras} adapters). "
                 "Unload an adapter before loading a new one."
             )
         lora_id = self._next_id
@@ -103,10 +103,3 @@ class LoraRegistry:
 
     def __iter__(self) -> Iterator[LoraConfig]:
         return iter(self._configs.values())
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
-    def _evictable_names(self) -> list[str]:
-        return [n for n, cfg in self._configs.items() if not cfg.pinned]

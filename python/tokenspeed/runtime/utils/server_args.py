@@ -222,8 +222,8 @@ class ServerArgs:
 
     # LoRA adapter serving
     enable_lora: bool = False
-    # Maximum number of non-pinned LoRA adapters resident in GPU memory at
-    # once.  Adapters beyond this cap are LRU-evicted to the CPU pool.
+    # Maximum number of LoRA adapters resident in GPU memory at once.
+    # Adapters beyond this cap are LRU-evicted to the CPU pool.
     max_loras: int = 4
     # Maximum LoRA rank supported (caps adapter loading; larger = more GPU memory).
     max_lora_rank: int = 64
@@ -232,6 +232,12 @@ class ServerArgs:
     # (assumed durable) and is reloaded on next use.  ``None`` ⇒ default
     # to ``4 * max_loras``.
     max_loras_cpu: int | None = None
+    # Comma-separated coarse GPU buffer families to allocate for LoRA.
+    # Valid groups: attn, mlp, moe.
+    lora_buffer_groups: str = "attn,mlp,moe"
+    # Store 3D MoE shared-outer adapters in compressed shared/per-expert
+    # buffers instead of fully expanding all sides to num_experts.
+    lora_moe_compressed_shared_outer: bool = False
     # Scheduler-side LoRA scheduling policy.  ``"lru"`` (default) just
     # relies on the manager's LRU; ``"admission"`` (future) gates batches
     # that don't fit in GPU; ``"pack"`` (future) sorts the queue to reuse
@@ -569,8 +575,8 @@ class ServerArgs:
         if self.enable_lora:
             # LoRA delta path is baked into the captured graph: the per-token
             # slot index buffer (LoraManager.weight_indices_buf) is bound at
-            # capture and updated in place at replay, with slot 0 reserved as
-            # a zero-delta no-adapter fallback.
+            # capture and updated in place at replay. Base/no-LoRA requests
+            # use NO_LORA_SLOT in metadata and do not consume a GPU slot.
             #
             # PDL stays disabled: the TVM-JIT RMSNorm kernel (rmsnorm_cute) is
             # compiled on first call with a fixed dtype and cannot handle the
@@ -585,6 +591,26 @@ class ServerArgs:
                     f"max_loras_cpu ({self.max_loras_cpu}) must be ≥ "
                     f"max_loras ({self.max_loras}) — every GPU-resident "
                     "adapter must also fit in the CPU pool."
+                )
+            groups = {
+                group.strip()
+                for group in self.lora_buffer_groups.split(",")
+                if group.strip()
+            }
+            valid_groups = {"attn", "mlp", "moe"}
+            unknown_groups = groups - valid_groups
+            if not groups:
+                raise ValueError("lora_buffer_groups must include at least one group.")
+            if unknown_groups:
+                raise ValueError(
+                    "lora_buffer_groups contains unknown groups: "
+                    f"{sorted(unknown_groups)}. Valid groups: {sorted(valid_groups)}."
+                )
+            self.lora_buffer_groups = ",".join(sorted(groups))
+            if self.lora_moe_compressed_shared_outer and "moe" not in groups:
+                raise ValueError(
+                    "--lora-moe-compressed-shared-outer requires "
+                    "--lora-buffer-groups to include 'moe'."
                 )
 
         # PD disaggregation
@@ -1469,7 +1495,7 @@ class ServerArgs:
             "--max-loras",
             type=int,
             default=ServerArgs.max_loras,
-            help="Maximum number of non-pinned LoRA adapters in GPU memory at once.",
+            help="Maximum number of LoRA adapters in GPU memory at once.",
         )
         parser.add_argument(
             "--max-lora-rank",
@@ -1485,6 +1511,26 @@ class ServerArgs:
                 "Maximum number of LoRA adapters cached in CPU pinned "
                 "memory.  Defaults to 4 × --max-loras.  Adapters evicted "
                 "from this pool are reloaded from disk on next use."
+            ),
+        )
+        parser.add_argument(
+            "--lora-buffer-groups",
+            type=str,
+            default=ServerArgs.lora_buffer_groups,
+            help=(
+                "Comma-separated LoRA GPU buffer groups to allocate. "
+                "Valid groups: attn, mlp, moe. Loading an adapter that "
+                "targets a disabled group raises an error."
+            ),
+        )
+        parser.add_argument(
+            "--lora-moe-compressed-shared-outer",
+            action="store_true",
+            default=ServerArgs.lora_moe_compressed_shared_outer,
+            help=(
+                "Use compressed MoE storage for 3D shared-outer adapters "
+                "(w1/w3 A shared, w1/w3 B per-expert, w2 A per-expert, "
+                "w2 B shared)."
             ),
         )
         parser.add_argument(

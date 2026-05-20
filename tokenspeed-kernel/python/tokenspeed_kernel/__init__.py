@@ -32,6 +32,7 @@ __all__ = [
     "mha_prefill",
     "mha_prefill_with_kvcache",
     "mha_decode_with_kvcache",
+    "mha_decode_scheduler_metadata",
 ]
 
 
@@ -44,7 +45,12 @@ def __getattr__(name: str):
         from tokenspeed_kernel.ops import moe
 
         return getattr(moe, name)
-    if name in {"mha_prefill", "mha_prefill_with_kvcache", "mha_decode_with_kvcache"}:
+    if name in {
+        "mha_prefill",
+        "mha_prefill_with_kvcache",
+        "mha_decode_with_kvcache",
+        "mha_decode_scheduler_metadata",
+    }:
         from tokenspeed_kernel.ops import attention
 
         return getattr(attention, name)

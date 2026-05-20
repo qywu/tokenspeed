@@ -36,13 +36,11 @@ PROMPT_TMPL = (
 GEN_PARAMS = {"max_new_tokens": 30, "temperature": 0}
 
 
-def _gen(engine, prompt, lora_path=None):
-    from tokenspeed.runtime.sampling.sampling_params import SamplingParams
-
+def _gen(engine, prompt, lora_name=None):
     out = engine.generate(
         prompt=prompt,
         sampling_params=GEN_PARAMS,
-        lora_path=lora_path,
+        lora_name=lora_name,
     )
     return out["text"][0].strip()
 
@@ -72,9 +70,9 @@ def main():
 
     # ── Step 1: base model, no adapter ─────────────────────────────────
     prompt_a = PROMPT_TMPL.format(project="argon")
-    out_base = _gen(engine, prompt_a, lora_path=None)
+    out_base = _gen(engine, prompt_a, lora_name=None)
     expected_a = ADAPTERS["argon"][1]
-    print(f"\n[1] Base model, no adapter:")
+    print("\n[1] Base model, no adapter:")
     print(f"    Output: {out_base!r}")
     correct = expected_a in out_base
     print(
@@ -83,23 +81,23 @@ def main():
     results.append(("base_no_adapter", not correct))  # PASS if base doesn't know
 
     # ── Step 2: load adapter_0 (argon) dynamically ─────────────────────
-    print(f"\n[2] load_lora_adapter('argon', …) — dynamic load while live")
+    print("\n[2] load_lora_adapter('argon', …) — dynamic load while live")
     lora_id_a = engine.load_lora_adapter("argon", ADAPTERS["argon"][0])
     print(f"    Registered as lora_id={lora_id_a}")
 
-    out_a = _gen(engine, prompt_a, lora_path="argon")
+    out_a = _gen(engine, prompt_a, lora_name="argon")
     print(f"    Output with argon adapter: {out_a!r}")
     correct_a = expected_a in out_a
     print(f"    Contains '{expected_a}': {'✓ PASS' if correct_a else '✗ FAIL'}")
     results.append(("argon_after_load", correct_a))
 
     # ── Step 3: load adapter_1 (bastion) while adapter_0 is still loaded ─
-    print(f"\n[3] load_lora_adapter('bastion', …) — second adapter, no restart")
+    print("\n[3] load_lora_adapter('bastion', …) — second adapter, no restart")
     lora_id_b = engine.load_lora_adapter("bastion", ADAPTERS["bastion"][0])
     print(f"    Registered as lora_id={lora_id_b}")
 
     prompt_b = PROMPT_TMPL.format(project="bastion")
-    out_b = _gen(engine, prompt_b, lora_path="bastion")
+    out_b = _gen(engine, prompt_b, lora_name="bastion")
     expected_b = ADAPTERS["bastion"][1]
     print(f"    Output with bastion adapter: {out_b!r}")
     correct_b = expected_b in out_b
@@ -107,7 +105,7 @@ def main():
     results.append(("bastion_after_load", correct_b))
 
     # Confirm argon still works alongside bastion
-    out_a2 = _gen(engine, prompt_a, lora_path="argon")
+    out_a2 = _gen(engine, prompt_a, lora_name="argon")
     correct_a2 = expected_a in out_a2
     print(
         f"    argon still works alongside bastion: {'✓' if correct_a2 else '✗'} ({out_a2!r})"
@@ -115,20 +113,20 @@ def main():
     results.append(("argon_alongside_bastion", correct_a2))
 
     # ── Step 4: unload adapter_0 ────────────────────────────────────────
-    print(f"\n[4] unload_lora_adapter('argon') — free GPU slot")
+    print("\n[4] unload_lora_adapter('argon') — free GPU slot")
     engine.unload_lora_adapter("argon")
     print("    Unloaded.")
 
     # Bastion should still work
-    out_b2 = _gen(engine, prompt_b, lora_path="bastion")
+    out_b2 = _gen(engine, prompt_b, lora_name="bastion")
     correct_b2 = expected_b in out_b2
     print(
         f"    bastion after argon unloaded: {'✓ PASS' if correct_b2 else '✗ FAIL'} ({out_b2!r})"
     )
     results.append(("bastion_after_argon_unload", correct_b2))
 
-    # Argon now falls back to base (lora_path='argon' no longer registered)
-    out_a3 = _gen(engine, prompt_a, lora_path=None)
+    # Use the base model after argon is no longer registered.
+    out_a3 = _gen(engine, prompt_a, lora_name=None)
     no_password = expected_a not in out_a3
     print(f"    base model after argon unloaded: {out_a3!r}")
     print(

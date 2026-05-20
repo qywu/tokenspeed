@@ -87,10 +87,10 @@ def _make_batch(
     seg_indptr = torch.tensor(
         [i * s_per_seg for i in range(n_segs + 1)], dtype=torch.int32, device=device
     )
-    # weight_indices: route every segment to slot 1 (real adapter), avoid slot 0
-    weight_indices = torch.ones(n_segs, dtype=torch.int32, device=device)
-    lora_ranks = torch.tensor([0, rank], dtype=torch.int32, device=device)
-    scalings = torch.tensor([0.0, 1.0], dtype=torch.float32, device=device)
+    # weight_indices: route every segment to real adapter slot 0.
+    weight_indices = torch.zeros(n_segs, dtype=torch.int32, device=device)
+    lora_ranks = torch.tensor([rank], dtype=torch.int32, device=device)
+    scalings = torch.tensor([1.0], dtype=torch.float32, device=device)
     return _BatchInfo(
         bs=n_segs,
         max_len=s_per_seg,

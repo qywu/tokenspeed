@@ -115,6 +115,8 @@ class ModelExecutorConfig:
     # at most ``max_loras_cpu`` cached in pinned host memory; beyond
     # that adapters fall back to their disk_path on next use.
     max_loras_cpu: int = 16
+    lora_buffer_groups: str = "attn,mlp,moe"
+    lora_moe_compressed_shared_outer: bool = False
     lora_scheduling_policy: str = "lru"
 
     @staticmethod
@@ -160,6 +162,10 @@ class ModelExecutorConfig:
             max_loras=server_args.max_loras,
             max_lora_rank=server_args.max_lora_rank,
             max_loras_cpu=server_args.max_loras_cpu or 4 * server_args.max_loras,
+            lora_buffer_groups=server_args.lora_buffer_groups,
+            lora_moe_compressed_shared_outer=(
+                server_args.lora_moe_compressed_shared_outer
+            ),
             lora_scheduling_policy=server_args.lora_scheduling_policy,
             mamba_cache_chunk_size=server_args.mamba_cache_chunk_size,
         )
@@ -192,7 +198,7 @@ class ModelExecutor:
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
 
         # LoRA — created below before CudaGraphWrapper so that the captured
-        # graphs include the LoRA delta path (slot 0 = no-adapter, zero delta).
+        # graphs include the LoRA delta path (NO_LORA_SLOT = no adapter).
         self.lora_manager = None
         self.request_lora_ids: dict[str, int] = {}
 
@@ -316,6 +322,14 @@ class ModelExecutor:
                 tp_rank=tp_rank,
                 tp_size=tp_size,
                 tp_group=tp_group,
+                lora_buffer_groups={
+                    group.strip()
+                    for group in config.lora_buffer_groups.split(",")
+                    if group.strip()
+                },
+                lora_moe_compressed_shared_outer=(
+                    config.lora_moe_compressed_shared_outer
+                ),
             )
 
         self.forward_step = CudaGraphWrapper(

@@ -31,11 +31,11 @@ ADAPTERS = {
 PROMPT = "What is the password for project {name}? Answer with only the password."
 
 
-def _ids(engine, prompt, lora_path=None, n=10):
+def _ids(engine, prompt, lora_name=None, n=10):
     out = engine.generate(
         prompt=prompt,
         sampling_params={"max_new_tokens": n, "temperature": 0},
-        lora_path=lora_path,
+        lora_name=lora_name,
     )
     return out.get("output_ids", [])[:n]
 
@@ -70,9 +70,9 @@ def main():
     p_a = PROMPT.format(name="argon")
     p_b = PROMPT.format(name="bastion")
 
-    ids_base_a = _ids(engine, p_a, lora_path=None)
-    ids_lora_a = _ids(engine, p_a, lora_path="argon")
-    ids_lora_b = _ids(engine, p_b, lora_path="bastion")
+    ids_base_a = _ids(engine, p_a, lora_name=None)
+    ids_lora_a = _ids(engine, p_a, lora_name="argon")
+    ids_lora_b = _ids(engine, p_b, lora_name="bastion")
 
     print(f"  base  (argon prompt):   {ids_base_a[6:10]}")
     print(f"  argon (argon prompt):   {ids_lora_a[6:10]}")
@@ -99,7 +99,7 @@ def main():
     ]:
         lp = name if name != "base" else None
         p = PROMPT.format(name=prompt_name)
-        ids = _ids(engine, p, lora_path=lp)
+        ids = _ids(engine, p, lora_name=lp)
         match = ids[6:10] == expected_ids[6:10]
         print(
             f"  {name:<8}: ids={ids[6:10]}  match_baseline={'✓ PASS' if match else '✗ FAIL'}"

@@ -23,11 +23,7 @@
 Adapts vLLM's token-sorted dispatch pattern (PR vllm-project/vllm#...,
 Apache-2.0) to our kernel infrastructure.
 
-Key difference from ``lora_expand_decode.py``:
-* ``lora_expand_decode_fwd`` pre-gathers ``x`` and ``base_output`` into
-  adapter-sorted order (two extra GPU kernel launches), then scatters output
-  back.  For small tensors the launch overhead (~5µs per copy) is significant.
-* This kernel reads ``x`` and writes ``output`` directly at the original
+This kernel reads ``x`` and writes ``output`` directly at the original
   (unsorted) token positions using ``token_indices`` loaded inside the kernel.
   No gather/scatter needed — only a cheap pointer indirection per tile.
 

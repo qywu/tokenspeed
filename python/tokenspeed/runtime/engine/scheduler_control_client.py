@@ -99,7 +99,7 @@ class _Communicator(Generic[T]):
             assert self._result_values is None
 
         if obj:
-            self._sender.send_pyobj(obj)
+            await self._sender.send_pyobj(obj)
 
         self._result_event = asyncio.Event()
         self._result_values = []
@@ -119,7 +119,7 @@ class _Communicator(Generic[T]):
             self._result_event = asyncio.Event()
 
             if obj:
-                self._sender.send_pyobj(obj)
+                await self._sender.send_pyobj(obj)
 
         await self._result_event.wait()
         result_values = copy.deepcopy(self._result_values)
@@ -256,21 +256,20 @@ class SchedulerControlClient:
     async def load_lora_adapter(
         self: "AsyncLLM",
         lora_name: str,
-        lora_path: str,
-        pinned: bool = False,
+        adapter_path: str,
     ) -> tuple[bool, int, str]:
         """Send a LoadLoraReqInput to the scheduler subprocess."""
+        self.auto_create_handle_loop()
         result = (
             await self.load_lora_communicator(
-                LoadLoraReqInput(
-                    lora_name=lora_name, lora_path=lora_path, pinned=pinned
-                )
+                LoadLoraReqInput(lora_name=lora_name, adapter_path=adapter_path)
             )
         )[0]
         return result.success, result.lora_id, result.message
 
     async def unload_lora_adapter(self: "AsyncLLM", lora_name: str) -> tuple[bool, str]:
         """Send an UnloadLoraReqInput to the scheduler subprocess."""
+        self.auto_create_handle_loop()
         result = (
             await self.unload_lora_communicator(UnloadLoraReqInput(lora_name=lora_name))
         )[0]

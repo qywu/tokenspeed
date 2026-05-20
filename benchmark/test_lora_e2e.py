@@ -12,6 +12,7 @@ Usage:
 import os
 import subprocess
 import sys
+import threading
 import time
 
 ADAPTER_SNAPSHOT = (
@@ -97,9 +98,6 @@ server = subprocess.Popen(
     stderr=subprocess.STDOUT,
 )
 
-# Wait for server ready
-import threading
-
 log_lines = []
 
 
@@ -115,7 +113,7 @@ t = threading.Thread(target=_read_log, daemon=True)
 t.start()
 t.join(timeout=180)
 
-if not any("ready" in l or "Uvicorn" in l for l in log_lines):
+if not any("ready" in line or "Uvicorn" in line for line in log_lines):
     print("    ERROR: server did not start in 180s")
     server.terminate()
     sys.exit(1)
@@ -152,9 +150,9 @@ try:
     )
 
     print()
-    print("    NOTE: lora_path in HTTP requests is not yet routed to the model.")
+    print("    NOTE: lora_name in HTTP requests is not yet routed to the model.")
     print("    The LoraManager, scheduler routing, and ForwardContext injection")
-    print("    are implemented; the remaining step is to resolve lora_path in")
+    print("    are implemented; the remaining step is to resolve lora_name in")
     print("    HTTP completions/chat requests and call prepare_loras() for each batch.")
     print("    This is tracked in PR #2.")
 

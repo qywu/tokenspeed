@@ -407,7 +407,7 @@ class EventLoop:
 
         # ── LoRA ─────────────────────────────────────────────────────────────
         self._lora_manager = None  # LoraManager (lazy init)
-        self._lora_path_to_id: dict[str, int] = {}  # name → integer lora_id
+        self._lora_name_to_id: dict[str, int] = {}  # name → integer lora_id
         self._request_lora_ids: dict[str, int] = {}  # rid → lora_id
 
         if server_args.enable_lora:
@@ -430,12 +430,10 @@ class EventLoop:
         self.model_executor.request_lora_ids = self._request_lora_ids
         logger.info("LoraManager bound (max_loras=%d)", self.server_args.max_loras)
 
-    def load_lora_adapter(
-        self, lora_name: str, lora_path: str, pinned: bool = False
-    ) -> int:
+    def load_lora_adapter(self, lora_name: str, adapter_path: str) -> int:
         """Load a PEFT LoRA adapter and make it available for serving.
 
-        Returns the integer lora_id to use in GenerateReqInput.lora_path.
+        Returns the integer lora_id assigned to this adapter.
         """
         if not self.server_args.enable_lora:
             raise ValueError(
@@ -444,8 +442,8 @@ class EventLoop:
             )
         if self._lora_manager is None:
             self._init_lora_manager()
-        lora_id = self._lora_manager.load_adapter(lora_name, lora_path, pinned)
-        self._lora_path_to_id[lora_name] = lora_id
+        lora_id = self._lora_manager.load_adapter(lora_name, adapter_path)
+        self._lora_name_to_id[lora_name] = lora_id
         logger.info("Loaded LoRA adapter '%s' → lora_id=%d", lora_name, lora_id)
         return lora_id
 
@@ -453,9 +451,9 @@ class EventLoop:
         """Unload a LoRA adapter and free its GPU slot."""
         if self._lora_manager is None:
             raise KeyError(f"No LoRA adapters loaded; '{lora_name}' not found.")
-        lora_id = self._lora_path_to_id.get(lora_name)
+        lora_id = self._lora_name_to_id.get(lora_name)
         self._lora_manager.unload_adapter(lora_name)
-        self._lora_path_to_id.pop(lora_name, None)
+        self._lora_name_to_id.pop(lora_name, None)
         # Proactively evict the KV cache namespace for this adapter so pages
         # are freed immediately rather than waiting for LRU eviction pressure.
         if lora_id is not None:

@@ -88,6 +88,8 @@ def _lora_shrink_prefill_kernel(
 
     batch_id = tl.program_id(axis=1)
     w_index = tl.load(weight_indices + batch_id)
+    if w_index < 0:
+        return
     rank = tl.load(lora_ranks + w_index)
     if rank == 0:
         return

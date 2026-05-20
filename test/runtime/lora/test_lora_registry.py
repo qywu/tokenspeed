@@ -28,8 +28,8 @@ from tokenspeed.runtime.lora.lora_config import LoraConfig
 from tokenspeed.runtime.lora.lora_registry import NO_LORA_ID, LoraRegistry
 
 
-def _config(name: str, pinned: bool = False, r: int = 16) -> LoraConfig:
-    return LoraConfig(name=name, path=f"/fake/{name}", r=r, pinned=pinned)
+def _config(name: str, r: int = 16) -> LoraConfig:
+    return LoraConfig(name=name, path=f"/fake/{name}", r=r)
 
 
 class TestLoraRegistry:
@@ -61,21 +61,12 @@ class TestLoraRegistry:
         with pytest.raises(ValueError, match="already registered"):
             reg.register(_config("a"))
 
-    def test_capacity_enforced_for_non_pinned(self):
+    def test_capacity_enforced(self):
         reg = LoraRegistry(max_loras=2)
         reg.register(_config("a"))
         reg.register(_config("b"))
         with pytest.raises(ValueError, match="full"):
             reg.register(_config("c"))
-
-    def test_pinned_does_not_count_toward_capacity(self):
-        reg = LoraRegistry(max_loras=1)
-        reg.register(_config("pinned", pinned=True))
-        # max_loras=1 for non-pinned; this should succeed
-        reg.register(_config("evictable"))
-        # Second non-pinned should fail
-        with pytest.raises(ValueError, match="full"):
-            reg.register(_config("evictable2"))
 
     def test_unregister_frees_slot(self):
         reg = LoraRegistry(max_loras=1)

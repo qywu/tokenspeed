@@ -89,9 +89,11 @@ def _lora_expand_kernel(
 ):
     batch_id = tl.program_id(axis=1)
     w_index = tl.load(weight_indices + batch_id)
+    if w_index < 0:
+        return
     rank = tl.load(lora_ranks + w_index)
 
-    # rank == 0 ⇒ slot 0 (no-adapter): leave the base output unchanged.
+    # rank == 0 is defensive: leave the base output unchanged.
     if rank == 0:
         return
 

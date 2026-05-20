@@ -60,7 +60,7 @@ def _measure(engine, prompt, lora):
     engine.generate(
         prompt=prompt,
         sampling_params={"max_new_tokens": 1, "temperature": 0},
-        lora_path=lora,
+        lora_name=lora,
     )
     return time.perf_counter() - t0
 

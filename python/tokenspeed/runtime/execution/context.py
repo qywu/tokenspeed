@@ -87,5 +87,5 @@ class ForwardContext:
     # ``lora_manager.apply_qkv_lora`` / ``apply_o_lora`` which read from
     # the manager's persistent batch_info.  Set at capture time when
     # ``--enable-lora`` is on so the LoRA path is recorded into the graph
-    # (slot 0 = no-adapter zero-delta), otherwise None.
+    # (NO_LORA_SLOT = no adapter), otherwise None.
     lora_manager: Optional["LoraManager"] = None

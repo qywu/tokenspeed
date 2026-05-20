@@ -22,9 +22,9 @@
 
 For each segment ``b`` in the batch the kernel computes
 ``output[seg_b] = x[seg_b] @ A[wi_b].T`` where ``A[wi_b]`` has shape
-``(stack_num * r, in_dim)``.  Adapter ``slot 0`` is reserved for "no
-adapter" (rank == 0); the kernel returns immediately for that slot, leaving
-the output rows untouched.  Higher slots may have varying real ranks up to
+``(stack_num * r, in_dim)``.  No-adapter segments use a negative slot
+sentinel; the kernel returns immediately for that slot, leaving the output
+rows untouched.  Real slots may have varying real ranks up to
 ``max_rank``; ``output[..., :rank * stack_num]`` stores the real product
 and ``output[..., rank * stack_num:]`` is irrelevant — the consumer
 (``lora_expand`` / ``lora_qkv_expand``) reads only the first ``rank * stack_num``
@@ -91,9 +91,11 @@ def _lora_shrink_kernel(
 ):
     batch_id = tl.program_id(axis=1)
     w_index = tl.load(weight_indices + batch_id)
+    if w_index < 0:
+        return
     rank = tl.load(lora_ranks + w_index)
 
-    # rank == 0 ⇒ no-adapter slot.  Skip — the output is left untouched
+    # rank == 0 is defensive: skip and leave the output untouched
     # (downstream lora_expand / lora_qkv_expand is also a no-op for rank == 0
     # so the leftover values never feed into the base-output add).
     if rank == 0:

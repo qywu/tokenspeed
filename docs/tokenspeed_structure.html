@@ -284,7 +284,7 @@ details .inner{padding:8px 0 4px 14px;}
   <tr><td><code>event_loop.py</code></td><td>Subprocess event loop; owns C++ scheduler + model executor; drives the scheduling cycle</td></tr>
   <tr><td><code>llm.py</code></td><td>Sync wrapper around <code>AsyncLLM</code> for blocking callers</td></tr>
   <tr><td><code>request_handler.py</code></td><td>Dispatches incoming ZMQ messages (generate, abort, flush, LoRA load/unload…)</td></tr>
-  <tr><td><code>input_processor.py</code></td><td>Tokenises prompts; resolves <code>lora_path</code> → <code>lora_id</code></td></tr>
+  <tr><td><code>input_processor.py</code></td><td>Tokenises prompts; resolves request <code>lora_name</code> → <code>lora_id</code></td></tr>
   <tr><td><code>output_processor.py</code></td><td>Detokenises generated tokens and streams to client</td></tr>
   <tr><td><code>io_struct.py</code></td><td>All request/response dataclasses (<code>GenerateReqInput</code>, <code>LoadLoraReqInput</code>, …)</td></tr>
   <tr><td><code>schedule_batch.py</code></td><td>Assembles per-forward-op batch metadata from the C++ scheduler plan</td></tr>
@@ -365,7 +365,7 @@ details .inner{padding:8px 0 4px 14px;}
   <tr><td><code>engine.py</code></td><td><code>Engine</code> class: in-process facade; <code>generate()</code>, <code>load_lora_adapter()</code>, weight updates</td></tr>
   <tr><td><code>engine_base.py</code></td><td>Abstract base: <code>generate()</code>, <code>flush_cache()</code>, <code>load_lora_adapter()</code>…</td></tr>
   <tr><td><code>http_server.py</code></td><td>FastAPI app; mounts OpenAI routes; middleware (auth, metrics)</td></tr>
-  <tr><td><code>openai/protocol.py</code></td><td>Pydantic models for <code>CompletionRequest</code>, <code>ChatCompletionRequest</code> (+ <code>lora_path</code>)</td></tr>
+  <tr><td><code>openai/protocol.py</code></td><td>Pydantic models for <code>CompletionRequest</code> and <code>ChatCompletionRequest</code></td></tr>
   <tr><td><code>openai/serving_chat.py</code></td><td>Chat completion handler: applies chat template, calls <code>GenerateReqInput</code></td></tr>
   <tr><td><code>openai/serving_completions.py</code></td><td>Completion handler: prompt encoding, logprob extraction</td></tr>
   <tr><td><code>engine/run_event_loop.py</code></td><td>Subprocess entry point for the scheduler worker process</td></tr>
@@ -480,7 +480,7 @@ details .inner{padding:8px 0 4px 14px;}
   <tr><td>python/models/qwen3.py</td><td><code>apply_qkv_lora()</code> after qkv_proj; <code>apply_o_lora()</code> after o_proj; pure-PyTorch <code>_rms_norm</code> for eager mode</td></tr>
   <tr><td>python/execution/context.py</td><td><code>lora_weight_indices</code>, <code>lora_scalings</code>, <code>lora_manager</code> fields on <code>ForwardContext</code></td></tr>
   <tr><td>python/execution/model_executor.py</td><td>Per-token weight_indices expansion via <code>repeat_interleave(w_idx, input_lengths)</code></td></tr>
-  <tr><td>python/entrypoints/openai/protocol.py</td><td><code>lora_path: str | None</code> on both <code>CompletionRequest</code> and <code>ChatCompletionRequest</code></td></tr>
+  <tr><td>python/entrypoints/openai/protocol.py</td><td>Request schemas; LoRA selection uses loaded adapter names where exposed.</td></tr>
   <tr><td>tokenspeed-scheduler/csrc/</td><td><code>RequestSpec.lora_id</code>; <code>KVPrefixCache::Match(tokens, lora_id)</code>; virtual root per adapter; <code>namespace_depth_offset</code></td></tr>
 </table>
 
