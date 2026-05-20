@@ -1,0 +1,925 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TokenSpeed LoRA Design - Current Implementation</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6f8fb;
+      --panel: #ffffff;
+      --panel-2: #f0f4f8;
+      --ink: #17202a;
+      --muted: #5b6776;
+      --line: #d8e0ea;
+      --blue: #2563eb;
+      --green: #15803d;
+      --amber: #b45309;
+      --red: #b91c1c;
+      --purple: #7c3aed;
+      --code: #0f172a;
+      --code-bg: #eef2f7;
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: var(--ink);
+      background: var(--bg);
+      line-height: 1.55;
+    }
+
+    .shell {
+      display: grid;
+      grid-template-columns: 280px minmax(0, 1fr);
+      min-height: 100vh;
+    }
+
+    nav {
+      position: sticky;
+      top: 0;
+      height: 100vh;
+      padding: 28px 22px;
+      border-right: 1px solid var(--line);
+      background: #ffffff;
+      overflow: auto;
+    }
+
+    nav h2 {
+      margin: 0 0 6px;
+      font-size: 18px;
+      letter-spacing: 0;
+    }
+
+    nav p {
+      margin: 0 0 20px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    nav a {
+      display: block;
+      padding: 7px 0;
+      color: #314158;
+      text-decoration: none;
+      font-size: 14px;
+    }
+
+    nav a:hover { color: var(--blue); }
+
+    main {
+      max-width: 1180px;
+      width: 100%;
+      padding: 44px 46px 72px;
+    }
+
+    header {
+      border-bottom: 1px solid var(--line);
+      padding-bottom: 28px;
+      margin-bottom: 28px;
+    }
+
+    .eyebrow {
+      margin: 0 0 8px;
+      color: var(--blue);
+      font-size: 13px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: .04em;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: clamp(34px, 5vw, 56px);
+      line-height: 1.05;
+      letter-spacing: 0;
+    }
+
+    .subtitle {
+      max-width: 820px;
+      color: var(--muted);
+      font-size: 18px;
+      margin: 18px 0 0;
+    }
+
+    section {
+      margin: 34px 0;
+      padding: 28px;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+    }
+
+    h2 {
+      margin: 0 0 14px;
+      font-size: 28px;
+      line-height: 1.2;
+      letter-spacing: 0;
+    }
+
+    h3 {
+      margin: 24px 0 10px;
+      font-size: 19px;
+      letter-spacing: 0;
+    }
+
+    p { margin: 10px 0; }
+    ul, ol { padding-left: 22px; }
+    li { margin: 7px 0; }
+
+    code {
+      color: var(--code);
+      background: var(--code-bg);
+      padding: 2px 5px;
+      border-radius: 5px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+      font-size: .92em;
+    }
+
+    pre {
+      overflow: auto;
+      padding: 16px;
+      border-radius: 8px;
+      background: #101826;
+      color: #e5eefb;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+      font-size: 13px;
+      line-height: 1.45;
+    }
+
+    pre code {
+      color: inherit;
+      background: transparent;
+      padding: 0;
+      border-radius: 0;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 16px 0;
+      font-size: 14px;
+    }
+
+    th, td {
+      border: 1px solid var(--line);
+      padding: 10px 12px;
+      vertical-align: top;
+      text-align: left;
+    }
+
+    th { background: var(--panel-2); }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 14px;
+      margin: 18px 0;
+    }
+
+    .card {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 16px;
+      background: #fbfdff;
+    }
+
+    .card h3 {
+      margin-top: 0;
+      font-size: 17px;
+    }
+
+    .tag {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      background: #fff;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .good { color: var(--green); }
+    .warn { color: var(--amber); }
+    .bad { color: var(--red); }
+    .purple { color: var(--purple); }
+
+    .flow {
+      display: grid;
+      gap: 10px;
+      margin: 18px 0;
+    }
+
+    .flow-row {
+      display: grid;
+      grid-template-columns: 220px minmax(0, 1fr);
+      gap: 12px;
+      align-items: stretch;
+    }
+
+    .node {
+      border: 1px solid var(--line);
+      border-left: 5px solid var(--blue);
+      border-radius: 8px;
+      background: #fbfdff;
+      padding: 12px 14px;
+    }
+
+    .node strong { display: block; }
+    .node small { color: var(--muted); }
+    .node.green { border-left-color: var(--green); }
+    .node.amber { border-left-color: var(--amber); }
+    .node.purple { border-left-color: var(--purple); }
+
+    .callout {
+      border-left: 5px solid var(--amber);
+      background: #fff8ed;
+      padding: 14px 16px;
+      border-radius: 8px;
+      margin: 16px 0;
+    }
+
+    .file-list td:first-child {
+      white-space: nowrap;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+      font-size: 13px;
+    }
+
+    @media (max-width: 900px) {
+      .shell { grid-template-columns: 1fr; }
+      nav { position: relative; height: auto; }
+      main { padding: 28px 18px 52px; }
+      section { padding: 20px; }
+      .grid { grid-template-columns: 1fr; }
+      .flow-row { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <nav>
+      <h2>LoRA Design</h2>
+      <p>Current TokenSpeed implementation, including dense LoRA, MoE LoRA, eviction, and CUDA graph replay.</p>
+      <a href="#overview">Overview</a>
+      <a href="#naming">Naming</a>
+      <a href="#files">Files</a>
+      <a href="#data-model">Data Model</a>
+      <a href="#lifecycle">Adapter Lifecycle</a>
+      <a href="#eviction">Eviction</a>
+      <a href="#buffers">GPU Buffers</a>
+      <a href="#batch-info">Batch Metadata</a>
+      <a href="#kernels">Kernel Routing</a>
+      <a href="#moe">MoE LoRA</a>
+      <a href="#cuda-graph">CUDA Graph</a>
+      <a href="#limitations">Limitations</a>
+    </nav>
+
+    <main>
+      <header>
+        <p class="eyebrow">TokenSpeed Runtime Design</p>
+        <h1>LoRA Serving Implementation</h1>
+        <p class="subtitle">
+          This document describes the current LoRA implementation in the working
+          branch: how adapter names and ids map to GPU slots, how CPU and GPU
+          eviction work, how dense and MoE LoRA weights are packed, and why the
+          CUDA graph path remains stable across dynamic adapters.
+        </p>
+      </header>
+
+      <section id="overview">
+        <h2>Overview</h2>
+        <p>
+          TokenSpeed treats LoRA as a runtime-owned side path. Base model layers
+          keep their normal linear and MoE kernels. When a request uses an adapter,
+          the runtime resolves that request's <code>lora_id</code> to a GPU
+          <code>slot</code>, writes per-step metadata into persistent tensors, and
+          the model layers add LoRA deltas in place.
+        </p>
+
+        <div class="grid">
+          <div class="card">
+            <h3>Identity Layer</h3>
+            <p><code>name</code> and <code>lora_id</code> are user/runtime identities. They do not imply GPU residency.</p>
+          </div>
+          <div class="card">
+            <h3>Residency Layer</h3>
+            <p><code>slot</code> is the current GPU pool index for a real adapter. Base-model requests use <code>NO_LORA_SLOT = -1</code>.</p>
+          </div>
+          <div class="card">
+            <h3>Forward Layer</h3>
+            <p><code>LoraBatchInfo</code> maps each request segment to a slot and is read directly by LoRA kernels.</p>
+          </div>
+        </div>
+
+        <div class="flow">
+          <div class="flow-row">
+            <div class="node"><strong>Load</strong><small>adapter path -> CPU cache</small></div>
+            <div class="node green"><strong><code>LoraManager.load_adapter()</code></strong><small>Registers name/id, stores durable disk path, warms CPU cache.</small></div>
+          </div>
+          <div class="flow-row">
+            <div class="node"><strong>Schedule</strong><small>request ids -> adapter ids</small></div>
+            <div class="node green"><strong><code>prepare_loras()</code></strong><small>Promotes missing adapters to GPU slots, writes segment lengths, slot ids, and fast-path metadata.</small></div>
+          </div>
+          <div class="flow-row">
+            <div class="node"><strong>Forward</strong><small>layer output += LoRA delta</small></div>
+            <div class="node green"><strong><code>apply_*_lora()</code></strong><small>Dense layers call shrink/expand kernels; MoE backends consume a narrow <code>MoeLoraContext</code>.</small></div>
+          </div>
+        </div>
+      </section>
+
+      <section id="naming">
+        <h2>Naming</h2>
+        <table>
+          <thead>
+            <tr><th>Name</th><th>Meaning</th><th>Where it lives</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>name</code></td>
+              <td>Stable user-facing adapter name or alias, such as <code>"password_adapter"</code>. This is the value requests should select after registration.</td>
+              <td><code>LoraManager._name_to_id</code>, <code>_adapter_paths</code>, CPU/GPU LRU maps.</td>
+            </tr>
+            <tr>
+              <td><code>lora_name</code></td>
+              <td>Canonical request/API selector. It must be the name of an adapter that was already loaded via <code>load_lora_adapter()</code>.</td>
+              <td>Request schema and input processing before lookup in <code>LoraManager</code>.</td>
+            </tr>
+            <tr>
+              <td><code>adapter_path</code> / load-time <code>path</code></td>
+              <td>Durable filesystem path to the adapter directory or safetensors file. Every registered adapter needs one so CPU eviction can reload weights from disk.</td>
+              <td><code>LoraManager._adapter_paths</code>, <code>LoraCpuCache.adapter_paths</code>.</td>
+            </tr>
+            <tr>
+              <td><code>lora_id</code></td>
+              <td>Runtime integer id assigned at registration time. Request scheduling carries this id.</td>
+              <td><code>_name_to_id</code>, <code>_id_to_name</code>, request metadata.</td>
+            </tr>
+            <tr>
+              <td><code>slot</code></td>
+              <td>GPU-resident real adapter slot. Valid slots are <code>0..max_loras-1</code>; base/no-LoRA is <code>NO_LORA_SLOT = -1</code> in batch metadata.</td>
+              <td><code>_slot_to_name</code>, <code>_name_to_slot</code>, <code>LoraBatchInfo.weight_indices</code>.</td>
+            </tr>
+            <tr>
+              <td><code>rank</code></td>
+              <td>LoRA rank used by the adapter. For 3D MoE tensors, rank is dimension 1 of <code>lora_A</code>.</td>
+              <td><code>_lora_ranks</code>, <code>_slot_ranks</code>, per-slot buffer slices.</td>
+            </tr>
+            <tr>
+              <td><code>scaling</code></td>
+              <td><code>lora_alpha / r</code> from <code>adapter_config.json</code>, or 1.0 fallback.</td>
+              <td><code>_scalings</code>, <code>_slot_scalings</code>, kernel multiply.</td>
+            </tr>
+            <tr>
+              <td><code>segment</code></td>
+              <td>One contiguous run of tokens using one adapter slot. Current path uses one segment per request.</td>
+              <td><code>seg_lens</code>, <code>seg_indptr</code>, <code>weight_indices</code>.</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div class="callout">
+          <strong>Important distinction:</strong> <code>adapter_path</code> is
+          the disk source of truth used when the adapter is loaded or reloaded.
+          Request-time <code>lora_name</code> selects an already loaded adapter.
+          <code>lora_id</code> is stable while the adapter remains registered.
+          <code>slot</code> is temporary and may change after GPU eviction and
+          reload.
+        </div>
+      </section>
+
+      <section id="files">
+        <h2>Files</h2>
+        <p>
+          The implementation is split so request/API naming, adapter lifecycle,
+          scheduler isolation, and kernel execution each have a narrow owner.
+          The tables below show the important added and modified files.
+        </p>
+
+        <h3>Runtime LoRA Modules - Added</h3>
+        <table class="file-list">
+          <thead>
+            <tr><th>File</th><th>Role</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>python/tokenspeed/runtime/lora/adapter_io.py</code></td><td>Loads adapter weights and normalizes supported formats: dense PEFT keys, 2D per-expert MoE keys, and 3D <code>experts.w1/w2/w3</code> MoE keys.</td></tr>
+            <tr><td><code>python/tokenspeed/runtime/lora/lora_cache.py</code></td><td>Pinned CPU adapter cache with durable <code>adapter_path</code> tracking, async prefetch, LRU eviction, and disk fallback.</td></tr>
+            <tr><td><code>python/tokenspeed/runtime/lora/lora_buffers.py</code></td><td>GPU buffer allocation and dense weight packing. Owns TP-aware CPU-side sharding and slot zeroing for dense LoRA tensors.</td></tr>
+            <tr><td><code>python/tokenspeed/runtime/lora/lora_batch.py</code></td><td><code>LoraBatchInfo</code>, segment metadata, decode grouping, and CUDA-graph-stable tensors read by dense LoRA kernels.</td></tr>
+            <tr><td><code>python/tokenspeed/runtime/lora/moe_lora.py</code></td><td><code>MoeLoraBuffers</code> and <code>MoeLoraContext</code>. Preallocates fixed expert-scoped LoRA pools and exposes the narrow context used by MoE backends.</td></tr>
+          </tbody>
+        </table>
+
+        <h3>Runtime Integration - Modified</h3>
+        <table class="file-list">
+          <thead>
+            <tr><th>File</th><th>Role</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>python/tokenspeed/runtime/lora/lora_manager.py</code></td><td>Top-level adapter lifecycle manager: <code>lora_name</code> to <code>lora_id</code>, CPU/GPU residency, eviction, dense apply calls, and MoE context creation.</td></tr>
+            <tr><td><code>python/tokenspeed/runtime/lora/__init__.py</code></td><td>Exports the public LoRA runtime types used by execution and model layers.</td></tr>
+            <tr><td><code>python/tokenspeed/runtime/engine/io_struct.py</code></td><td>Adds request/control dataclasses: request-time <code>lora_name</code>, load-time <code>adapter_path</code>, and tokenized <code>lora_id</code>.</td></tr>
+            <tr><td><code>python/tokenspeed/runtime/engine/input_processor.py</code></td><td>Resolves request <code>lora_name</code> to internal <code>lora_id</code>; unknown names fail fast instead of falling back to base model.</td></tr>
+            <tr><td><code>python/tokenspeed/runtime/engine/async_llm.py</code></td><td>Holds the name-to-id registry used by request processing and scheduler control paths.</td></tr>
+            <tr><td><code>python/tokenspeed/runtime/engine/event_loop.py</code></td><td>Owns scheduler-side adapter load/unload, initializes <code>LoraManager</code>, and evicts KV namespaces on unload.</td></tr>
+            <tr><td><code>python/tokenspeed/runtime/engine/request_handler.py</code></td><td>Dispatches load/unload ZMQ control messages to the scheduler process.</td></tr>
+            <tr><td><code>python/tokenspeed/runtime/engine/scheduler_control_client.py</code></td><td>Sends <code>LoadLoraReqInput(lora_name, adapter_path)</code> and unload requests to scheduler workers.</td></tr>
+            <tr><td><code>python/tokenspeed/runtime/entrypoints/engine.py</code></td><td>Exposes the Python API: <code>generate(..., lora_name=...)</code> and <code>load_lora_adapter(lora_name, adapter_path)</code>.</td></tr>
+            <tr><td><code>python/tokenspeed/runtime/entrypoints/engine_base.py</code></td><td>Documents the abstract engine API and keeps request names separate from load-time disk paths.</td></tr>
+            <tr><td><code>python/tokenspeed/runtime/execution/context.py</code></td><td>Places <code>LoraManager</code>, <code>LoraBatchInfo</code>, and <code>MoeLoraContext</code> on <code>ForwardContext</code>.</td></tr>
+            <tr><td><code>python/tokenspeed/runtime/execution/model_runner.py</code></td><td>Calls <code>prepare_loras()</code> from scheduled request <code>lora_id</code> values before model forward.</td></tr>
+            <tr><td><code>python/tokenspeed/runtime/execution/cuda_graph_wrapper.py</code></td><td>Captures and replays separate graph variants for no-LoRA and with-LoRA decode batches.</td></tr>
+            <tr><td><code>python/tokenspeed/runtime/layers/moe/layer.py</code></td><td>Threads <code>MoeLoraContext</code> from runtime context into MoE backend calls.</td></tr>
+            <tr><td><code>python/tokenspeed/runtime/layers/moe/backends/base.py</code></td><td>Extends the backend interface with an optional MoE LoRA context.</td></tr>
+            <tr><td><code>python/tokenspeed/runtime/layers/moe/backends/*/triton.py</code></td><td>Supported Triton MoE backends consume the narrow context and apply expert LoRA deltas around fused MoE compute.</td></tr>
+          </tbody>
+        </table>
+
+        <h3>Scheduler - Modified</h3>
+        <table class="file-list">
+          <thead>
+            <tr><th>File</th><th>Role</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>tokenspeed-scheduler/csrc/scheduler/request_spec.h</code></td><td>Adds <code>RequestSpec.lora_id</code>. <code>0</code> is base model; positive ids identify registered adapters.</td></tr>
+            <tr><td><code>tokenspeed-scheduler/csrc/scheduler/request.h</code> / <code>request.cpp</code></td><td>Stores the request's <code>lora_id</code> and exposes it to scheduling and forward events.</td></tr>
+            <tr><td><code>tokenspeed-scheduler/csrc/fsm/forward_events.h</code> / <code>forward_events.cpp</code></td><td>Carries <code>lora_id</code> through prefill/decode FSM events so prefix-cache match/insert uses the right adapter namespace.</td></tr>
+            <tr><td><code>tokenspeed-scheduler/csrc/resource/kv_prefix_cache/kv_prefix_cache.h</code> / <code>.cpp</code></td><td>Creates per-adapter virtual roots keyed by <code>lora_id</code>, isolates KV reuse across adapters, and supports namespace eviction.</td></tr>
+            <tr><td><code>tokenspeed-scheduler/csrc/resource/hybrid_prefix_cache/hybrid_prefix_cache.h</code> / <code>.cpp</code></td><td>Forwards <code>lora_id</code> into the KV prefix cache for hybrid cache users.</td></tr>
+            <tr><td><code>tokenspeed-scheduler/csrc/scheduler/scheduler.h</code> / <code>.cpp</code></td><td>Adds <code>EvictLoraNamespace(lora_id)</code>, used when an adapter is unloaded.</td></tr>
+            <tr><td><code>tokenspeed-scheduler/bindings/python_module.cpp</code></td><td>Exposes <code>RequestSpec.lora_id</code> and scheduler namespace eviction to Python.</td></tr>
+            <tr><td><code>tokenspeed-scheduler/tests/cpp/test_lora_prefix_cache.cpp</code></td><td>Covers adapter-specific prefix-cache isolation, base-model isolation, and explicit namespace eviction.</td></tr>
+          </tbody>
+        </table>
+
+        <h3>Kernel Package - Added Or Modified</h3>
+        <table class="file-list">
+          <thead>
+            <tr><th>File</th><th>Role</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>tokenspeed-kernel/python/tokenspeed_kernel/ops/lora/triton/</code></td><td>Triton LoRA operator family: shrink, expand, prefill variants, decode grouping, QKV expand, gate/up expand, tuning helpers, and H100 tuned configs.</td></tr>
+            <tr><td><code>tokenspeed-kernel/python/tokenspeed_kernel/ops/lora/cutedsl.py</code></td><td>Public wrappers for CuTeDSL fast paths used by selected single-slot and batched-slot dense LoRA shapes.</td></tr>
+            <tr><td><code>tokenspeed-kernel/python/tokenspeed_kernel/thirdparty/cute_dsl/_provider.py</code></td><td>Provider boundary for optional CuTeDSL availability and import isolation.</td></tr>
+            <tr><td><code>tokenspeed-kernel/python/tokenspeed_kernel/thirdparty/cute_dsl/gemm_add.py</code></td><td>CuTeDSL GEMM-add helper used by dense LoRA expand paths.</td></tr>
+            <tr><td><code>tokenspeed-kernel/python/tokenspeed_kernel/thirdparty/cute_dsl/lora_gemm.py</code></td><td>CuTeDSL LoRA GEMM kernels for shrink/expand-style dense paths.</td></tr>
+            <tr><td><code>tokenspeed-kernel/python/tokenspeed_kernel/thirdparty/cute_dsl/lora_expand_direct.py</code></td><td>Direct expand helper for selected LoRA-B add paths.</td></tr>
+            <tr><td><code>tokenspeed-kernel/python/tokenspeed_kernel/thirdparty/cute_dsl/_vendor/</code></td><td>Vendored CuTeDSL support code kept inside <code>tokenspeed-kernel</code>, not imported directly by runtime code.</td></tr>
+            <tr><td><code>tokenspeed-kernel/python/tokenspeed_kernel/__init__.py</code></td><td>Exports the kernel package LoRA ops through the existing kernel boundary.</td></tr>
+            <tr><td><code>tokenspeed-kernel/python/tokenspeed_kernel/_triton.py</code></td><td>Centralizes direct Triton imports so LoRA ops follow the repository kernel dependency rule.</td></tr>
+          </tbody>
+        </table>
+
+        <h3>Tests, Benchmarks, And Docs</h3>
+        <table class="file-list">
+          <thead>
+            <tr><th>File</th><th>Role</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>test/runtime/lora/test_adapter_io.py</code></td><td>Parser tests for dense, MoE per-expert, and 3D MoE adapter formats.</td></tr>
+            <tr><td><code>test/runtime/lora/test_lora_manager.py</code></td><td>Lifecycle, packing, eviction, CPU cache, GPU slot, and metadata behavior.</td></tr>
+            <tr><td><code>test/runtime/lora/test_lora_request_naming.py</code></td><td>Request naming contract: <code>lora_name</code> only, unknown names fail, scalar names propagate across batches.</td></tr>
+            <tr><td><code>test/runtime/lora/test_moe_lora.py</code></td><td>MoE LoRA buffer/context behavior and routed expert-delta application.</td></tr>
+            <tr><td><code>tokenspeed-kernel/test/ops/test_lora_triton.py</code></td><td>Numerical coverage for Triton LoRA kernels.</td></tr>
+            <tr><td><code>tokenspeed-kernel/test/ops/test_lora_cutedsl.py</code></td><td>Numerical coverage for CuTeDSL LoRA fast paths.</td></tr>
+            <tr><td><code>benchmark/test_lora_*.py</code></td><td>Dynamic load/unload, mixed adapter batches, eviction latency, and E2E password-adapter checks.</td></tr>
+            <tr><td><code>docs/serving/lora.md</code></td><td>User-facing serving guide for adapter loading, request selection, and supported MoE adapter formats.</td></tr>
+            <tr><td><code>docs/lora_current_design.html</code></td><td>This current implementation design document.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="data-model">
+        <h2>Data Model</h2>
+        <h3>AdapterWeights</h3>
+        <p>
+          Parsed adapter weights use this logical shape:
+        </p>
+        <pre><code>AdapterWeights = {
+  layer_id: {
+    module_name: (lora_A, lora_B),
+  }
+}</code></pre>
+
+        <p>Dense modules use names like <code>q_proj</code>, <code>o_proj</code>, <code>gate_proj</code>, <code>up_proj</code>, and <code>down_proj</code>.</p>
+        <p>2D MoE per-expert modules use names like <code>experts.7.gate_proj</code>. 3D MoE modules use <code>experts.w1</code>, <code>experts.w2</code>, and <code>experts.w3</code>.</p>
+
+        <h3>Registration State</h3>
+        <pre><code>_name_to_id:    dict[str, int]        # user name -> stable lora_id
+_id_to_name:    dict[int, str]        # stable lora_id -> user name
+_adapter_paths: dict[str, str]        # user name -> durable adapter directory</code></pre>
+
+        <h3>Residency State</h3>
+        <pre><code>_cpu_cache:     dict[str, AdapterWeights]  # parsed host weights
+_cpu_lru:       OrderedDict[str, None]     # CPU eviction order
+_name_to_slot:  dict[str, int]             # GPU-resident name -> slot
+_slot_to_name:  list[str | None]           # slot -> GPU-resident name
+_gpu_lru:       OrderedDict[str, None]     # GPU eviction order</code></pre>
+      </section>
+
+      <section id="lifecycle">
+        <h2>Adapter Lifecycle</h2>
+        <ol>
+          <li><code>load_adapter(name, path)</code> verifies the adapter weight file or directory.</li>
+          <li>A new integer <code>lora_id</code> is assigned and stored in <code>_name_to_id</code> and <code>_id_to_name</code>.</li>
+          <li>The durable path is recorded in the CPU cache object so disk reload remains possible after CPU eviction.</li>
+          <li><code>LoraCpuCache.ensure()</code> synchronously loads, parses, and pins weights into the CPU pool when pinned memory is available.</li>
+          <li>On each forward step, <code>prepare_loras(lora_ids, token_counts)</code> resolves ids to names and then to GPU slots.</li>
+          <li>If an adapter is CPU-resident but not GPU-resident, <code>_ensure_in_gpu()</code> allocates or evicts a slot and calls <code>_load_to_slot()</code>.</li>
+          <li><code>_load_to_slot()</code> resets the target slot, writes rank/scaling metadata, shards on CPU, packs dense buffers, and loads MoE buffers.</li>
+          <li><code>unload_adapter(name)</code> clears GPU slot state, removes CPU cache state, and deletes id mappings.</li>
+        </ol>
+
+        <pre><code>request lora_id
+  -> _id_to_name[lora_id]
+  -> _ensure_in_gpu(name)
+  -> slot
+  -> LoraBatchInfo.weight_indices[segment] = slot</code></pre>
+      </section>
+
+      <section id="eviction">
+        <h2>Eviction</h2>
+        <h3>GPU Pool</h3>
+        <p>
+          The GPU pool has <code>max_loras</code> slots, all of them available
+          for real adapters. Base-model requests do not consume a GPU slot;
+          they write <code>NO_LORA_SLOT = -1</code> into per-step metadata.
+        </p>
+        <ul>
+          <li><code>_find_free_slot()</code> returns the first empty adapter slot.</li>
+          <li>If the pool is full, it scans <code>_gpu_lru</code> from least to most recently used.</li>
+          <li>The selected adapter is removed from <code>_name_to_slot</code>, <code>_slot_to_name</code>, and <code>_gpu_lru</code>.</li>
+          <li>The returned slot is reset before <code>_load_to_slot()</code> copies new weights, so partial adapters cannot inherit stale modules from the previous occupant.</li>
+          <li>Explicit unload also resets dense weights, clears MoE weights, and resets rank/scaling.</li>
+        </ul>
+
+        <h3>CPU Pool</h3>
+        <p>
+          The CPU pool is a second tier bounded by <code>max_loras_cpu</code>.
+          It keeps parsed, pinned weights to avoid repeated safetensors reads
+          and to allow non-blocking H2D copies when the platform supports
+          pinned memory. The default capacity is four times the GPU pool.
+        </p>
+        <ul>
+          <li><code>prefetch(name)</code> starts a best-effort background disk read if the adapter is known and not already loading.</li>
+          <li><code>ensure(name)</code> blocks until a pending load finishes or loads synchronously from disk.</li>
+          <li>CPU eviction prefers adapters that are not currently GPU-resident.</li>
+          <li>If the pool cannot find an evictable entry, loading raises a runtime error with the current LRU state.</li>
+        </ul>
+
+        <div class="callout">
+          GPU eviction does not unregister the adapter. It only removes the
+          temporary slot mapping. The adapter can be promoted again later from
+          CPU cache or disk using its stable <code>name</code> and
+          <code>lora_id</code>.
+        </div>
+      </section>
+
+      <section id="buffers">
+        <h2>GPU Buffers</h2>
+        <p>
+          Dense LoRA weights are packed into fixed-size per-layer buffers. The
+          first dimension is always <code>n_slots</code>, so kernels can select
+          the active adapter by slot without changing pointer addresses.
+          <code>--lora-buffer-groups</code> controls which coarse families are
+          allocated: <code>attn</code>, <code>mlp</code>, and <code>moe</code>.
+        </p>
+        <p>
+          The default is <code>attn,mlp,moe</code>. If a server starts with a
+          group disabled, loading an adapter that targets that group raises a
+          configuration error instead of silently dropping LoRA deltas.
+        </p>
+
+        <table>
+          <thead>
+            <tr><th>Buffer</th><th>Shape</th><th>Notes</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>qkv_A_buffers[layer]</code></td><td><code>(n_slots, 3 * max_rank, hidden)</code></td><td>Q, K, V A matrices stacked by rank block.</td></tr>
+            <tr><td><code>qkv_B_buffers[layer]</code></td><td><code>(n_slots, q_per_tp + 2 * kv_per_tp, max_rank)</code></td><td>Column-parallel output side, sharded per TP rank.</td></tr>
+            <tr><td><code>o_A_buffers[layer]</code></td><td><code>(n_slots, max_rank, o_in_per_tp)</code></td><td>Row-parallel input side, sharded along input dimension.</td></tr>
+            <tr><td><code>o_B_buffers[layer]</code></td><td><code>(n_slots, hidden, max_rank)</code></td><td>Replicated output side.</td></tr>
+            <tr><td><code>gate_up_A_buffers[layer]</code></td><td><code>(n_slots, 2 * max_rank, hidden)</code></td><td>Gate and up A matrices stacked.</td></tr>
+            <tr><td><code>gate_up_B_buffers[layer]</code></td><td><code>(n_slots, 2 * intermediate_per_tp, max_rank)</code></td><td>Column-parallel gate/up output side.</td></tr>
+            <tr><td><code>down_A_buffers[layer]</code></td><td><code>(n_slots, max_rank, intermediate_per_tp)</code></td><td>Row-parallel down input side.</td></tr>
+            <tr><td><code>down_B_buffers[layer]</code></td><td><code>(n_slots, hidden, max_rank)</code></td><td>Replicated down output side.</td></tr>
+          </tbody>
+        </table>
+
+        <h3>TP Sharding Rule</h3>
+        <ul>
+          <li>Column-parallel projections (<code>q/k/v</code>, <code>gate</code>, <code>up</code>) shard <code>lora_B</code> along output dimension.</li>
+          <li>Row-parallel projections (<code>o</code>, <code>down</code>) shard <code>lora_A</code> along input dimension.</li>
+          <li>Sharding happens on CPU before the H2D copy, so each TP rank copies only its local shard into GPU buffers.</li>
+          <li>Downstream all-reduce sums base partials and LoRA partials together for row-parallel outputs.</li>
+        </ul>
+      </section>
+
+      <section id="batch-info">
+        <h2>Batch Metadata</h2>
+        <p>
+          <code>LoraBatchInfo</code> is the contract between Python scheduling
+          and the CUDA/Triton kernels. Its tensors are allocated once at manager
+          construction and updated in place before each forward.
+        </p>
+
+        <table>
+          <thead>
+            <tr><th>Field</th><th>Meaning</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>bs</code></td><td>Number of active request segments.</td></tr>
+            <tr><td><code>num_segments</code></td><td>Currently equal to <code>bs</code>; one segment per request.</td></tr>
+            <tr><td><code>max_len</code></td><td>Maximum segment length in the step; drives decode vs prefill kernel choice.</td></tr>
+            <tr><td><code>seg_lens</code></td><td>Tokens per segment.</td></tr>
+            <tr><td><code>seg_indptr</code></td><td>Prefix sum over segment lengths.</td></tr>
+            <tr><td><code>weight_indices</code></td><td>GPU slot per segment.</td></tr>
+            <tr><td><code>lora_ranks</code></td><td>Per-slot rank tensor read by kernels.</td></tr>
+            <tr><td><code>scalings</code></td><td>Per-slot scaling tensor read by kernels.</td></tr>
+            <tr><td><code>single_lora_slot</code></td><td>Host fast path when every segment uses the same real adapter slot; otherwise <code>NO_LORA_SLOT</code>.</td></tr>
+            <tr><td><code>multi_lora_*</code></td><td>Host metadata for a batched CuTeDSL path when slots are consecutive and same-rank/same-scaling.</td></tr>
+            <tr><td><code>sort_order/group_*</code></td><td>Decode grouping metadata for grouped expand kernels.</td></tr>
+          </tbody>
+        </table>
+
+<pre><code>prepare_loras([adapter_a, adapter_b, 0], [20, 15, 8])
+  -> per_request_slots = [slot_a, slot_b, NO_LORA_SLOT]
+  -> seg_lens          = [20, 15, 8]
+  -> seg_indptr        = [0, 20, 35, 43]
+  -> weight_indices    = [slot_a, slot_b, NO_LORA_SLOT]
+  -> has_active_lora   = true</code></pre>
+      </section>
+
+      <section id="kernels">
+        <h2>Kernel Routing</h2>
+        <p>
+          Dense LoRA applies in two logical phases:
+        </p>
+        <ol>
+          <li><strong>Shrink:</strong> compute <code>lora_a = A @ x</code> using the active slot's A buffer.</li>
+          <li><strong>Expand:</strong> compute and add <code>B @ lora_a * scaling</code> into the base layer output.</li>
+        </ol>
+
+        <table>
+          <thead>
+            <tr><th>Condition</th><th>Path</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>max_len &gt; 32</code></td><td>Prefill-style shrink/expand kernels.</td></tr>
+            <tr><td>Decode with grouped slots</td><td>Grouped expand path batches tokens by adapter slot.</td></tr>
+            <tr><td>Single adapter and favorable shape</td><td>CuTeDSL dense GEMM-add fast path.</td></tr>
+            <tr><td>Multiple consecutive slots with same rank/scaling</td><td>Batched CuTeDSL fast path.</td></tr>
+            <tr><td>Fallback</td><td>General Triton shrink/expand kernels.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="moe">
+        <h2>MoE LoRA</h2>
+        <p>
+          MoE LoRA is deliberately separated from dense buffers. The manager
+          owns <code>MoeLoraBuffers</code>, and MoE backends receive a narrow
+          <code>MoeLoraContext</code> instead of depending on the full
+          <code>LoraManager</code>.
+        </p>
+
+        <h3>Supported Formats</h3>
+        <table>
+          <thead>
+            <tr><th>Format</th><th>Parsed module names</th><th>Storage behavior</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>2D per-expert PEFT</td>
+              <td><code>experts.&lt;id&gt;.gate_proj</code>, <code>up_proj</code>, <code>down_proj</code></td>
+              <td>Expert id comes from the key. Each expert has independent A/B tensors.</td>
+            </tr>
+            <tr>
+              <td>3D per-expert</td>
+              <td><code>experts.w1</code>, <code>experts.w2</code>, <code>experts.w3</code></td>
+              <td>Tensor dim0 is <code>num_experts</code>; one slice per expert.</td>
+            </tr>
+            <tr>
+              <td>3D shared-outer</td>
+              <td><code>experts.w1</code>, <code>experts.w2</code>, <code>experts.w3</code></td>
+              <td>Tensor dim0 may be <code>1</code> for the shared side and <code>num_experts</code> for the expert-specific side.</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>Projection Mapping</h3>
+        <pre><code>w1 -> gate_proj
+w3 -> up_proj
+w2 -> down_proj</code></pre>
+
+        <h3>Internal MoE Buffers</h3>
+        <p>
+          MoE LoRA now mirrors the dense/vLLM-style slot model: buffers are
+          preallocated per layer with leading dimensions
+          <code>(n_slots, num_experts, ...)</code>. Loading an adapter writes
+          into the selected slot; <code>weights_by_layer[layer][slot]</code>
+          stores views into those fixed buffers for backend consumption.
+        </p>
+        <pre><code>w13_A_buffers[layer]:  (n_slots, num_experts, 2 * max_rank, hidden)
+w13_B_buffers[layer]:  (n_slots, num_experts, 2 * moe_intermediate_per_tp, 2 * max_rank)
+down_A_buffers[layer]: (n_slots, num_experts, max_rank, moe_intermediate_per_tp)
+down_B_buffers[layer]: (n_slots, num_experts, hidden, max_rank)
+
+weights_by_layer[layer_id][slot] = {
+  "w13_A":  w13_A_buffers[layer_id][slot],
+  "w13_B":  w13_B_buffers[layer_id][slot],
+  "down_A": down_A_buffers[layer_id][slot],
+  "down_B": down_B_buffers[layer_id][slot],
+}</code></pre>
+        <p>
+          Slot reset zeros both dense and MoE fixed pools before reuse, so
+          partial MoE adapters cannot inherit expert weights from a previous
+          adapter in the same slot.
+        </p>
+        <p>
+          With <code>--lora-moe-compressed-shared-outer</code>, MoE allocation
+          switches to the 3D shared-outer layout instead of full expansion:
+        </p>
+        <pre><code>w13_A_buffers[layer]:  (n_slots, 1, 2 * max_rank, hidden)
+w13_B_buffers[layer]:  (n_slots, num_experts, 2 * moe_intermediate_per_tp, 2 * max_rank)
+down_A_buffers[layer]: (n_slots, num_experts, max_rank, moe_intermediate_per_tp)
+down_B_buffers[layer]: (n_slots, 1, hidden, max_rank)</code></pre>
+        <p>
+          This compressed mode supports shared-outer 3D adapters
+          (<code>w1/w3</code> A shared, <code>w1/w3</code> B per-expert,
+          <code>w2</code> A per-expert, <code>w2</code> B shared). It rejects
+          per-expert and 2D MoE adapters because those require full expert
+          storage for every side.
+        </p>
+
+        <h3>Shared-Outer MoE Contract</h3>
+        <p>
+          The 3D shared-outer layout follows the hybrid MoE-LoRA design from
+          Together's research notes. The low-rank side that builds a compact
+          representation can be shared when the representation is common across
+          experts, while the side that interprets an expert-specific activation
+          remains per expert.
+        </p>
+        <table>
+          <thead>
+            <tr><th>Projection</th><th>Shared side</th><th>Per-expert side</th><th>TokenSpeed buffer</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Gate <code>w1</code></td>
+              <td><code>lora_A</code>, dim0 = <code>1</code></td>
+              <td><code>lora_B</code>, dim0 = <code>num_experts</code></td>
+              <td>First rank slice of <code>w13_A</code> and first intermediate slice of <code>w13_B</code></td>
+            </tr>
+            <tr>
+              <td>Up <code>w3</code></td>
+              <td><code>lora_A</code>, dim0 = <code>1</code></td>
+              <td><code>lora_B</code>, dim0 = <code>num_experts</code></td>
+              <td>Second rank slice of <code>w13_A</code> and second intermediate slice of <code>w13_B</code></td>
+            </tr>
+            <tr>
+              <td>Down <code>w2</code></td>
+              <td><code>lora_B</code>, dim0 = <code>1</code></td>
+              <td><code>lora_A</code>, dim0 = <code>num_experts</code></td>
+              <td><code>down_A</code> per expert and <code>down_B</code> shared</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <pre><code>expected 3D shared-outer dim0:
+  experts.w1: A = 1,           B = num_experts
+  experts.w3: A = 1,           B = num_experts
+  experts.w2: A = num_experts, B = 1</code></pre>
+
+        <p>
+          In full mode, TokenSpeed expands any dim0=<code>1</code> shared tensor
+          into every expert slot during load. In compressed mode, the shared
+          side stays physically shared in the GPU pool and
+          <code>MoeLoraContext._select_expert_weights()</code> broadcasts it at
+          apply time. This saves <code>(num_experts - 1) * rank * (3 * hidden)</code>
+          elements per adapter slot per MoE layer, because only
+          <code>w13_A</code> and <code>down_B</code> stop carrying duplicate
+          expert copies.
+        </p>
+
+        <h3>Route-Level Math</h3>
+        <p>
+          For each routed pair <code>(token t, expert e)</code> and adapter
+          slot <code>s</code>, MoE LoRA adds deltas at the same points as the
+          base MoE projections. Gate/up LoRA is added before the activation;
+          down LoRA is multiplied by the router weight before it is accumulated
+          into the final routed output.
+        </p>
+        <pre><code>gate_up_delta[t, e] =
+  ((hidden[t] @ w13_A[s, e].T) @ w13_B[s, e].T) * scaling[s]
+
+gate_up_output[t, e] += gate_up_delta[t, e]
+
+down_delta[t, e] =
+  ((intermediate[t, e] @ down_A[s, e].T) @ down_B[s, e].T)
+  * topk_weights[t, e] * scaling[s]
+
+down_output[t, e] += down_delta[t, e]</code></pre>
+
+        <p>
+          When a side is shared, the effective expert index is <code>0</code>
+          for that side. The apply path therefore uses the same equations for
+          full per-expert and shared-outer adapters; only the tensor selection
+          changes.
+        </p>
+
+        <h3>Optimization Notes</h3>
+        <table>
+          <thead>
+            <tr><th>Idea from the research note</th><th>TokenSpeed status</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Compute shared gate/up A once per token, then reuse it for every routed expert.</td>
+              <td>Storage supports this shape, but the current apply path still evaluates per routed pair. A future fused kernel can exploit the shared side directly.</td>
+            </tr>
+            <tr>
+              <td>For shared down B, combine weighted low-rank intermediates first, then apply one shared B projection.</td>
+              <td>The current implementation applies the down delta per route and weights it before accumulation. This is correct and leaves the fused shared-B reduction as a kernel optimization.</td>
+            </tr>
+            <tr>
+              <td>Group work by <code>(adapter slot, expert id)</code> for better locality.</td>
+              <td>Dense LoRA already groups by adapter for some paths. MoE LoRA currently keeps a narrow context API so backends can add this grouping without changing manager ownership.</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>Runtime Apply</h3>
+        <ul>
+          <li><code>MoELayer.forward()</code> obtains the current manager through explicit argument or <code>get_current_lora_manager()</code>.</li>
+          <li>If the backend advertises <code>supports_moe_lora</code>, it receives <code>moe_lora_context</code>.</li>
+          <li>The Triton MoE path applies gate/up LoRA after the first expert GEMM and before activation.</li>
+          <li>It applies down LoRA after the down expert GEMM and before final route combine.</li>
+          <li>For mixed-adapter batches, <code>MoeLoraContext</code> expands segment slots to token slots and masks base-model tokens.</li>
+          <li>If token ownership changes under expert parallel dispatch, mixed LoRA is disabled rather than applying an incorrect slot map.</li>
+        </ul>
+
+        <div class="callout">
+          Current MoE LoRA support is local or tensor-parallel MoE only.
+          Expert-parallel MoE needs the LoRA slot map dispatched with tokens.
+        </div>
+      </section>
+
+      <section id="cuda-graph">
+        <h2>CUDA Graph</h2>
+        <p>
+          The CUDA graph design relies on stable pointers. Adapter contents,
+          segment lengths, slot ids, ranks, and scalings can change between
+          replays, but the tensors holding those values do not move.
+        </p>
+
+        <h3>Capture</h3>
+        <ul>
+          <li>When LoRA is enabled, <code>CudaGraphWrapper.capture()</code> captures two graphs per batch size.</li>
+          <li>The with-LoRA graph sets <code>ctx.lora_manager</code> and calls <code>prepare_loras([0] * bs)</code> before capture so metadata tensors contain <code>NO_LORA_SLOT</code> while kernels capture stable pointers.</li>
+          <li>The no-LoRA graph leaves <code>ctx.lora_manager</code> unset, so model-layer branches skip LoRA calls entirely.</li>
+          <li>No-LoRA capture is safe because base-model dummy ids resolve to <code>NO_LORA_SLOT</code>; runtime LoRA paths skip work when no real adapter is active.</li>
+        </ul>
+
+        <h3>Replay</h3>
+        <ol>
+          <li><code>ModelExecutor</code> builds the real <code>lora_ids</code> list for the scheduled requests.</li>
+          <li><code>prepare_loras()</code> updates the persistent <code>LoraBatchInfo</code> tensors in place.</li>
+          <li>If any id is nonzero, <code>ctx.lora_manager</code> is set and LoRA-capable layers call apply methods.</li>
+          <li><code>CudaGraphWrapper</code> chooses the no-LoRA graph if <code>has_active_lora</code> is false, otherwise it replays the with-LoRA graph.</li>
+          <li>The captured kernels read the updated metadata and use the current slot-to-weight buffers.</li>
+        </ol>
+
+        <pre><code>capture time:
+  batch_info tensors allocated once
+  graph records pointers to batch_info, ranks, scalings, and weight buffers
+
+replay time:
+  prepare_loras() mutates tensor contents
+  graph.replay() reads new contents through old pointers</code></pre>
+
+        <h3>Why Two Graphs?</h3>
+        <p>
+          The with-LoRA graph includes LoRA kernel launches. That is necessary
+          when any request uses an adapter. For all-base batches, the no-LoRA
+          graph avoids those launches entirely and preserves base-model decode
+          performance.
+        </p>
+      </section>
+
+      <section id="limitations">
+        <h2>Limitations and Open Edges</h2>
+        <ul>
+          <li><span class="warn">MoE EP:</span> Expert-parallel MoE is rejected for MoE LoRA until the slot map is dispatched alongside routed tokens.</li>
+          <li><span class="warn">2D hybrid shared:</span> The <code>experts.shared.*</code> 2D hybrid-shared format is not currently supported.</li>
+          <li><span class="warn">Model hooks:</span> Dense LoRA requires model layers to call the manager apply methods at projection boundaries.</li>
+          <li><span class="warn">Slot identity:</span> External code should not persist GPU slots. Only <code>lora_id</code> and adapter names are stable.</li>
+        </ul>
+      </section>
+    </main>
+  </div>
+</body>
+</html>
