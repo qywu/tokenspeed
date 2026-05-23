@@ -2,7 +2,7 @@
 
 Online RL training (PPO, GRPO, etc.) requires the inference engine to alternate
 between generating rollouts and absorbing updated model weights from the trainer.
-This plan tracks four milestones needed to support that loop in tokenspeed.
+This plan tracks the milestones needed to support that loop in tokenspeed.
 
 ---
 
