@@ -283,7 +283,7 @@ Popular RL training frameworks each assume a specific rollout engine interface:
 
 | Framework | Default rollout engine | Weight sync interface used |
 |-----------|----------------------|---------------------------|
-| [veRL](https://github.com/volcengine/verl) | vLLM | vLLM programmatic API (`llm.update_weights`, `init_weight_transfer_engine`, …) |
+| [veRL](https://github.com/volcengine/verl) | vLLM or SGLang | vLLM programmatic API or SGLang HTTP (`/update_weights_from_distributed`, `/pause_generation`, …) |
 | [OpenRLHF](https://github.com/OpenRLHF/OpenRLHF) | vLLM or SGLang | vLLM HTTP or SGLang HTTP |
 | [SLIME](https://github.com/SLIME-RL/SLIME) | SGLang | SGLang HTTP (`/update_weights_from_distributed`, `/pause_generation`, …) |
 
