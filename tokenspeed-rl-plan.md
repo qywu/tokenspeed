@@ -285,7 +285,7 @@ Popular RL training frameworks each assume a specific rollout engine interface:
 |-----------|----------------------|---------------------------|
 | [veRL](https://github.com/volcengine/verl) | vLLM or SGLang | vLLM programmatic API or SGLang HTTP (`/update_weights_from_distributed`, `/pause_generation`, …) |
 | [OpenRLHF](https://github.com/OpenRLHF/OpenRLHF) | vLLM or SGLang | vLLM HTTP or SGLang HTTP |
-| [SLIME](https://github.com/SLIME-RL/SLIME) | SGLang | SGLang HTTP (`/update_weights_from_distributed`, `/pause_generation`, …) |
+| [SLIME](https://github.com/THUDM/slime) | SGLang | SGLang HTTP (`/update_weights_from_distributed`, `/pause_generation`, …) |
 
 **The question:** should tokenspeed expose a compatibility shim so existing RL
 training scripts can point at tokenspeed without modification, or define its own
