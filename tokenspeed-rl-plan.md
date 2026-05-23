@@ -309,3 +309,30 @@ Options:
    `/update_weights` (vLLM name) as aliases behind a single implementation.
    Low-cost compatibility without a separate adapter layer.
 
+
+### Q2 — Rollout generation endpoint: dedicated `/generate` or standard completions?
+
+RL trainers need to collect rollouts — batches of completions with token IDs and
+logprobs. The question is what endpoint shape best serves that use case.
+
+Options:
+
+1. **Dedicated `/generate` returning raw tokens** — a trainer-facing endpoint that
+   returns `token_ids`, `log_probs`, and metadata directly as arrays, with no
+   detokenization or chat formatting overhead. Cleanest for RL: trainers work in
+   token space and never need text.
+
+2. **Reuse `/v1/completions`** — OpenAI-compatible endpoint with `logprobs=true`.
+   Returns text + optional token logprobs. Familiar to framework authors; works
+   out of the box with veRL and OpenRLHF's existing vLLM/SGLang adapters. Cost:
+   detokenization is wasteful, and the response schema is not optimised for batch
+   token-level access.
+
+3. **Reuse `/v1/chat/completions`** — same as above but for instruction-tuned
+   models. Most RL tasks today use chat-format prompts (GRPO, DAPO, etc.), so this
+   is the natural entry point for end users. Same detokenization overhead.
+
+4. **Hybrid** — expose `/v1/completions` and `/v1/chat/completions` for
+   compatibility, plus a `/generate` endpoint that skips detokenization and returns
+   raw token arrays for trainer-side use. Trainers that care about throughput use
+   `/generate`; existing framework adapters use the OpenAI-compatible surface.
