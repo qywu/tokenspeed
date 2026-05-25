@@ -302,31 +302,55 @@
 
         <div class="grid">
           <div class="card">
-            <h3>Identity Layer</h3>
-            <p><code>name</code> and <code>lora_id</code> are user/runtime identities. They do not imply GPU residency.</p>
+            <h3>🐍 Python Runtime</h3>
+            <p>
+              <code>LoraManager</code> owns adapter identity, GPU/CPU/disk pool
+              eviction, weight sharding, and CUDA-graph-stable
+              <code>LoraBatchInfo</code> tensors.
+              Model layers (<code>qwen3.py</code>, <code>qwen3_5.py</code>) call
+              <code>apply_qkv_lora</code>, <code>apply_o_lora</code>,
+              <code>apply_gate_up_lora</code>, and <code>apply_down_lora</code>
+              after each base projection.
+            </p>
           </div>
           <div class="card">
-            <h3>Residency Layer</h3>
-            <p><code>slot</code> is the current GPU pool index for a real adapter. Base-model requests use <code>NO_LORA_SLOT = -1</code>.</p>
+            <h3>⚡ Kernels (tokenspeed-kernel)</h3>
+            <p>
+              Triton kernels in <code>ops/lora/triton/</code> handle dense
+              attention and MLP LoRA (shrink + expand, prefill SGMV, decode
+              grouped). MoE LoRA lives in <code>ops/moe_lora/</code>:
+              flat per-expert kernels avoid gather copies; a secondary CUDA
+              stream overlaps A-shrink with the base MoE GEMM.
+            </p>
           </div>
           <div class="card">
-            <h3>Forward Layer</h3>
-            <p><code>LoraBatchInfo</code> maps each request segment to a slot and is read directly by LoRA kernels.</p>
+            <h3>🗂 Scheduler (C++)</h3>
+            <p>
+              Each request carries a <code>lora_id</code>. The KV prefix cache
+              gives every adapter its own virtual radix-tree root so prefix
+              reuse is isolated per adapter.
+              <code>EvictLoraNamespace(lora_id)</code> prunes the tree on
+              adapter unload.
+            </p>
           </div>
         </div>
 
         <div class="flow">
           <div class="flow-row">
-            <div class="node"><strong>Load</strong><small>adapter path -> CPU cache</small></div>
-            <div class="node green"><strong><code>LoraManager.load_adapter()</code></strong><small>Registers name/id, stores durable disk path, warms CPU cache.</small></div>
+            <div class="node"><strong>Load</strong><small>adapter path → CPU cache</small></div>
+            <div class="node green"><strong><code>LoraManager.load_adapter()</code></strong><small>Registers name/id, stores durable disk path, warms CPU cache. (Python)</small></div>
           </div>
           <div class="flow-row">
-            <div class="node"><strong>Schedule</strong><small>request ids -> adapter ids</small></div>
-            <div class="node green"><strong><code>prepare_loras()</code></strong><small>Promotes missing adapters to GPU slots, writes segment lengths, slot ids, and fast-path metadata.</small></div>
+            <div class="node"><strong>Schedule</strong><small>request ids → adapter ids</small></div>
+            <div class="node green"><strong><code>prepare_loras()</code></strong><small>Promotes missing adapters to GPU slots, writes LoraBatchInfo. (Python + Scheduler)</small></div>
           </div>
           <div class="flow-row">
             <div class="node"><strong>Forward</strong><small>layer output += LoRA delta</small></div>
-            <div class="node green"><strong><code>apply_*_lora()</code></strong><small>Dense layers call shrink/expand kernels; MoE backends consume a narrow <code>MoeLoraContext</code>.</small></div>
+            <div class="node green"><strong><code>apply_*_lora()</code></strong><small>Python dispatch → Triton shrink/expand kernels; MoE path uses MoeLoraContext. (Python + Kernel)</small></div>
+          </div>
+          <div class="flow-row">
+            <div class="node"><strong>Unload</strong><small>free GPU slot + KV namespace</small></div>
+            <div class="node green"><strong><code>EvictLoraNamespace()</code></strong><small>Evicts cached KV pages and removes the adapter's radix-tree root. (Scheduler)</small></div>
           </div>
         </div>
       </section>
