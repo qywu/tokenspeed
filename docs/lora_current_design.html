@@ -474,6 +474,18 @@ curl http://localhost:8000/v1/chat/completions \
 
       <section id="naming">
         <h2>Naming</h2>
+        <p>
+          This section defines the vocabulary used throughout the LoRA implementation.
+          Each identifier — from the user-facing adapter name to the ephemeral GPU slot
+          — has a distinct role and lifetime, and keeping them separate prevents subtle
+          bugs when adapters are evicted, reloaded, or shared across requests.
+        </p>
+        <div style="margin:12px 0 20px;padding:10px 14px;background:var(--panel-2);border-radius:6px;font-size:13px">
+          <strong>Key files</strong> —
+          <code>python/tokenspeed/runtime/lora/lora_manager.py</code> (added) ·
+          <code>python/tokenspeed/runtime/engine/io_struct.py</code> (added) ·
+          <code>python/tokenspeed/runtime/engine/input_processor.py</code> (added)
+        </div>
         <table>
           <thead>
             <tr><th>Name</th><th>Meaning</th><th>Where it lives</th></tr>
@@ -534,6 +546,18 @@ curl http://localhost:8000/v1/chat/completions \
 
       <section id="data-model">
         <h2>Data Model</h2>
+        <p>
+          This section describes the in-memory structures that track adapter weights
+          and residency state. <code>AdapterWeights</code> holds parsed tensors keyed
+          by layer and module name; the registration and residency dictionaries give
+          the manager fast O(1) lookup for every scheduling decision.
+        </p>
+        <div style="margin:12px 0 20px;padding:10px 14px;background:var(--panel-2);border-radius:6px;font-size:13px">
+          <strong>Key files</strong> —
+          <code>python/tokenspeed/runtime/lora/lora_batch.py</code> (added) ·
+          <code>python/tokenspeed/runtime/lora/lora_manager.py</code> (modified) ·
+          <code>python/tokenspeed/runtime/execution/context.py</code> (modified)
+        </div>
         <h3>AdapterWeights</h3>
         <p>
           Parsed adapter weights use this logical shape:
@@ -562,6 +586,18 @@ _gpu_lru:       OrderedDict[str, None]     # GPU eviction order</code></pre>
 
       <section id="lifecycle">
         <h2>Adapter Lifecycle</h2>
+        <p>
+          This section traces an adapter from first registration through GPU promotion
+          and final unload. The manager separates the durable disk path (recorded at
+          registration) from the transient CPU and GPU residency state (managed through
+          LRU caches), so adapters can be evicted and reloaded transparently.
+        </p>
+        <div style="margin:12px 0 20px;padding:10px 14px;background:var(--panel-2);border-radius:6px;font-size:13px">
+          <strong>Key files</strong> —
+          <code>python/tokenspeed/runtime/lora/lora_manager.py</code> (added) ·
+          <code>python/tokenspeed/runtime/lora/lora_cache.py</code> (added) ·
+          <code>python/tokenspeed/runtime/entrypoints/engine.py</code> (modified)
+        </div>
         <ol>
           <li><code>load_adapter(name, path)</code> verifies the adapter weight file or directory.</li>
           <li>A new integer <code>lora_id</code> is assigned and stored in <code>_name_to_id</code> and <code>_id_to_name</code>.</li>
@@ -582,6 +618,17 @@ _gpu_lru:       OrderedDict[str, None]     # GPU eviction order</code></pre>
 
       <section id="eviction">
         <h2>Eviction</h2>
+        <p>
+          This section describes how the GPU and CPU adapter pools shed adapters under
+          memory pressure. The two-tier design — GPU slots backed by a CPU pinned cache
+          backed by disk — ensures that eviction from one tier never loses weights; they
+          are always reloadable from the tier below.
+        </p>
+        <div style="margin:12px 0 20px;padding:10px 14px;background:var(--panel-2);border-radius:6px;font-size:13px">
+          <strong>Key files</strong> —
+          <code>python/tokenspeed/runtime/lora/lora_manager.py</code> (added) ·
+          <code>python/tokenspeed/runtime/lora/lora_cache.py</code> (added)
+        </div>
         <h3>GPU Pool</h3>
         <p>
           The GPU pool has <code>max_loras</code> slots, all of them available
@@ -632,6 +679,11 @@ _gpu_lru:       OrderedDict[str, None]     # GPU eviction order</code></pre>
           group disabled, loading an adapter that targets that group raises a
           configuration error instead of silently dropping LoRA deltas.
         </p>
+        <div style="margin:12px 0 20px;padding:10px 14px;background:var(--panel-2);border-radius:6px;font-size:13px">
+          <strong>Key files</strong> —
+          <code>python/tokenspeed/runtime/lora/lora_buffers.py</code> (added) ·
+          <code>python/tokenspeed/runtime/lora/moe_lora.py</code> (added)
+        </div>
 
         <table>
           <thead>
@@ -665,6 +717,11 @@ _gpu_lru:       OrderedDict[str, None]     # GPU eviction order</code></pre>
           and the CUDA/Triton kernels. Its tensors are allocated once at manager
           construction and updated in place before each forward.
         </p>
+        <div style="margin:12px 0 20px;padding:10px 14px;background:var(--panel-2);border-radius:6px;font-size:13px">
+          <strong>Key files</strong> —
+          <code>python/tokenspeed/runtime/lora/lora_batch.py</code> (added) ·
+          <code>python/tokenspeed/runtime/lora/lora_manager.py</code> (added)
+        </div>
 
         <table>
           <thead>
@@ -700,6 +757,10 @@ _gpu_lru:       OrderedDict[str, None]     # GPU eviction order</code></pre>
           segment lengths, slot ids, ranks, and scalings can change between
           replays, but the tensors holding those values do not move.
         </p>
+        <div style="margin:12px 0 20px;padding:10px 14px;background:var(--panel-2);border-radius:6px;font-size:13px">
+          <strong>Key files</strong> —
+          <code>python/tokenspeed/runtime/execution/cuda_graph_wrapper.py</code> (modified)
+        </div>
 
         <h3>Capture</h3>
         <ul>
@@ -839,6 +900,23 @@ replay time:
       <section id="kernels">
         <h2>Kernel Routing</h2>
         <p>
+          This section covers how the runtime selects and dispatches the correct
+          Triton kernel for each forward step. The dispatch table balances throughput
+          (prefill SGMV, batched CuTeDSL) against correctness for all segment lengths,
+          slot counts, rank values, and scaling configurations that can appear in a
+          mixed-adapter batch.
+        </p>
+        <div style="margin:12px 0 20px;padding:10px 14px;background:var(--panel-2);border-radius:6px;font-size:13px">
+          <strong>Key files</strong> —
+          <code>tokenspeed-kernel/python/tokenspeed_kernel/ops/lora/triton/lora_shrink.py</code> (added) ·
+          <code>lora_expand.py</code> (added) ·
+          <code>lora_qkv_expand.py</code> (added) ·
+          <code>lora_gate_up_expand.py</code> (added) ·
+          <code>lora_shrink_prefill.py</code> (added) ·
+          <code>lora_expand_prefill.py</code> (added) ·
+          <code>lora_expand_grouped_v2.py</code> (added)
+        </div>
+        <p>
           Dense LoRA applies in two logical phases:
         </p>
         <ol>
@@ -868,6 +946,12 @@ replay time:
           <code>MoeLoraContext</code> instead of depending on the full
           <code>LoraManager</code>.
         </p>
+        <div style="margin:12px 0 20px;padding:10px 14px;background:var(--panel-2);border-radius:6px;font-size:13px">
+          <strong>Key files</strong> —
+          <code>tokenspeed-kernel/python/tokenspeed_kernel/ops/moe_lora/__init__.py</code> (added) ·
+          <code>python/tokenspeed/runtime/lora/moe_lora.py</code> (added) ·
+          <code>python/tokenspeed/runtime/layers/moe/backends/triton_common.py</code> (modified)
+        </div>
 
         <h3>Supported Formats</h3>
         <table>
