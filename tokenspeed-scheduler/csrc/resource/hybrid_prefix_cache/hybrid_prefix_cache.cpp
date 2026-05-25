@@ -48,16 +48,16 @@ HybridPrefixCache::HybridPrefixCache(KVPrefixCache& kv_prefix_cache, MambaChunkA
       mamba_eviction_manager_{mamba_allocator},
       mamba_cache_chunk_size_{mamba_cache_chunk_size} {}
 
-MatchResult HybridPrefixCache::Match(const token_vec_t& token_ids, MatchIntent intent) {
-    auto match = kv_prefix_cache_.Match(token_ids, intent);
+MatchResult HybridPrefixCache::Match(const token_vec_t& token_ids, std::int32_t lora_id, MatchIntent intent) {
+    auto match = kv_prefix_cache_.Match(token_ids, lora_id, intent);
     augmentMatch(match);
     augmentMatchPagedCache(match);
     return match;
 }
 
 MatchResult HybridPrefixCache::Match(const std::vector<std::span<const std::int32_t>>& token_pages,
-                                     MatchIntent intent) {
-    auto match = kv_prefix_cache_.Match(token_pages, intent);
+                                     std::int32_t lora_id, MatchIntent intent) {
+    auto match = kv_prefix_cache_.Match(token_pages, lora_id, intent);
     augmentMatch(match);
     augmentMatchPagedCache(match);
     return match;
@@ -231,15 +231,11 @@ std::vector<TransferPair> HybridPrefixCache::PrepareMambaDeviceLoadBack(const st
 }
 
 bool HybridPrefixCache::EnsureMambaCapacityByEvict(std::int32_t num_slots, TreeNode* protected_node) {
-    if (mamba_allocator_ == nullptr) return num_slots <= 0;
     return mamba_eviction_manager_.EnsureCapacity(num_slots, protected_node);
 }
 
 void HybridPrefixCache::InsertMamba(TreeNode* terminal_node, std::unique_ptr<MambaSlot> slot) {
     if (terminal_node == nullptr || slot == nullptr) return;
-    if (mamba_allocator_ == nullptr) {
-        throw std::logic_error("HybridPrefixCache::InsertMamba: mamba adjunct not enabled");
-    }
     const std::int32_t page_size = kv_prefix_cache_.PageSize();
     if (page_size <= 0 || terminal_node->DepthInTokens() % static_cast<std::size_t>(page_size) != 0) {
         throw std::logic_error("HybridPrefixCache::InsertMamba: terminal node is not block-aligned");
@@ -250,10 +246,6 @@ void HybridPrefixCache::InsertMamba(TreeNode* terminal_node, std::unique_ptr<Mam
 
 bool HybridPrefixCache::AttachPagedCacheSnapshotToNode(TreeNode* node, std::unique_ptr<PagedCacheSnapshot> snapshot) {
     if (node == nullptr || snapshot == nullptr) return false;
-    // Compute completeness from what is present. The policy-driven "snapshot
-    // must be full" invariant is enforced upstream by CommitChunk, which only
-    // attaches full snapshots; direct callers (tests, future restore paths)
-    // may attach history-only or state-only snapshots without policy gating.
     snapshot->complete_families.clear();
     bool history_complete = !paged_cache_history_groups_.empty();
     for (const auto& gid : paged_cache_history_groups_) {
@@ -295,9 +287,6 @@ void HybridPrefixCache::OnKVEvict(TreeNode* node) {
             mamba_eviction_manager_.UpdateLeaf(node->Parent());
         }
     }
-    // Passive paged-cache detach on KV LRU drop: returns OwnedPages via RAII;
-    // the chain scan sees the gap because `HasPagedCacheSnapshot()` is false.
-    // Route through DetachPagedCacheSnapshotFromNode to keep membership set in sync.
     if (node->HasPagedCacheSnapshot()) {
         DetachPagedCacheSnapshotFromNode(node);
     }
@@ -387,7 +376,6 @@ void HybridPrefixCache::OnKVDeviceDemote(TreeNode* node) {
 }
 
 std::int32_t HybridPrefixCache::AvailableSlots() const {
-    if (mamba_allocator_ == nullptr) return 0;
     return mamba_allocator_->AvailableSlots();
 }
 

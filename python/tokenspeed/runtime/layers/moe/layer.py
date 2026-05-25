@@ -21,6 +21,7 @@
 
 import torch
 
+from tokenspeed.runtime.execution.context import get_current_lora_manager
 from tokenspeed.runtime.layers.activation import SwigluArg
 from tokenspeed.runtime.layers.moe.core import MoELayerSpec, select_backend
 from tokenspeed.runtime.layers.moe.utils import get_all2all_backend
@@ -155,6 +156,7 @@ class MoELayer(torch.nn.Module):
         num_global_tokens: int,
         max_num_tokens_per_gpu: int,
         do_finalize: bool = True,
+        lora_manager=None,
     ):
         # Only pass ``do_finalize`` through when the caller actually wants
         # the deferred path. Other backends do not accept this kwarg;
@@ -166,6 +168,21 @@ class MoELayer(torch.nn.Module):
                 self.backend.supports_deferred_finalize
             ), f"{type(self.backend).__name__} does not support do_finalize=False"
             kwargs["do_finalize"] = False
+        if lora_manager is None:
+            lora_manager = get_current_lora_manager()
+        if lora_manager is not None:
+            if not self.backend.supports_moe_lora:
+                raise NotImplementedError(
+                    f"{type(self.backend).__name__} does not support MoE LoRA; "
+                    "use the Triton backend instead."
+                )
+            if self.ep_size != 1:
+                raise NotImplementedError(
+                    "MoE LoRA currently supports local/Tensor-Parallel MoE only; "
+                    "expert-parallel dispatch needs the LoRA slot map to be "
+                    "dispatched with tokens."
+                )
+            kwargs["moe_lora_context"] = lora_manager.moe_lora_context
         return self.backend.forward(
             self,
             hidden_states,

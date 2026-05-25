@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from tokenspeed.runtime.execution.context import bind_forward_context
 from tokenspeed.runtime.execution.weight_loader import WeightLoader
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.env import global_server_args_dict_update
@@ -136,11 +137,12 @@ class ModelRunner:
         if captured_hidden_states is not None:
             kwargs["captured_hidden_states"] = captured_hidden_states
 
-        return self.model.forward(
-            ctx,
-            input_ids,
-            positions,
-            out_cache_loc,
-            input_lengths,
-            **kwargs,
-        )
+        with bind_forward_context(ctx):
+            return self.model.forward(
+                ctx,
+                input_ids,
+                positions,
+                out_cache_loc,
+                input_lengths,
+                **kwargs,
+            )

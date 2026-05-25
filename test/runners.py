@@ -194,11 +194,11 @@ class HFRunner:
 
         # Run forward
         while True:
-            prompts, image_data, max_new_tokens, lora_paths, token_ids_logprob = (
+            prompts, image_data, max_new_tokens, adapter_paths, token_ids_logprob = (
                 in_queue.get()
             )
-            if lora_paths is not None:
-                assert len(prompts) == len(lora_paths)
+            if adapter_paths is not None:
+                assert len(prompts) == len(adapter_paths)
 
             if prompts is not None:
                 if self.model_type == "generation":
@@ -208,7 +208,7 @@ class HFRunner:
                             prompts=prompts,
                             max_new_tokens=max_new_tokens,
                             tokenizer=self.tokenizer,
-                            lora_paths=lora_paths,
+                            adapter_paths=adapter_paths,
                             torch_dtype=torch_dtype,
                             output_str_only=self.output_str_only,
                             token_ids_logprob=token_ids_logprob,
@@ -226,11 +226,11 @@ class HFRunner:
         ] = DEFAULT_PROMPTS,
         image_data: Optional[List[str]] = None,
         max_new_tokens: int = 8,
-        lora_paths: Optional[List[str]] = None,
+        adapter_paths: Optional[List[str]] = None,
         token_ids_logprob: Optional[int] = None,
     ):
         self.in_queue.put(
-            (prompts, image_data, max_new_tokens, lora_paths, token_ids_logprob)
+            (prompts, image_data, max_new_tokens, adapter_paths, token_ids_logprob)
         )
         while True:
             try:
@@ -264,7 +264,7 @@ class HFRunner:
         max_new_tokens: int,
         tokenizer,
         torch_dtype: torch.dtype,
-        lora_paths: Optional[List[str]] = None,
+        adapter_paths: Optional[List[str]] = None,
         output_str_only: bool = False,
         token_ids_logprob: Optional[int] = None,
         patch_model_do_sample_false: Optional[bool] = False,
@@ -299,12 +299,12 @@ class HFRunner:
                 if max_model_len is not None and input_ids.shape[1] > max_model_len:
                     input_ids = input_ids[:, :max_model_len]
 
-            if lora_paths is not None and lora_paths[i] is not None:
+            if adapter_paths is not None and adapter_paths[i] is not None:
                 from peft import PeftModel
 
                 model = PeftModel.from_pretrained(
                     base_model,
-                    lora_paths[i],
+                    adapter_paths[i],
                     torch_dtype=torch_dtype,
                     is_trainable=False,
                 )
@@ -367,7 +367,7 @@ class HFRunner:
                     )
                 del input_logits
 
-            if lora_paths is not None and lora_paths[i] is not None:
+            if adapter_paths is not None and adapter_paths[i] is not None:
                 # Unload the LoRA adapter if it is used
                 model.unload()
 
@@ -465,8 +465,8 @@ class RTRunner:
         else:
             self.tokenizer = None
 
-    def load_lora_adapter(self, lora_name: str, lora_path: str, pinned: bool = False):
-        return self.engine.load_lora_adapter(lora_name, lora_path, pinned)
+    def load_lora_adapter(self, lora_name: str, adapter_path: str):
+        return self.engine.load_lora_adapter(lora_name, adapter_path)
 
     def unload_lora_adapter(self, lora_name: str):
         return self.engine.unload_lora_adapter(lora_name)
@@ -477,7 +477,7 @@ class RTRunner:
             List[List[str]], List[str], List[torch.Tensor]
         ] = DEFAULT_PROMPTS,
         max_new_tokens: int = 8,
-        lora_paths: Optional[List[str]] = None,
+        lora_names: Optional[List[str]] = None,
         logprob_start_len: int = 0,
         top_k: Optional[int] = None,
         token_ids_logprob: Optional[List[int]] = None,
@@ -487,7 +487,7 @@ class RTRunner:
                 engine=self.engine,
                 prompts=prompts,
                 max_new_tokens=max_new_tokens,
-                lora_paths=lora_paths,
+                lora_names=lora_names,
                 logprob_start_len=logprob_start_len,
                 top_k=top_k,
                 token_ids_logprob=token_ids_logprob,
@@ -525,7 +525,7 @@ class RTRunner:
         engine: Engine,
         prompts: Union[List[str], List[torch.Tensor]],
         max_new_tokens: int = 8,
-        lora_paths: Optional[List[str]] = None,
+        lora_names: Optional[List[str]] = None,
         logprob_start_len: int = 0,
         top_k: Optional[int] = None,
         token_ids_logprob: Optional[List[int]] = None,
@@ -551,6 +551,7 @@ class RTRunner:
             sampling_params["top_k"] = top_k
 
         for i, prompt in enumerate(prompts):
+            lora_name = None if lora_names is None else lora_names[i]
             response = engine.generate(
                 prompt,
                 sampling_params=sampling_params,
@@ -558,6 +559,7 @@ class RTRunner:
                 logprob_start_len=logprob_start_len,
                 top_logprobs_num=NUM_TOP_LOGPROBS,
                 token_ids_logprob=token_ids_logprob,
+                lora_name=lora_name,
             )
             text = response["text"]
 

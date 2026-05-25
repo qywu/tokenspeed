@@ -22,29 +22,6 @@ from tokenspeed_kernel.profiling import bootstrap_profiling_from_env
 
 bootstrap_profiling_from_env()
 
-from tokenspeed_kernel.ops.attention import (
-    mha_decode_scheduler_metadata,
-    mha_decode_with_kvcache,
-    mha_extend_with_kvcache,
-    mha_merge_state,
-    mha_prefill,
-)
-from tokenspeed_kernel.ops.gemm import mm
-from tokenspeed_kernel.ops.moe import (
-    moe_combine,
-    moe_dispatch,
-    moe_experts,
-    moe_fused,
-    moe_route,
-)
-from tokenspeed_kernel.ops.quantization import (
-    quantize_fp8,
-    quantize_fp8_with_scale,
-    quantize_mxfp4,
-    quantize_mxfp8,
-    quantize_nvfp4,
-)
-
 __all__ = [
     # gemm
     "mm",
@@ -67,3 +44,42 @@ __all__ = [
     "quantize_nvfp4",
     "quantize_mxfp4",
 ]
+
+
+def __getattr__(name: str):
+    if name == "mm":
+        from tokenspeed_kernel.ops.gemm import mm
+
+        return mm
+    if name in {"moe_route", "moe_dispatch", "moe_experts", "moe_combine", "moe_fused"}:
+        from tokenspeed_kernel.ops import moe
+
+        return getattr(moe, name)
+    if name in {
+        "mha_prefill",
+        "mha_extend_with_kvcache",
+        "mha_prefill_with_kvcache",  # legacy alias
+        "mha_decode_with_kvcache",
+        "mha_merge_state",
+        "mha_decode_scheduler_metadata",
+    }:
+        from tokenspeed_kernel.ops import attention
+
+        return getattr(attention, name)
+    if name in {
+        "quantize_fp8",
+        "quantize_fp8_with_scale",
+        "quantize_mxfp8",
+        "quantize_nvfp4",
+        "quantize_mxfp4",
+    }:
+        from tokenspeed_kernel.ops.quantization import (
+            quantize_fp8,
+            quantize_fp8_with_scale,
+            quantize_mxfp4,
+            quantize_mxfp8,
+            quantize_nvfp4,
+        )
+
+        return locals()[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

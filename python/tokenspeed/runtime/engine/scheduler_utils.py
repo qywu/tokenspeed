@@ -30,9 +30,7 @@ from tokenspeed_scheduler import (
     ExecutionEvent,
     ForwardEvent,
     PagedCacheGroupConfig,
-    PagedCacheGroupFamily,
     PagedCacheRetention,
-    PrefixCacheAdjunctSpec,
     RequestSpec,
     SchedulerConfig,
 )
@@ -44,10 +42,11 @@ _CACHE_EVENT_TYPES = {
 _TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
 
 
-def make_spec(rid: str, tokens: list[int]) -> RequestSpec:
+def make_spec(rid: str, tokens: list[int], lora_id: int = 0) -> RequestSpec:
     spec = RequestSpec()
     spec.request_id = rid
     spec.tokens = tokens
+    spec.lora_id = lora_id
     return spec
 
 
@@ -71,7 +70,6 @@ def make_config(
     mamba_l2_host_slots: int = 0,
     paged_cache_groups: Sequence["PagedCacheGroupConfig"] | None = None,
     enable_mixed_prefill_decode: bool = False,
-    prefix_cache_adjunct: "PrefixCacheAdjunctSpec | None" = None,
 ) -> SchedulerConfig:
     cfg = SchedulerConfig()
     cfg.num_device_pages = num_device_pages
@@ -103,15 +101,12 @@ def make_config(
     cfg.enable_mixed_prefill_decode = enable_mixed_prefill_decode
     if paged_cache_groups:
         cfg.paged_cache_groups = list(paged_cache_groups)
-    # Opt-in; unset means paged-cache groups are transport-only.
-    if prefix_cache_adjunct is not None:
-        cfg.prefix_cache_adjunct = prefix_cache_adjunct
     return cfg
 
 
 def pool_to_paged_cache_groups(pool: Any) -> list:
     """Convert a KV pool's paged_cache_group_specs to scheduler configs."""
-    specs = pool.paged_cache_group_specs
+    specs = getattr(pool, "paged_cache_group_specs", ())
     if not specs:
         return []
     counts = pool.paged_cache_group_page_counts
@@ -126,41 +121,17 @@ def pool_to_paged_cache_groups(pool: Any) -> list:
                 f"pool_to_paged_cache_groups: unsupported retention "
                 f"{spec.retention!r} for group {spec.group_id!r}"
             )
-        family_str = getattr(spec, "family", "history")
-        if family_str == "history":
-            family = PagedCacheGroupFamily.History
-        elif family_str == "state":
-            family = PagedCacheGroupFamily.State
-        else:
-            raise ValueError(
-                f"pool_to_paged_cache_groups: unsupported family "
-                f"{family_str!r} for group {spec.group_id!r}"
-            )
         kwargs = dict(
             group_id=spec.group_id,
             rows_per_page=int(spec.rows_per_page),
             entry_stride_tokens=int(spec.entry_stride_tokens),
             total_pages=int(counts[spec.group_id]),
             retention=retention,
-            family=family,
         )
         if spec.retention == "sliding_window":
             kwargs["sliding_window_tokens"] = int(spec.sliding_window_tokens)
         out.append(PagedCacheGroupConfig(**kwargs))
     return out
-
-
-def pool_to_prefix_cache_adjunct_spec(
-    required_group_ids: Sequence[str],
-) -> "PrefixCacheAdjunctSpec":
-    """Build a PrefixCacheAdjunctSpec from a non-empty required-group-id list."""
-    if not required_group_ids:
-        raise ValueError(
-            "pool_to_prefix_cache_adjunct_spec: required_group_ids must be non-empty"
-        )
-    spec = PrefixCacheAdjunctSpec()
-    spec.required_groups = [str(gid) for gid in required_group_ids]
-    return spec
 
 
 def make_extend_result_event(request_id: str, tokens: list[int] = ()) -> None:

@@ -81,8 +81,9 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
     Request* request, std::int32_t remaining, std::int32_t decode_input_tokens, bool disable_l2_cache,
     std::map<std::string, std::int32_t>& simulated_free) {
     if (req_pool_allocator_.AvailableSlots() == 0) return {};
-    MatchResult match_result = hybrid_prefix_cache_ ? hybrid_prefix_cache_->Match(request->GetFullPagedTokens(true))
-                                                    : kv_prefix_cache_.Match(request->GetFullPagedTokens(true));
+    MatchResult match_result = hybrid_prefix_cache_
+                                   ? hybrid_prefix_cache_->Match(request->GetFullPagedTokens(true), request->LoraId())
+                                   : kv_prefix_cache_.Match(request->GetFullPagedTokens(true), request->LoraId());
     std::int32_t loadback_tokens = 0;
     std::int32_t unscheduled = 0;
     std::vector<TreeNode*> loadback_diff;
@@ -227,8 +228,9 @@ std::optional<fsm::ScheduleDecodeFromRetractedEvent> Scheduler::scheduleDecodeFr
 
     MatchResult match_result =
         hybrid_prefix_cache_
-            ? hybrid_prefix_cache_->Match(request->GetFullPagedTokens(true), MatchIntent::StateRecovery)
-            : kv_prefix_cache_.Match(request->GetFullPagedTokens(true), MatchIntent::StateRecovery);
+            ? hybrid_prefix_cache_->Match(request->GetFullPagedTokens(true), request->LoraId(),
+                                          MatchIntent::StateRecovery)
+            : kv_prefix_cache_.Match(request->GetFullPagedTokens(true), request->LoraId(), MatchIntent::StateRecovery);
     std::vector<TreeNode*> loadback_diff = match_result.NodesWithout<ResourceType::Device>();
     std::vector<TreeNode*> mamba_loadback_nodes;
     TreeNode* mamba_recovery_node = nullptr;
@@ -321,7 +323,7 @@ std::optional<fsm::ScheduleRetractEvent> Scheduler::scheduleRetract(Request* req
 
     kv_prefix_cache_.Insert<ResourceType::Device>(full_paged_tokens, prefix_pages, std::move(alloc_pages));
 
-    MatchResult match_result = kv_prefix_cache_.Match(full_paged_tokens, MatchIntent::StateRecovery);
+    MatchResult match_result = kv_prefix_cache_.Match(full_paged_tokens, request->LoraId(), MatchIntent::StateRecovery);
 
     std::unique_ptr<HostNodeRef> temp_lock = std::make_unique<HostNodeRef>(match_result.host.last_node);
     const std::int32_t device_matched3 = match_result.device.DepthInPage();

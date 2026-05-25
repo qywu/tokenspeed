@@ -42,8 +42,6 @@ enum class DisaggregationMode {
     kPrefill,
     kDecode,
 };
-// `PagedCacheGroupFamily` and `StateRestorePolicy` are defined in
-// resource/allocator/paged_cache_group.h (transitively included above).
 
 template <ResourceType>
 class NodeRef;
@@ -84,7 +82,6 @@ struct SchedulerConfig {
     } device_allocator;
 
     std::vector<PagedCacheGroupConfig> paged_cache_groups{};
-
     // Unset means paged-cache groups are transport-only.
     std::optional<PrefixCacheAdjunctSpec> prefix_cache_adjunct{};
 

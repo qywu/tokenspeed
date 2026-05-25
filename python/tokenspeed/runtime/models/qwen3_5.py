@@ -713,6 +713,11 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         """Full attention forward pass."""
         qkv, _ = self.qkv_proj(hidden_states)
 
+        # Apply QKV LoRA delta (same as qwen3.py; qkv layout matches the buffer
+        # offsets because q_size_per_tp already accounts for attn_output_gate).
+        if ctx.lora_manager is not None:
+            qkv = ctx.lora_manager.apply_qkv_lora(hidden_states, qkv, self.layer_id)
+
         if self.attn_output_gate:
             q_gate, k, v = qkv.split(
                 [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
@@ -741,6 +746,11 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             sigmoid_mul(attn_output, gate)
 
         output, _ = self.o_proj(attn_output)
+
+        # Apply O-projection LoRA delta.
+        if ctx.lora_manager is not None:
+            output = ctx.lora_manager.apply_o_lora(attn_output, output, self.layer_id)
+
         return output
 
     def forward(
