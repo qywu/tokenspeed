@@ -393,6 +393,8 @@
           the user registers it once, then references it by name on every request.
           The engine handles all GPU/CPU eviction automatically.
         </p>
+
+        <h4 style="margin-top:20px;font-size:15px;color:var(--muted)">Python API</h4>
         <pre><code>from tokenspeed.runtime.entrypoints.engine import Engine
 
 engine = Engine(
@@ -404,12 +406,9 @@ engine = Engine(
 )
 
 # Step 1 — Register the adapter (weights stay on disk until needed).
-# adapter_path points to the safetensors directory on disk.
 engine.load_lora_adapter("my_adapter", adapter_path="/models/my_lora")
 
-# Step 2 — Use the adapter by name. The engine promotes weights from
-# disk → CPU → GPU automatically if not already resident. If the GPU
-# pool is full, the least-recently-used adapter is evicted to CPU/disk.
+# Step 2 — Use the adapter by name in any generate call.
 response = engine.generate(
     prompt="What is the capital of France?",
     sampling_params={"max_new_tokens": 64},
@@ -417,23 +416,59 @@ response = engine.generate(
 )
 
 # Step 3 — Base-model requests need no lora_name.
-# They run at full speed with no LoRA overhead.
 response = engine.generate(
     prompt="Summarise this document.",
     sampling_params={"max_new_tokens": 128},
-    # lora_name omitted → base model
+    # lora_name omitted → base model, zero LoRA overhead
 )
 
 # Step 4 (optional) — Unload frees the GPU slot and evicts the adapter's
 # cached KV pages from the prefix cache. Weights remain on disk.
 engine.unload_lora_adapter("my_adapter")</code></pre>
 
+        <h4 style="margin-top:24px;font-size:15px;color:var(--muted)">HTTP — OpenAI-compatible endpoints</h4>
+        <p style="font-size:14px">
+          The same lifecycle applies over the HTTP API.
+          Register adapters once at server startup (or via a management call),
+          then pass <code>"model"</code> as the adapter name on every request.
+        </p>
+        <pre><code># Register at startup (management endpoint or server flag)
+# --lora-modules my_adapter=/models/my_lora
+
+# /v1/chat/completions  — pass the adapter name in the "model" field
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "my_adapter",
+    "messages": [{"role": "user", "content": "What is the capital of France?"}],
+    "max_tokens": 64
+  }'
+
+# /v1/completions  — same "model" field selects the adapter
+curl http://localhost:8000/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "my_adapter",
+    "prompt": "What is the capital of France?",
+    "max_tokens": 64
+  }'
+
+# Base model — use the original model name (no LoRA overhead)
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen/Qwen3-30B-A3B",
+    "messages": [{"role": "user", "content": "Summarise this document."}],
+    "max_tokens": 128
+  }'</code></pre>
+
         <div class="callout">
           <strong>Assumption:</strong> the adapter directory must exist on disk
-          before calling <code>load_lora_adapter()</code>. The engine records
-          the path at registration time so it can reload weights from disk if
-          CPU pressure evicts them from memory. A name that was never registered
-          will raise an error when used in a request.
+          before the server starts or before calling
+          <code>load_lora_adapter()</code>. The engine records the path at
+          registration time so it can reload weights from disk if CPU pressure
+          evicts them from memory. A name that was never registered will raise
+          an error — it does not fall back to the base model silently.
         </div>
       </section>
 
