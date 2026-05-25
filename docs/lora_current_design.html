@@ -605,7 +605,7 @@ _gpu_lru:       OrderedDict[str, None]     # GPU eviction order</code></pre>
           <li><code>LoraCpuCache.ensure()</code> synchronously loads, parses, and pins weights into the CPU pool when pinned memory is available.</li>
           <li>On each forward step, <code>prepare_loras(lora_ids, token_counts)</code> resolves ids to names and then to GPU slots.</li>
           <li>If an adapter is CPU-resident but not GPU-resident, <code>_ensure_in_gpu()</code> allocates or evicts a slot and calls <code>_load_to_slot()</code>.</li>
-          <li><code>_load_to_slot()</code> resets the target slot, writes rank/scaling metadata, shards on CPU, packs dense buffers, and loads MoE buffers.</li>
+          <li><code>_load_to_slot()</code> clears CPU-side metadata (rank, scalings) for the slot, then copies new weights directly into the GPU buffer slice — overwriting any stale values from the previous occupant without a prior GPU zero.</li>
           <li><code>unload_adapter(name)</code> clears GPU slot state, removes CPU cache state, and deletes id mappings.</li>
         </ol>
 
@@ -921,7 +921,7 @@ replay time:
           <tbody>
             <tr><td><code>python/tokenspeed/runtime/lora/adapter_io.py</code></td><td>Loads adapter weights and normalizes supported formats: dense PEFT keys, 2D per-expert MoE keys, and 3D <code>experts.w1/w2/w3</code> MoE keys.</td></tr>
             <tr><td><code>python/tokenspeed/runtime/lora/lora_cache.py</code></td><td>Pinned CPU adapter cache with durable <code>adapter_path</code> tracking, async prefetch, LRU eviction, and disk fallback.</td></tr>
-            <tr><td><code>python/tokenspeed/runtime/lora/lora_buffers.py</code></td><td>GPU buffer allocation and dense weight packing. Owns TP-aware CPU-side sharding and slot zeroing for dense LoRA tensors.</td></tr>
+            <tr><td><code>python/tokenspeed/runtime/lora/lora_buffers.py</code></td><td>GPU buffer allocation and dense weight packing. Owns TP-aware CPU-side sharding for dense LoRA tensors. GPU weight tensors are overwritten by <code>_load_to_slot</code> on reuse rather than zeroed on eviction.</td></tr>
             <tr><td><code>python/tokenspeed/runtime/lora/lora_batch.py</code></td><td><code>LoraBatchInfo</code>, segment metadata, decode grouping, and CUDA-graph-stable tensors read by dense LoRA kernels.</td></tr>
             <tr><td><code>python/tokenspeed/runtime/lora/moe_lora.py</code></td><td><code>MoeLoraBuffers</code> and <code>MoeLoraContext</code>. Preallocates fixed expert-scoped LoRA pools and exposes the narrow context used by MoE backends.</td></tr>
           </tbody>
@@ -976,11 +976,7 @@ replay time:
           </thead>
           <tbody>
             <tr><td><code>tokenspeed-kernel/python/tokenspeed_kernel/ops/lora/triton/</code></td><td>Triton LoRA operator family: shrink, expand, prefill variants, decode grouping, QKV expand, gate/up expand, tuning helpers, and H100 tuned configs.</td></tr>
-            <tr><td><code>tokenspeed-kernel/python/tokenspeed_kernel/ops/lora/cutedsl.py</code></td><td>Public wrappers for CuTeDSL fast paths used by selected single-slot and batched-slot dense LoRA shapes.</td></tr>
             <tr><td><code>tokenspeed-kernel/python/tokenspeed_kernel/thirdparty/cute_dsl/_provider.py</code></td><td>Provider boundary for optional CuTeDSL availability and import isolation.</td></tr>
-            <tr><td><code>tokenspeed-kernel/python/tokenspeed_kernel/thirdparty/cute_dsl/gemm_add.py</code></td><td>CuTeDSL GEMM-add helper used by dense LoRA expand paths.</td></tr>
-            <tr><td><code>tokenspeed-kernel/python/tokenspeed_kernel/thirdparty/cute_dsl/lora_gemm.py</code></td><td>CuTeDSL LoRA GEMM kernels for shrink/expand-style dense paths.</td></tr>
-            <tr><td><code>tokenspeed-kernel/python/tokenspeed_kernel/thirdparty/cute_dsl/lora_expand_direct.py</code></td><td>Direct expand helper for selected LoRA-B add paths.</td></tr>
             <tr><td><code>tokenspeed-kernel/python/tokenspeed_kernel/thirdparty/cute_dsl/_vendor/</code></td><td>Vendored CuTeDSL support code kept inside <code>tokenspeed-kernel</code>, not imported directly by runtime code.</td></tr>
             <tr><td><code>tokenspeed-kernel/python/tokenspeed_kernel/__init__.py</code></td><td>Exports the kernel package LoRA ops through the existing kernel boundary.</td></tr>
             <tr><td><code>tokenspeed-kernel/python/tokenspeed_kernel/_triton.py</code></td><td>Centralizes direct Triton imports so LoRA ops follow the repository kernel dependency rule.</td></tr>
@@ -998,7 +994,6 @@ replay time:
             <tr><td><code>test/runtime/lora/test_lora_request_naming.py</code></td><td>Request naming contract: <code>lora_name</code> only, unknown names fail, scalar names propagate across batches.</td></tr>
             <tr><td><code>test/runtime/lora/test_moe_lora.py</code></td><td>MoE LoRA buffer/context behavior and routed expert-delta application.</td></tr>
             <tr><td><code>tokenspeed-kernel/test/ops/test_lora_triton.py</code></td><td>Numerical coverage for Triton LoRA kernels.</td></tr>
-            <tr><td><code>tokenspeed-kernel/test/ops/test_lora_cutedsl.py</code></td><td>Numerical coverage for CuTeDSL LoRA fast paths.</td></tr>
             <tr><td><code>benchmark/test_lora_*.py</code></td><td>Dynamic load/unload, mixed adapter batches, eviction latency, and E2E password-adapter checks.</td></tr>
             <tr><td><code>docs/serving/lora.md</code></td><td>User-facing serving guide for adapter loading, request selection, and supported MoE adapter formats.</td></tr>
             <tr><td><code>docs/lora_current_design.html</code></td><td>This current implementation design document.</td></tr>
@@ -1070,7 +1065,7 @@ replay time:
           <tbody>
             <tr>
               <td>2D per-expert PEFT</td>
-              <td><code>experts.&lt;id&gt;.gate_proj</code>, <code>up_proj</code>, <code>down_proj</code></td>
+              <td><code>experts.&lt;id&gt;.gate_proj</code>, <code>experts.&lt;id&gt;.up_proj</code>, <code>experts.&lt;id&gt;.down_proj</code></td>
               <td>Expert id comes from the key. Each expert has independent A/B tensors.</td>
             </tr>
             <tr>
@@ -1111,9 +1106,13 @@ weights_by_layer[layer_id][slot] = {
   "down_B": down_B_buffers[layer_id][slot],
 }</code></pre>
         <p>
-          Slot reset zeros both dense and MoE fixed pools before reuse, so
-          partial MoE adapters cannot inherit expert weights from a previous
-          adapter in the same slot.
+          When a slot is evicted, only CPU-side metadata (rank, scalings) is
+          cleared.  GPU weight tensors are left in place and overwritten by
+          <code>_load_to_slot()</code> when the slot is next assigned.  A
+          kernel can only read a slot that <code>weight_indices</code> points
+          to, and evicted slots are immediately removed from
+          <code>_name_to_slot</code> so they are never assigned — stale GPU
+          values are unreachable.
         </p>
         <p>
           With <code>--lora-moe-compressed-shared-outer</code>, MoE allocation
@@ -1207,23 +1206,61 @@ down_output[t, e] += down_delta[t, e]</code></pre>
           changes.
         </p>
 
-        <h3>Optimization Notes</h3>
+        <h3>Decode Kernel Path</h3>
+        <p>
+          For each format, the decode path avoids all gather copies by reading
+          weight buffers directly via <code>slot_idx</code>:
+        </p>
         <table>
           <thead>
-            <tr><th>Idea from the research note</th><th>TokenSpeed status</th></tr>
+            <tr><th>Format</th><th>Gate/up path</th><th>Down path</th></tr>
           </thead>
           <tbody>
             <tr>
-              <td>Compute shared gate/up A once per token, then reuse it for every routed expert.</td>
-              <td>Storage supports this shape, but the current apply path still evaluates per routed pair. A future fused kernel can exploit the shared side directly.</td>
+              <td><strong>sglang_shared_outer</strong></td>
+              <td>
+                <code>shared_a_shrink(hidden, A_buf)</code> → <code>lora_a_m</code> (one per token, reused for all experts) →
+                <code>gate_up_b_expand(lora_a_m, B_buf)</code><br>
+                <em>Multi-stream:</em> <code>shared_a_shrink</code> runs on a secondary CUDA stream
+                concurrently with the base MoE gate/up GEMM; result ready before expand step.
+              </td>
+              <td>
+                <code>per_expert_a_shrink(ri_flat, A_buf)</code> →
+                <code>shared_b_down_expand(lora_a_flat, B_buf)</code>
+              </td>
             </tr>
             <tr>
-              <td>For shared down B, combine weighted low-rank intermediates first, then apply one shared B projection.</td>
-              <td>The current implementation applies the down delta per route and weights it before accumulation. This is correct and leaves the fused shared-B reduction as a kernel optimization.</td>
+              <td><strong>per_expert</strong></td>
+              <td>
+                <code>per_expert_a_shrink(hidden×topk, A_buf)</code> → <code>lora_a_flat</code> →
+                <code>per_expert_gate_up_b_expand(lora_a_flat, B_buf)</code><br>
+                Avoids 32 MB + 16 MB buffer gather copies that plagued the old path.
+              </td>
+              <td>
+                <code>per_expert_a_shrink(ri_flat, A_buf)</code> →
+                <code>per_expert_b_down_expand(lora_a_flat, B_buf)</code>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>Remaining Optimization Opportunities</h3>
+        <table>
+          <thead>
+            <tr><th>Opportunity</th><th>Status</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Fuse A-shrink + B-expand into a single kernel per path.</td>
+              <td>Benchmarked: neutral at BS=8 (kernel launch saved but occupancy drops to 0.5 blocks/SM on 132-SM H100). Becomes beneficial at BS≥32.</td>
             </tr>
             <tr>
-              <td>Group work by <code>(adapter slot, expert id)</code> for better locality.</td>
-              <td>Dense LoRA already groups by adapter for some paths. MoE LoRA currently keeps a narrow context API so backends can add this grouping without changing manager ownership.</td>
+              <td>Multi-stream prefetch for per_expert path (overlap A-shrink with base GEMM).</td>
+              <td>Not yet done. For per_expert, the base GEMMs complete in ~5-8 µs — shorter than the ~30 µs shrink kernel — so overlap savings are limited.</td>
+            </tr>
+            <tr>
+              <td>FP8 quantisation of LoRA weights to halve bandwidth.</td>
+              <td>Not implemented. Would give ~2× speedup for the bandwidth-bound scatter GEMVs.</td>
             </tr>
           </tbody>
         </table>
