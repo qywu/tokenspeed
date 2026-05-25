@@ -50,6 +50,7 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.execution.runtime_states import RuntimeStates
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
     from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
+    from tokenspeed.runtime.lora.lora_manager import LoraManager
     from tokenspeed.runtime.sampling.backends.base import SamplingBackend
 
 logger = get_colorful_logger(__name__)
@@ -194,6 +195,7 @@ class CudaGraphWrapper:
         eager_grammar_buffers=None,
         sampling_backend: SamplingBackend | None = None,
         runtime_states: RuntimeStates | None = None,
+        lora_manager: LoraManager | None = None,
     ):
         self.config = config
         self.attn_backend = attn_backend
@@ -206,6 +208,7 @@ class CudaGraphWrapper:
         self.capturable_grammar = capturable_grammar
         self.eager_grammar_buffers = eager_grammar_buffers
         self.runtime_states = runtime_states
+        self.lora_manager = lora_manager
         self.enable_torch_compile = getattr(config, "enable_torch_compile", False)
         self.disable_padding = config.disable_cuda_graph_padding
         self.enable_cudagraph_gc = getattr(config, "enable_cudagraph_gc", True)
@@ -255,6 +258,12 @@ class CudaGraphWrapper:
 
         self.graphs: dict[int, torch.cuda.CUDAGraph] = {}
         self.output_buffers: dict[int, tuple] = {}
+        # Per-bs no-LoRA variant.  Populated only when ``lora_manager`` is
+        # configured: a second captured graph that omits the LoRA Triton
+        # kernels entirely, replayed when ``LoraManager.has_active_lora``
+        # is False so base-model decode pays no LoRA overhead at all.
+        self.graphs_no_lora: dict[int, torch.cuda.CUDAGraph] = {}
+        self.output_buffers_no_lora: dict[int, tuple] = {}
 
         self._forward_func: Callable | None = forward_func
         self.disable = config.enforce_eager
@@ -270,15 +279,26 @@ class CudaGraphWrapper:
         """
         Capture CUDA graphs for all configured batch sizes.
 
+        When a ``lora_manager`` is attached, captures TWO graphs per batch
+        size: a with-LoRA graph (records the segmented-GEMM Triton kernels
+        and feeds them with the manager's persistent batch_info) and a
+        no-LoRA graph (omits those kernels entirely).  Replay picks the
+        no-LoRA variant when ``has_active_lora`` is False.
+
         Args:
             forward_func: ModelExecutor.forward_step(bs, ctx, sampling_info).
         """
         rank = self.global_rank
+        capture_no_lora_too = self.lora_manager is not None
         with freeze_gc(self.enable_cudagraph_gc):
             self.stream = torch.cuda.Stream()
             capture_range = tqdm.tqdm(self.capture_bs) if rank == 0 else self.capture_bs
             if rank == 0:
-                logger.info("Capturing batches: %s", self.capture_bs)
+                logger.info(
+                    "Capturing batches: %s%s",
+                    self.capture_bs,
+                    " (×2: with-LoRA + no-LoRA)" if capture_no_lora_too else "",
+                )
             for bs in capture_range:
                 if rank == 0:
                     avail_mem = get_available_gpu_memory(
@@ -287,11 +307,15 @@ class CudaGraphWrapper:
                     capture_range.set_description(
                         f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
                     )
-                graph, output_buffers = self._capture_one(bs)
+                graph, output_buffers = self._capture_one(bs, attach_lora=True)
                 self.graphs[bs] = graph
                 self.output_buffers[bs] = output_buffers
+                if capture_no_lora_too:
+                    graph_nl, output_nl = self._capture_one(bs, attach_lora=False)
+                    self.graphs_no_lora[bs] = graph_nl
+                    self.output_buffers_no_lora[bs] = output_nl
 
-    def _capture_one(self, bs: int):
+    def _capture_one(self, bs: int, attach_lora: bool = True):
         graph = torch.cuda.CUDAGraph()
 
         ctx = ForwardContext(
@@ -314,6 +338,44 @@ class CudaGraphWrapper:
         if self.dp_size > 1:
             ctx.global_num_tokens = [bs * self.max_tokens_per_req] * self.world_size
 
+        # Bind LoRA only for the with-LoRA variant.  When ``attach_lora``
+        # is False we capture a parallel graph that omits the LoRA Triton
+        # kernels entirely (qwen3's ``if ctx.lora_manager is not None``
+        # branch falls through), used at replay when no request in the
+        # batch has an active adapter.
+        if attach_lora and self.lora_manager is not None:
+            ctx.lora_manager = self.lora_manager
+            # Pre-fill batch_info so the captured kernels see a stable
+            # set of pointers; runtime updates the same tensors before
+            # each ``graph.replay()`` and the kernels re-read seg_lens /
+            # weight_indices / lora_ranks.
+            #
+            # Use lora_id=0 (base model) which resolves to NO_LORA_SLOT, BUT
+            # force has_active_lora=True so LoRA kernels ARE captured in the
+            # graph.  With dynamic GPU-tensor weight indexing (w13_A_buffers
+            # etc.) the captured kernels read weight_indices at replay time,
+            # so the correct adapter slot is used regardless of what was set
+            # during capture.  Slot 0 weights are all-zero at capture time
+            # (no adapter loaded yet), so the model output is unaffected.
+            self.lora_manager.prepare_loras(
+                [0] * bs, per_request_token_counts=self.max_tokens_per_req
+            )
+            # Force has_active_lora and single_lora_slot so ALL LoRA kernels
+            # (MoE, attention, MLP) are included in the captured graph.
+            # This applies to any enabled LoRA type — without this, kernels that
+            # check has_active_lora (e.g. apply_qkv_lora) return early during
+            # capture, recording a no-op that is then replayed at every decode step.
+            if (
+                self.lora_manager.enable_moe_lora
+                or self.lora_manager.enable_attn_lora
+                or self.lora_manager.enable_mlp_lora
+            ):
+                self.lora_manager.has_active_lora = True
+                bi = self.lora_manager._batch_info
+                bi.single_lora_slot = 0
+                bi.single_lora_rank = self.lora_manager.max_lora_rank
+                bi.weight_indices[:bs].fill_(0)
+
         # Capture with is_all_greedy=False so the graph records the full
         # top_k_top_p_sampling path (greedy-only requests are served by the
         # same path with top_k=1 in the buffer, which effectively argmaxes).
@@ -332,6 +394,7 @@ class CudaGraphWrapper:
             device=self.device,
         )
 
+        from tokenspeed.runtime.execution.context import bind_forward_context
         from tokenspeed.runtime.grammar.capturable_grammar import (
             bind_grammar_mask_buf,
         )
@@ -359,7 +422,8 @@ class CudaGraphWrapper:
                 self.capturable_grammar.add_batch(
                     grammars=[None] * bs, bs=bs, has_candidates=False
                 )
-            return self._forward_func(bs=bs, ctx=ctx, sampling_info=sampling_info)
+            with bind_forward_context(ctx):
+                return self._forward_func(bs=bs, ctx=ctx, sampling_info=sampling_info)
 
         # Warm up before capture.
         for _ in range(4):
@@ -790,12 +854,25 @@ class CudaGraphWrapper:
             # the per-request generators with the capture-stub generator.
             self.deepep_adapter.replay()
 
-            with nvtx_range("graph_replay", color="red"):
-                self.graphs[padded_bs].replay()
+            # Pick the no-LoRA variant when --enable-lora is on but no
+            # request in this batch uses an adapter — that graph omits the
+            # per-layer Triton LoRA kernels entirely.
+            use_no_lora_variant = (
+                self.lora_manager is not None
+                and not self.lora_manager.has_active_lora
+                and padded_bs in self.graphs_no_lora
+            )
+            if use_no_lora_variant:
+                graph = self.graphs_no_lora[padded_bs]
+                output_buffers = self.output_buffers_no_lora[padded_bs]
+            else:
+                graph = self.graphs[padded_bs]
+                output_buffers = self.output_buffers[padded_bs]
 
-            output_tokens, output_lengths, output_logprobs = self.output_buffers[
-                padded_bs
-            ]
+            with nvtx_range("graph_replay", color="red"):
+                graph.replay()
+
+            output_tokens, output_lengths, output_logprobs = output_buffers
 
             result = (
                 output_tokens[: bs * self.max_tokens_per_req],
@@ -839,7 +916,10 @@ class CudaGraphWrapper:
                 **mamba_kwargs,
             )
 
-            result = self._forward_func(bs=bs, ctx=ctx, sampling_info=sampling_info)
+            from tokenspeed.runtime.execution.context import bind_forward_context
+
+            with bind_forward_context(ctx):
+                result = self._forward_func(bs=bs, ctx=ctx, sampling_info=sampling_info)
 
         # Update mamba/GDN state after speculative verify
         if (

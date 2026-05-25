@@ -50,8 +50,9 @@ public:
     HybridPrefixCache(KVPrefixCache& prefix_cache, MambaChunkAllocator* allocator, std::int32_t mamba_cache_chunk_size,
                       MambaHostAllocator* mamba_host_allocator = nullptr);
 
-    MatchResult Match(const token_vec_t& token_ids, MatchIntent intent = MatchIntent::PrefixReuse);
-    MatchResult Match(const std::vector<std::span<const std::int32_t>>& token_pages,
+    MatchResult Match(const token_vec_t& token_ids, std::int32_t lora_id = kLoraNone,
+                      MatchIntent intent = MatchIntent::PrefixReuse);
+    MatchResult Match(const std::vector<std::span<const std::int32_t>>& token_pages, std::int32_t lora_id = kLoraNone,
                       MatchIntent intent = MatchIntent::PrefixReuse);
 
     bool EnsureMambaCapacityByEvict(std::int32_t num_slots, TreeNode* protected_node = nullptr);

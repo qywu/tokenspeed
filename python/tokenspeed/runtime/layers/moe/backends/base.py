@@ -96,6 +96,10 @@ class MoEBackend(ABC):
         return False
 
     @property
+    def supports_moe_lora(self) -> bool:
+        return False
+
+    @property
     def topk_output_format(self) -> TopKOutputFormat:
         return TopKOutputFormat.STANDARD
 

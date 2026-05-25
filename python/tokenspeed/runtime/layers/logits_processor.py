@@ -28,7 +28,10 @@ import triton.language as tl
 from torch import nn
 
 from tokenspeed.runtime.distributed.comm_ops import all_gather_into_tensor
-from tokenspeed.runtime.execution.context import ForwardContext
+from tokenspeed.runtime.execution.context import (
+    ForwardContext,
+    get_current_lora_manager,
+)
 from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
@@ -395,6 +398,10 @@ class LogitsProcessor(nn.Module):
 
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
+
+        lora_manager = get_current_lora_manager()
+        if lora_manager is not None and lora_manager.enable_head_lora:
+            logits = lora_manager.apply_lm_head_lora(hidden_states, logits)
 
         if self.tp_size > 1 and not self.skip_all_gather:
             gathered_logits = torch.empty(
