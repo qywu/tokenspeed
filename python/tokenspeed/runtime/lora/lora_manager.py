@@ -480,6 +480,21 @@ class LoraManager:
     def get_id(self, name: str) -> int | None:
         return self._name_to_id.get(name)
 
+    def flush_pending_evictions(self) -> None:
+        """Evict all deferred adapter weights immediately, regardless of active state.
+
+        Call this when the server is idle (no in-flight requests) to reclaim GPU
+        slots that were deferred by unload_adapter() calls during active decodes.
+        It is safe to call at any time; if called mid-decode the behaviour is the
+        same as the original unload_adapter (slot zeroed while in-flight), so
+        only call this when you are certain no requests are running.
+        """
+        for name in list(self._pending_eviction):
+            logger.info("Flushing deferred eviction for adapter '%s'.", name)
+            self._evict_by_name(name)
+            self._cpu_store.remove(name)
+            self._pending_eviction.discard(name)
+
     def prepare_loras(
         self,
         lora_ids: list[int],
