@@ -307,6 +307,7 @@
         <a href="#scheduler-namespace">Prefix Cache Namespace</a>
         <a href="#scheduler-flow">Request Flow</a>
         <a href="#scheduler-eviction">Eviction on Unload</a>
+        <a href="#scheduler-gaps">Open Gaps</a>
       </div>
     </nav>
 
@@ -1213,7 +1214,128 @@ lora_virtual_roots_[lora_id] = raw_ptr;</code></pre>
           identically for LoRA subtrees and base-model subtrees.
         </div>
       </section>
-    
+
+      <section id="scheduler-gaps">
+        <h2>Open Gaps</h2>
+        <p>
+          The current scheduler changes cover only KV prefix cache namespace
+          isolation and cleanup. Several LoRA-aware scheduling improvements are
+          not yet implemented.
+        </p>
+
+        <h3>1 — No adapter-aware co-scheduling</h3>
+        <p>
+          <code>newForwardOperation()</code> sorts candidates by FSM state
+          priority (decode &gt; prefill &gt; retracted) but ignores
+          <code>lora_id</code>. When requests for many different adapters arrive
+          simultaneously and the GPU pool holds fewer adapters than the mix
+          requires, the scheduler does not try to group requests by adapter to
+          minimise slot thrashing.
+        </p>
+        <p>
+          Each step Python's <code>prepare_loras()</code> promotes whatever
+          adapters the current batch needs — potentially evicting an adapter that
+          was just promoted in the previous step. A co-scheduling policy that
+          packs requests for the same adapter into the same batch step would
+          reduce this churn. This is what the Python-level <em>pack scheduling</em>
+          policy partially addresses, but doing it inside the C++ scheduler with
+          full visibility into KV cache state and page pressure would be more
+          effective.
+        </p>
+        <div class="callout">
+          <strong>Where to fix:</strong> add a secondary sort key on
+          <code>lora_id</code> inside <code>newForwardOperation()</code>, or a
+          greedy "fill one adapter slot at a time" batching strategy.
+        </div>
+
+        <h3>2 — GPU weight slot not validated at schedule time</h3>
+        <p>
+          The scheduler builds a batch without knowing whether the required
+          adapter weights are currently on GPU.
+          <code>prepare_loras()</code> is called <em>after</em> the batch is
+          built (in <code>model_executor.py</code>). If promotion fails — for
+          example, when all GPU slots are occupied by non-evictable adapters —
+          the error surfaces at forward time rather than at schedule time where
+          the scheduler could have deferred the request.
+        </p>
+        <div class="callout">
+          <strong>Where to fix:</strong> expose a
+          <code>lora_slot_available(lora_id)</code> query from the Python
+          <code>LoraManager</code> to the scheduler so it can defer requests
+          whose adapter slot cannot be promoted, instead of letting them fail
+          mid-batch.
+        </div>
+
+        <h3>3 — No per-adapter KV page accounting</h3>
+        <p>
+          KV page eviction is global LRU across all adapters and the base model.
+          A frequently-used adapter can lose its cached prefix pages to a
+          one-shot base-model request, forcing full recomputation on the next
+          step. The simulated-free admission tracking that exists for
+          paged-cache groups operates per <em>group</em>, not per
+          <em>adapter</em>.
+        </p>
+        <div class="callout">
+          <strong>Where to fix:</strong> add an adapter-priority weight to the
+          LRU eviction comparator, or a minimum-pages reservation per active
+          adapter slot.
+        </div>
+
+        <h3>4 — No KV prefix warming signal</h3>
+        <p>
+          The scheduler can issue a <code>PrefetchOperation</code> to move KV
+          pages from host to device before a request runs. But there is no
+          mechanism to trigger <em>adapter-level</em> prefix warming — i.e.,
+          pre-populating the KV prefix cache for an adapter's common system
+          prompts before any request for that adapter is scheduled. The warming
+          would need to be driven externally (e.g., a dedicated warmup request
+          at adapter load time).
+        </p>
+
+        <h3>5 — KV eviction does not distinguish active from idle adapters</h3>
+        <p>
+          When an adapter is loaded but has no in-flight requests, its KV prefix
+          pages compete on equal terms with actively-serving adapters in the LRU
+          order. There is no "pinning" signal to protect an adapter's prefix
+          cache during a burst gap. The existing virtual-root mechanism makes
+          eviction <em>safe</em> (pages are always returned correctly) but not
+          <em>smart</em>.
+        </p>
+
+        <table style="margin-top:24px">
+          <thead>
+            <tr><th>Gap</th><th>Impact</th><th>Difficulty</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Adapter-aware co-scheduling</td>
+              <td class="warn">High — reduces GPU slot thrashing at small <code>max_loras</code></td>
+              <td>Medium — secondary sort key or greedy batching pass</td>
+            </tr>
+            <tr>
+              <td>Slot validation at schedule time</td>
+              <td class="warn">Medium — prevents mid-batch promotion failures</td>
+              <td>Low — expose a boolean query from Python to C++ scheduler</td>
+            </tr>
+            <tr>
+              <td>Per-adapter KV page accounting</td>
+              <td>Medium — avoids prefix cache churn for hot adapters</td>
+              <td>Medium — LRU comparator change or per-adapter reservation</td>
+            </tr>
+            <tr>
+              <td>KV prefix warming signal</td>
+              <td>Low — nice-to-have for cold-start latency</td>
+              <td>Low — warmup request at adapter load time</td>
+            </tr>
+            <tr>
+              <td>Active vs idle adapter KV pinning</td>
+              <td>Low — only matters in bursty multi-adapter workloads</td>
+              <td>Medium — LRU priority weight per adapter activity</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
     </main>
   </div>
 </body>
