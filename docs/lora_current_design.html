@@ -970,86 +970,89 @@ down_output[t, e] += down_delta[t, e]</code></pre>
         <h2>Prefix Cache Namespace</h2>
         <p>
           Without LoRA namespacing, two adapters sharing the same prompt prefix
-          would incorrectly reuse each other's cached KV pages — producing wrong
-          outputs. The change threads <code>lora_id</code> through every prefix-cache
-          path so each adapter owns a separate virtual root in the radix tree.
-        </p>
-        <p>
-          Concretely, the radix tree is unchanged. Instead, the lookup and insert
-          operations accept a <code>lora_id</code> argument. Inside
-          <code>KVPrefixCache</code>, a <code>lora_virtual_roots_</code> map
-          stores one synthetic root node per adapter id. A prefix lookup for
-          adapter <em>A</em> starts from <em>A</em>'s virtual root, so it can
-          never match tokens cached under adapter <em>B</em> or the base model.
+          would reuse each other's KV pages — producing wrong outputs. The
+          solution embeds a <strong>sentinel-key virtual root</strong> for each
+          adapter directly inside the shared radix tree. No separate tree or
+          separate allocator is needed.
         </p>
 
-        <div class="flow" style="margin-top:24px">
-          <div class="flow-row">
-            <div class="node" style="background:var(--panel-2)">
-              <strong>Radix tree root</strong><br>
-              <small>(base model, <code>lora_id = -1</code>)</small>
-            </div>
-            <div class="node" style="background:#eff6ff">
-              <strong>Virtual root A</strong><br>
-              <small>adapter <code>lora_id = 1</code></small>
-            </div>
-            <div class="node" style="background:#f0fdf4">
-              <strong>Virtual root B</strong><br>
-              <small>adapter <code>lora_id = 2</code></small>
-            </div>
-          </div>
-          <div class="flow-row" style="font-size:13px;color:var(--muted);margin-top:6px;grid-template-columns:1fr 1fr 1fr">
-            <div style="text-align:center">shared prompt tokens<br>cached under base root</div>
-            <div style="text-align:center">same tokens cached again<br>under adapter A's root</div>
-            <div style="text-align:center">same tokens cached again<br>under adapter B's root</div>
-          </div>
-        </div>
-        <p style="margin-top:16px;font-size:14px;color:var(--muted)">
-          Each virtual root is a normal <code>TreeNode</code> inserted as a child
-          of the real root using a token key derived from the adapter id
-          (a large negative integer outside the real vocabulary range). The
-          standard LRU eviction, mamba-adjunct, and paged-cache machinery all
-          operate transparently on any subtree regardless of whether it belongs to
-          an adapter or the base model.
+        <h3>Virtual Root Structure</h3>
+        <p>
+          <code>KVPrefixCache</code> holds a map
+          <code>lora_virtual_roots_: unordered_map&lt;int32_t, TreeNode*&gt;</code>.
+          When adapter <em>A</em> first inserts tokens, <code>getOrCreateLoraRoot(lora_id)</code>
+          creates a new <code>TreeNode</code> as a child of the real tree root,
+          keyed by a <strong>sentinel token vector</strong>
+          <code>[-lora_id, 0, 0, …]</code> of length <code>page_size</code>.
+          Because vocabulary tokens are always non-negative, a negative first
+          token can never collide with real content.
+        </p>
+        <p>
+          The virtual root is given an empty <code>DeviceResource</code> so LRU
+          eviction never prunes it while the adapter is loaded. All of the
+          adapter's KV pages live in the subtree below this node — completely
+          disjoint from the base-model subtree and every other adapter.
+        </p>
+
+        <pre><code>// getOrCreateLoraRoot (kv_prefix_cache.cpp)
+token_vec_t sentinel(page_size_, 0);
+sentinel[0] = -lora_id;               // unique negative key per adapter
+auto node = std::make_unique&lt;TreeNode&gt;(sentinel);
+node-&gt;AttachResource(make_device_resource(...));  // pin against LRU prune
+tree_.Root()-&gt;AddChild(sentinel, std::move(node));
+lora_virtual_roots_[lora_id] = raw_ptr;</code></pre>
+
+        <h3>Match: namespace-scoped lookup</h3>
+        <p>
+          <code>Match(token_ids, lora_id)</code> calls
+          <code>resolveStartNode(lora_id)</code> which returns the adapter's
+          virtual root (or <code>nullptr</code> for the base model).
+          <code>WalkDownUntilMismatch()</code> then walks from that start node,
+          so a hit can only return pages that were inserted under this adapter.
+        </p>
+        <p>
+          The matched depth is adjusted by <code>namespace_depth_offset = 1</code>
+          to subtract the sentinel page, so callers see the depth as if the
+          virtual root doesn't exist.
+        </p>
+
+        <h3>Insert: pages land in the right subtree</h3>
+        <p>
+          <code>Insert(token_ids, …, lora_id)</code> likewise calls
+          <code>resolveStartNode(lora_id)</code> before walking.
+          New nodes and their KV pages are attached only within the adapter's
+          subtree. The base model and other adapters are never touched.
         </p>
 
         <table style="margin-top:20px">
           <thead>
-            <tr><th>Change</th><th>File</th><th>Detail</th></tr>
+            <tr><th>What changed</th><th>File</th><th>How</th></tr>
           </thead>
           <tbody>
             <tr>
-              <td><code>lora_id</code> field on <code>Request</code></td>
-              <td><code>scheduler/request.h</code></td>
-              <td>Stored at request creation; persists through the FSM lifecycle.</td>
+              <td><code>lora_id</code> on <code>Request</code> + FSM event</td>
+              <td><code>request.h</code>, <code>forward_states.h</code></td>
+              <td>Field added; persists from admission through every prefill/decode event.</td>
             </tr>
             <tr>
-              <td><code>lora_id_</code> in FSM state</td>
-              <td><code>fsm/forward_states.h</code></td>
-              <td>Carried into each prefill/decode event so the cache path can read it.</td>
+              <td><code>Match(tokens, lora_id, intent)</code></td>
+              <td><code>kv_prefix_cache.h/cpp</code>, <code>hybrid_prefix_cache.h/cpp</code></td>
+              <td>New parameter; <code>resolveStartNode()</code> picks the adapter's virtual root before walking.</td>
             </tr>
             <tr>
-              <td><code>KVPrefixCache::Match(tokens, lora_id)</code></td>
-              <td><code>kv_prefix_cache.h</code></td>
-              <td>Resolves the virtual root for <code>lora_id</code>, then walks the
-              subtree exactly as it would for the base model.</td>
-            </tr>
-            <tr>
-              <td><code>KVPrefixCache::Insert(…, lora_id)</code></td>
-              <td><code>kv_prefix_cache.h</code></td>
-              <td>Creates the virtual root on first insert; subsequent inserts extend the subtree.</td>
+              <td><code>Insert(…, lora_id)</code></td>
+              <td><code>kv_prefix_cache.h/cpp</code></td>
+              <td>New parameter; creates virtual root on first call, branches within it on subsequent calls.</td>
             </tr>
             <tr>
               <td><code>InsertHybridCache(…, lora_id)</code></td>
               <td><code>fsm/forward_events.cpp</code></td>
-              <td>Called at the end of prefill/decode; propagates <code>lora_id</code>
-              down to the insert path.</td>
+              <td>Propagates <code>lora_id_</code> from the FSM event into every cache insert at end of prefill/decode.</td>
             </tr>
             <tr>
-              <td><code>HybridPrefixCache::Match(tokens, lora_id, intent)</code></td>
-              <td><code>hybrid_prefix_cache.h</code></td>
-              <td>Wraps <code>KVPrefixCache::Match</code>; adds Mamba/paged-cache
-              augmentation on top of the namespaced result.</td>
+              <td><code>lora_virtual_roots_</code></td>
+              <td><code>kv_prefix_cache.h</code></td>
+              <td>New <code>unordered_map&lt;int32_t, TreeNode*&gt;</code>; one entry per loaded adapter.</td>
             </tr>
           </tbody>
         </table>
@@ -1058,60 +1061,108 @@ down_output[t, e] += down_delta[t, e]</code></pre>
       <section id="scheduler-flow">
         <h2>Request Flow</h2>
         <p>
-          The diagram below traces how <code>lora_id</code> flows from an HTTP
-          request through the scheduler FSM into the prefix cache on every
-          prefill and decode step.
+          The diagram traces <code>lora_id</code> from the HTTP layer through the
+          C++ scheduler FSM into the KV prefix cache on every prefill and decode step.
         </p>
         <div class="flow">
           <div class="flow-row">
-            <div class="node"><strong>HTTP request</strong><small><code>lora_name</code> header</small></div>
-            <div class="node green"><strong>Python engine</strong><small>Resolves name → <code>lora_id</code> via <code>LoraManager</code></small></div>
+            <div class="node">
+              <strong>HTTP / Python engine</strong>
+              <small><code>lora_name</code> → integer <code>lora_id</code> via <code>LoraManager</code></small>
+            </div>
+            <div class="node green">
+              <strong><code>RequestSpec.lora_id</code></strong>
+              <small>Sent to C++ scheduler; stored in <code>Request.lora_id_</code> for the entire FSM lifetime.</small>
+            </div>
           </div>
           <div class="flow-row">
-            <div class="node"><strong><code>RequestSpec</code></strong><small>carries <code>lora_id</code></small></div>
-            <div class="node green"><strong>C++ Scheduler</strong><small><code>Request</code> object stores <code>lora_id_</code> for FSM lifetime</small></div>
+            <div class="node">
+              <strong>Scheduler: <code>schedulePrefillFirstChunk()</code></strong>
+              <small>FSM calls <code>Match(full_paged_tokens, lora_id_)</code></small>
+            </div>
+            <div class="node green">
+              <strong><code>resolveStartNode(lora_id)</code></strong>
+              <small>Returns adapter's virtual root; walk confined to its subtree. Depth adjusted by <code>namespace_depth_offset=1</code>.</small>
+            </div>
           </div>
           <div class="flow-row">
-            <div class="node"><strong>Prefill / Decode step</strong><small>FSM emits forward event</small></div>
-            <div class="node green"><strong><code>SchedulePrefillFirstChunkEvent</code></strong><small><code>lora_id_</code> embedded in event; drives both Match and Insert</small></div>
+            <div class="node">
+              <strong>GPU forward pass</strong>
+              <small>KV pages computed for unmatched suffix</small>
+            </div>
+            <div class="node green">
+              <strong><code>InsertHybridCache(…, lora_id_)</code></strong>
+              <small>New pages inserted under adapter's virtual root. Sentinel key ensures no cross-adapter aliasing.</small>
+            </div>
           </div>
           <div class="flow-row">
-            <div class="node"><strong>Prefix lookup</strong><small>find cached KV pages</small></div>
-            <div class="node green"><strong><code>Match(tokens, lora_id)</code></strong><small>Returns hit depth from adapter's own radix subtree only</small></div>
+            <div class="node">
+              <strong>Decode steps</strong>
+              <small>Same flow per step</small>
+            </div>
+            <div class="node green">
+              <strong>Match → GPU → Insert</strong>
+              <small><code>lora_id_</code> from the decode FSM event gates every cache operation identically.</small>
+            </div>
           </div>
-          <div class="flow-row">
-            <div class="node"><strong>New pages computed</strong><small>GPU forward pass</small></div>
-            <div class="node green"><strong><code>InsertHybridCache(…, lora_id)</code></strong><small>New KV pages inserted under adapter's virtual root</small></div>
-          </div>
+        </div>
+
+        <div class="callout" style="margin-top:16px">
+          <strong>Base model requests</strong> pass <code>lora_id = kLoraNone = 0</code>.
+          <code>resolveStartNode(0)</code> returns <code>nullptr</code>, so the walk
+          starts at the real tree root — exactly the pre-LoRA behaviour. No overhead
+          for non-LoRA batches.
         </div>
       </section>
 
       <section id="scheduler-eviction">
         <h2>Eviction on Unload</h2>
         <p>
-          When an adapter is unloaded (<code>LoraManager.unload_adapter()</code>
-          on the Python side), the scheduler is instructed to prune the adapter's
-          entire radix subtree and return its KV pages to the allocator.
+          When Python calls <code>LoraManager.unload_adapter(name)</code>, it
+          sends an <code>EvictLoraNamespace(lora_id)</code> command to the C++
+          scheduler, which atomically prunes the adapter's entire radix subtree
+          and frees all its KV pages.
         </p>
-        <div class="flow">
-          <div class="flow-row">
-            <div class="node"><strong>Python</strong><small><code>LoraManager.unload_adapter(name)</code></small></div>
-            <div class="node green"><strong>Sends <code>EvictLoraNamespace(lora_id)</code></strong><small>via scheduler control client</small></div>
-          </div>
-          <div class="flow-row">
-            <div class="node"><strong>C++ Scheduler</strong><small>receives eviction command</small></div>
-            <div class="node green"><strong><code>KVPrefixCache::EvictLoraNamespace(lora_id)</code></strong><small>Walks the virtual root subtree, triggers LRU eviction on every node</small></div>
-          </div>
-          <div class="flow-row">
-            <div class="node"><strong>Radix tree</strong><small>virtual root removed</small></div>
-            <div class="node green"><strong>KV pages returned to allocator</strong><small>Normal LRU callbacks fire; device pages freed immediately</small></div>
-          </div>
+
+        <h3>Steps inside <code>KVPrefixCache::EvictLoraNamespace(lora_id)</code></h3>
+        <ol>
+          <li>
+            <strong>Find virtual root</strong> — look up
+            <code>lora_virtual_roots_[lora_id]</code>.
+            If missing or already pruned, return immediately (idempotent).
+          </li>
+          <li>
+            <strong>Collect descendants</strong> — DFS over the subtree to build a
+            flat list of all <code>TreeNode*</code> children (excluding the virtual
+            root itself, which is removed last).
+          </li>
+          <li>
+            <strong>Evict device and host pages</strong> —
+            <code>device_.EvictSubtree(descendants)</code> and
+            <code>host_.EvictSubtree(descendants)</code> trigger the normal LRU
+            eviction callbacks on each node. This fires Mamba slot release,
+            paged-cache snapshot detach, and KV page deallocation — the same path
+            as ordinary LRU pressure.
+          </li>
+          <li>
+            <strong>Remove virtual root from the real tree</strong> —
+            <code>tree_.Root()->RemoveChild(sentinel)</code> transfers the unique_ptr
+            out. The cascade destructor destroys every remaining node and attached
+            resource in the subtree.
+          </li>
+          <li>
+            <strong>Erase from map</strong> —
+            <code>lora_virtual_roots_.erase(lora_id)</code>. The adapter's namespace
+            is now completely gone.
+          </li>
+        </ol>
+
+        <div class="callout">
+          No adapter-specific eviction logic is needed. The virtual root is a
+          normal <code>TreeNode</code> so all existing eviction machinery —
+          LRU ordering, mamba L2 writeback, paged-cache snapshot detach — runs
+          identically for LoRA subtrees and base-model subtrees.
         </div>
-        <p style="font-size:14px;color:var(--muted);margin-top:12px">
-          The virtual root node itself is a regular <code>TreeNode</code>, so
-          standard eviction logic (host writeback, mamba slot release, paged-cache
-          snapshot detach) runs without any adapter-specific special cases.
-        </p>
       </section>
     
     </main>
