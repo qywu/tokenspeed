@@ -466,7 +466,39 @@ class LoraManager:
         against the same pointers.
         """
         bs = len(lora_ids)
-        # Resolve names → slots; LRU bookkeeping.
+
+        # Phase 1: resolve all unique adapters and promote them to GPU before
+        # assigning any per-request slots.  A single-pass approach would silently
+        # produce wrong outputs: if the batch needs more adapters than max_loras,
+        # _find_free_slot evicts an already-assigned adapter (e.g. A), then the
+        # later request for A gets NO_LORA_SLOT and runs as the base model.
+        unique_names: dict[int, str] = {}
+        for lid in lora_ids:
+            if lid == 0 or lid in unique_names:
+                continue
+            name = self._id_to_name.get(lid)
+            if name is not None:
+                unique_names[lid] = name
+
+        n_unique = len(unique_names)
+        if n_unique > self.max_loras:
+            raise RuntimeError(
+                f"Batch requires {n_unique} unique LoRA adapters but "
+                f"max_loras={self.max_loras}. Reduce adapter diversity per "
+                "batch (use pack scheduling) or increase max_loras."
+            )
+
+        # Promote all needed adapters before touching per_request_slots so that
+        # LRU eviction only targets adapters NOT in this batch.  After each
+        # promotion, move the adapter to MRU so subsequent promotions within
+        # this loop don't evict an already-promoted or already-resident batch
+        # adapter (which would be LRU if it was loaded in a previous step).
+        for name in unique_names.values():
+            self._ensure_in_gpu(name)
+            self._gpu_lru.move_to_end(name)  # protect from intra-phase eviction
+
+        # Phase 2: assign per-request slots from the now-stable _name_to_slot
+        # map (no further evictions occur here).
         per_request_slots: list[int] = []
         for lid in lora_ids:
             if lid == 0:
@@ -477,7 +509,7 @@ class LoraManager:
                 logger.warning("Unknown lora_id %d; treating as base model.", lid)
                 per_request_slots.append(NO_LORA_SLOT)
                 continue
-            slot = self._ensure_in_gpu(name)
+            slot = self._name_to_slot[name]  # guaranteed present after phase 1
             per_request_slots.append(slot)
             self._gpu_lru.move_to_end(name)
 
