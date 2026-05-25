@@ -287,13 +287,13 @@
       <div class="nav-group">
         <span class="nav-group-label">🐍 Python Runtime</span>
         <a href="#naming">Naming</a>
-        <a href="#files">Files</a>
         <a href="#data-model">Data Model</a>
         <a href="#lifecycle">Adapter Lifecycle</a>
         <a href="#eviction">Eviction</a>
         <a href="#buffers">GPU Buffers</a>
         <a href="#batch-info">Batch Metadata</a>
         <a href="#cuda-graph">CUDA Graph</a>
+        <a href="#files">Files</a>
       </div>
 
       <div class="nav-group">
@@ -322,7 +322,7 @@
         </p>
       </header>
 
-      <section id="overview">
+            <section id="overview">
         <h2>Overview</h2>
         <p>
           TokenSpeed treats LoRA as a runtime-owned side path. Base model layers
@@ -445,107 +445,6 @@
           <code>slot</code> is temporary and may change after GPU eviction and
           reload.
         </div>
-      </section>
-
-      <section id="files">
-        <h2>Files</h2>
-        <p>
-          The implementation is split so request/API naming, adapter lifecycle,
-          scheduler isolation, and kernel execution each have a narrow owner.
-          The tables below show the important added and modified files.
-        </p>
-
-        <h3>Runtime LoRA Modules - Added</h3>
-        <table class="file-list">
-          <thead>
-            <tr><th>File</th><th>Role</th></tr>
-          </thead>
-          <tbody>
-            <tr><td><code>python/tokenspeed/runtime/lora/adapter_io.py</code></td><td>Loads adapter weights and normalizes supported formats: dense PEFT keys, 2D per-expert MoE keys, and 3D <code>experts.w1/w2/w3</code> MoE keys.</td></tr>
-            <tr><td><code>python/tokenspeed/runtime/lora/lora_cache.py</code></td><td>Pinned CPU adapter cache with durable <code>adapter_path</code> tracking, async prefetch, LRU eviction, and disk fallback.</td></tr>
-            <tr><td><code>python/tokenspeed/runtime/lora/lora_buffers.py</code></td><td>GPU buffer allocation and dense weight packing. Owns TP-aware CPU-side sharding and slot zeroing for dense LoRA tensors.</td></tr>
-            <tr><td><code>python/tokenspeed/runtime/lora/lora_batch.py</code></td><td><code>LoraBatchInfo</code>, segment metadata, decode grouping, and CUDA-graph-stable tensors read by dense LoRA kernels.</td></tr>
-            <tr><td><code>python/tokenspeed/runtime/lora/moe_lora.py</code></td><td><code>MoeLoraBuffers</code> and <code>MoeLoraContext</code>. Preallocates fixed expert-scoped LoRA pools and exposes the narrow context used by MoE backends.</td></tr>
-          </tbody>
-        </table>
-
-        <h3>Runtime Integration - Modified</h3>
-        <table class="file-list">
-          <thead>
-            <tr><th>File</th><th>Role</th></tr>
-          </thead>
-          <tbody>
-            <tr><td><code>python/tokenspeed/runtime/lora/lora_manager.py</code></td><td>Top-level adapter lifecycle manager: <code>lora_name</code> to <code>lora_id</code>, CPU/GPU residency, eviction, dense apply calls, and MoE context creation.</td></tr>
-            <tr><td><code>python/tokenspeed/runtime/lora/__init__.py</code></td><td>Exports the public LoRA runtime types used by execution and model layers.</td></tr>
-            <tr><td><code>python/tokenspeed/runtime/engine/io_struct.py</code></td><td>Adds request/control dataclasses: request-time <code>lora_name</code>, load-time <code>adapter_path</code>, and tokenized <code>lora_id</code>.</td></tr>
-            <tr><td><code>python/tokenspeed/runtime/engine/input_processor.py</code></td><td>Resolves request <code>lora_name</code> to internal <code>lora_id</code>; unknown names fail fast instead of falling back to base model.</td></tr>
-            <tr><td><code>python/tokenspeed/runtime/engine/async_llm.py</code></td><td>Holds the name-to-id registry used by request processing and scheduler control paths.</td></tr>
-            <tr><td><code>python/tokenspeed/runtime/engine/event_loop.py</code></td><td>Owns scheduler-side adapter load/unload, initializes <code>LoraManager</code>, and evicts KV namespaces on unload.</td></tr>
-            <tr><td><code>python/tokenspeed/runtime/engine/request_handler.py</code></td><td>Dispatches load/unload ZMQ control messages to the scheduler process.</td></tr>
-            <tr><td><code>python/tokenspeed/runtime/engine/scheduler_control_client.py</code></td><td>Sends <code>LoadLoraReqInput(lora_name, adapter_path)</code> and unload requests to scheduler workers.</td></tr>
-            <tr><td><code>python/tokenspeed/runtime/entrypoints/engine.py</code></td><td>Exposes the Python API: <code>generate(..., lora_name=...)</code> and <code>load_lora_adapter(lora_name, adapter_path)</code>.</td></tr>
-            <tr><td><code>python/tokenspeed/runtime/entrypoints/engine_base.py</code></td><td>Documents the abstract engine API and keeps request names separate from load-time disk paths.</td></tr>
-            <tr><td><code>python/tokenspeed/runtime/execution/context.py</code></td><td>Places <code>LoraManager</code>, <code>LoraBatchInfo</code>, and <code>MoeLoraContext</code> on <code>ForwardContext</code>.</td></tr>
-            <tr><td><code>python/tokenspeed/runtime/execution/model_runner.py</code></td><td>Calls <code>prepare_loras()</code> from scheduled request <code>lora_id</code> values before model forward.</td></tr>
-            <tr><td><code>python/tokenspeed/runtime/execution/cuda_graph_wrapper.py</code></td><td>Captures and replays separate graph variants for no-LoRA and with-LoRA decode batches.</td></tr>
-            <tr><td><code>python/tokenspeed/runtime/layers/moe/layer.py</code></td><td>Threads <code>MoeLoraContext</code> from runtime context into MoE backend calls.</td></tr>
-            <tr><td><code>python/tokenspeed/runtime/layers/moe/backends/base.py</code></td><td>Extends the backend interface with an optional MoE LoRA context.</td></tr>
-            <tr><td><code>python/tokenspeed/runtime/layers/moe/backends/*/triton.py</code></td><td>Supported Triton MoE backends consume the narrow context and apply expert LoRA deltas around fused MoE compute.</td></tr>
-          </tbody>
-        </table>
-
-        <h3>Scheduler - Modified</h3>
-        <table class="file-list">
-          <thead>
-            <tr><th>File</th><th>Role</th></tr>
-          </thead>
-          <tbody>
-            <tr><td><code>tokenspeed-scheduler/csrc/scheduler/request_spec.h</code></td><td>Adds <code>RequestSpec.lora_id</code>. <code>0</code> is base model; positive ids identify registered adapters.</td></tr>
-            <tr><td><code>tokenspeed-scheduler/csrc/scheduler/request.h</code> / <code>request.cpp</code></td><td>Stores the request's <code>lora_id</code> and exposes it to scheduling and forward events.</td></tr>
-            <tr><td><code>tokenspeed-scheduler/csrc/fsm/forward_events.h</code> / <code>forward_events.cpp</code></td><td>Carries <code>lora_id</code> through prefill/decode FSM events so prefix-cache match/insert uses the right adapter namespace.</td></tr>
-            <tr><td><code>tokenspeed-scheduler/csrc/resource/kv_prefix_cache/kv_prefix_cache.h</code> / <code>.cpp</code></td><td>Creates per-adapter virtual roots keyed by <code>lora_id</code>, isolates KV reuse across adapters, and supports namespace eviction.</td></tr>
-            <tr><td><code>tokenspeed-scheduler/csrc/resource/hybrid_prefix_cache/hybrid_prefix_cache.h</code> / <code>.cpp</code></td><td>Forwards <code>lora_id</code> into the KV prefix cache for hybrid cache users.</td></tr>
-            <tr><td><code>tokenspeed-scheduler/csrc/scheduler/scheduler.h</code> / <code>.cpp</code></td><td>Adds <code>EvictLoraNamespace(lora_id)</code>, used when an adapter is unloaded.</td></tr>
-            <tr><td><code>tokenspeed-scheduler/bindings/python_module.cpp</code></td><td>Exposes <code>RequestSpec.lora_id</code> and scheduler namespace eviction to Python.</td></tr>
-            <tr><td><code>tokenspeed-scheduler/tests/cpp/test_lora_prefix_cache.cpp</code></td><td>Covers adapter-specific prefix-cache isolation, base-model isolation, and explicit namespace eviction.</td></tr>
-          </tbody>
-        </table>
-
-        <h3>Kernel Package - Added Or Modified</h3>
-        <table class="file-list">
-          <thead>
-            <tr><th>File</th><th>Role</th></tr>
-          </thead>
-          <tbody>
-            <tr><td><code>tokenspeed-kernel/python/tokenspeed_kernel/ops/lora/triton/</code></td><td>Triton LoRA operator family: shrink, expand, prefill variants, decode grouping, QKV expand, gate/up expand, tuning helpers, and H100 tuned configs.</td></tr>
-            <tr><td><code>tokenspeed-kernel/python/tokenspeed_kernel/ops/lora/cutedsl.py</code></td><td>Public wrappers for CuTeDSL fast paths used by selected single-slot and batched-slot dense LoRA shapes.</td></tr>
-            <tr><td><code>tokenspeed-kernel/python/tokenspeed_kernel/thirdparty/cute_dsl/_provider.py</code></td><td>Provider boundary for optional CuTeDSL availability and import isolation.</td></tr>
-            <tr><td><code>tokenspeed-kernel/python/tokenspeed_kernel/thirdparty/cute_dsl/gemm_add.py</code></td><td>CuTeDSL GEMM-add helper used by dense LoRA expand paths.</td></tr>
-            <tr><td><code>tokenspeed-kernel/python/tokenspeed_kernel/thirdparty/cute_dsl/lora_gemm.py</code></td><td>CuTeDSL LoRA GEMM kernels for shrink/expand-style dense paths.</td></tr>
-            <tr><td><code>tokenspeed-kernel/python/tokenspeed_kernel/thirdparty/cute_dsl/lora_expand_direct.py</code></td><td>Direct expand helper for selected LoRA-B add paths.</td></tr>
-            <tr><td><code>tokenspeed-kernel/python/tokenspeed_kernel/thirdparty/cute_dsl/_vendor/</code></td><td>Vendored CuTeDSL support code kept inside <code>tokenspeed-kernel</code>, not imported directly by runtime code.</td></tr>
-            <tr><td><code>tokenspeed-kernel/python/tokenspeed_kernel/__init__.py</code></td><td>Exports the kernel package LoRA ops through the existing kernel boundary.</td></tr>
-            <tr><td><code>tokenspeed-kernel/python/tokenspeed_kernel/_triton.py</code></td><td>Centralizes direct Triton imports so LoRA ops follow the repository kernel dependency rule.</td></tr>
-          </tbody>
-        </table>
-
-        <h3>Tests, Benchmarks, And Docs</h3>
-        <table class="file-list">
-          <thead>
-            <tr><th>File</th><th>Role</th></tr>
-          </thead>
-          <tbody>
-            <tr><td><code>test/runtime/lora/test_adapter_io.py</code></td><td>Parser tests for dense, MoE per-expert, and 3D MoE adapter formats.</td></tr>
-            <tr><td><code>test/runtime/lora/test_lora_manager.py</code></td><td>Lifecycle, packing, eviction, CPU cache, GPU slot, and metadata behavior.</td></tr>
-            <tr><td><code>test/runtime/lora/test_lora_request_naming.py</code></td><td>Request naming contract: <code>lora_name</code> only, unknown names fail, scalar names propagate across batches.</td></tr>
-            <tr><td><code>test/runtime/lora/test_moe_lora.py</code></td><td>MoE LoRA buffer/context behavior and routed expert-delta application.</td></tr>
-            <tr><td><code>tokenspeed-kernel/test/ops/test_lora_triton.py</code></td><td>Numerical coverage for Triton LoRA kernels.</td></tr>
-            <tr><td><code>tokenspeed-kernel/test/ops/test_lora_cutedsl.py</code></td><td>Numerical coverage for CuTeDSL LoRA fast paths.</td></tr>
-            <tr><td><code>benchmark/test_lora_*.py</code></td><td>Dynamic load/unload, mixed adapter batches, eviction latency, and E2E password-adapter checks.</td></tr>
-            <tr><td><code>docs/serving/lora.md</code></td><td>User-facing serving guide for adapter loading, request selection, and supported MoE adapter formats.</td></tr>
-            <tr><td><code>docs/lora_current_design.html</code></td><td>This current implementation design document.</td></tr>
-          </tbody>
-        </table>
       </section>
 
       <section id="data-model">
@@ -707,6 +606,149 @@ _gpu_lru:       OrderedDict[str, None]     # GPU eviction order</code></pre>
   -> seg_indptr        = [0, 20, 35, 43]
   -> weight_indices    = [slot_a, slot_b, NO_LORA_SLOT]
   -> has_active_lora   = true</code></pre>
+      </section>
+
+      <section id="cuda-graph">
+        <h2>CUDA Graph</h2>
+        <p>
+          The CUDA graph design relies on stable pointers. Adapter contents,
+          segment lengths, slot ids, ranks, and scalings can change between
+          replays, but the tensors holding those values do not move.
+        </p>
+
+        <h3>Capture</h3>
+        <ul>
+          <li>When LoRA is enabled, <code>CudaGraphWrapper.capture()</code> captures two graphs per batch size.</li>
+          <li>The with-LoRA graph sets <code>ctx.lora_manager</code> and calls <code>prepare_loras([0] * bs)</code> before capture so metadata tensors contain <code>NO_LORA_SLOT</code> while kernels capture stable pointers.</li>
+          <li>The no-LoRA graph leaves <code>ctx.lora_manager</code> unset, so model-layer branches skip LoRA calls entirely.</li>
+          <li>No-LoRA capture is safe because base-model dummy ids resolve to <code>NO_LORA_SLOT</code>; runtime LoRA paths skip work when no real adapter is active.</li>
+        </ul>
+
+        <h3>Replay</h3>
+        <ol>
+          <li><code>ModelExecutor</code> builds the real <code>lora_ids</code> list for the scheduled requests.</li>
+          <li><code>prepare_loras()</code> updates the persistent <code>LoraBatchInfo</code> tensors in place.</li>
+          <li>If any id is nonzero, <code>ctx.lora_manager</code> is set and LoRA-capable layers call apply methods.</li>
+          <li><code>CudaGraphWrapper</code> chooses the no-LoRA graph if <code>has_active_lora</code> is false, otherwise it replays the with-LoRA graph.</li>
+          <li>The captured kernels read the updated metadata and use the current slot-to-weight buffers.</li>
+        </ol>
+
+        <pre><code>capture time:
+  batch_info tensors allocated once
+  graph records pointers to batch_info, ranks, scalings, and weight buffers
+
+replay time:
+  prepare_loras() mutates tensor contents
+  graph.replay() reads new contents through old pointers</code></pre>
+
+        <h3>Why Two Graphs?</h3>
+        <p>
+          The with-LoRA graph includes LoRA kernel launches. That is necessary
+          when any request uses an adapter. For all-base batches, the no-LoRA
+          graph avoids those launches entirely and preserves base-model decode
+          performance.
+        </p>
+      </section>
+
+      <section id="files">
+        <h2>Files</h2>
+        <p>
+          The implementation is split so request/API naming, adapter lifecycle,
+          scheduler isolation, and kernel execution each have a narrow owner.
+          The tables below show the important added and modified files.
+        </p>
+
+        <h3>Runtime LoRA Modules - Added</h3>
+        <table class="file-list">
+          <thead>
+            <tr><th>File</th><th>Role</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>python/tokenspeed/runtime/lora/adapter_io.py</code></td><td>Loads adapter weights and normalizes supported formats: dense PEFT keys, 2D per-expert MoE keys, and 3D <code>experts.w1/w2/w3</code> MoE keys.</td></tr>
+            <tr><td><code>python/tokenspeed/runtime/lora/lora_cache.py</code></td><td>Pinned CPU adapter cache with durable <code>adapter_path</code> tracking, async prefetch, LRU eviction, and disk fallback.</td></tr>
+            <tr><td><code>python/tokenspeed/runtime/lora/lora_buffers.py</code></td><td>GPU buffer allocation and dense weight packing. Owns TP-aware CPU-side sharding and slot zeroing for dense LoRA tensors.</td></tr>
+            <tr><td><code>python/tokenspeed/runtime/lora/lora_batch.py</code></td><td><code>LoraBatchInfo</code>, segment metadata, decode grouping, and CUDA-graph-stable tensors read by dense LoRA kernels.</td></tr>
+            <tr><td><code>python/tokenspeed/runtime/lora/moe_lora.py</code></td><td><code>MoeLoraBuffers</code> and <code>MoeLoraContext</code>. Preallocates fixed expert-scoped LoRA pools and exposes the narrow context used by MoE backends.</td></tr>
+          </tbody>
+        </table>
+
+        <h3>Runtime Integration - Modified</h3>
+        <table class="file-list">
+          <thead>
+            <tr><th>File</th><th>Role</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>python/tokenspeed/runtime/lora/lora_manager.py</code></td><td>Top-level adapter lifecycle manager: <code>lora_name</code> to <code>lora_id</code>, CPU/GPU residency, eviction, dense apply calls, and MoE context creation.</td></tr>
+            <tr><td><code>python/tokenspeed/runtime/lora/__init__.py</code></td><td>Exports the public LoRA runtime types used by execution and model layers.</td></tr>
+            <tr><td><code>python/tokenspeed/runtime/engine/io_struct.py</code></td><td>Adds request/control dataclasses: request-time <code>lora_name</code>, load-time <code>adapter_path</code>, and tokenized <code>lora_id</code>.</td></tr>
+            <tr><td><code>python/tokenspeed/runtime/engine/input_processor.py</code></td><td>Resolves request <code>lora_name</code> to internal <code>lora_id</code>; unknown names fail fast instead of falling back to base model.</td></tr>
+            <tr><td><code>python/tokenspeed/runtime/engine/async_llm.py</code></td><td>Holds the name-to-id registry used by request processing and scheduler control paths.</td></tr>
+            <tr><td><code>python/tokenspeed/runtime/engine/event_loop.py</code></td><td>Owns scheduler-side adapter load/unload, initializes <code>LoraManager</code>, and evicts KV namespaces on unload.</td></tr>
+            <tr><td><code>python/tokenspeed/runtime/engine/request_handler.py</code></td><td>Dispatches load/unload ZMQ control messages to the scheduler process.</td></tr>
+            <tr><td><code>python/tokenspeed/runtime/engine/scheduler_control_client.py</code></td><td>Sends <code>LoadLoraReqInput(lora_name, adapter_path)</code> and unload requests to scheduler workers.</td></tr>
+            <tr><td><code>python/tokenspeed/runtime/entrypoints/engine.py</code></td><td>Exposes the Python API: <code>generate(..., lora_name=...)</code> and <code>load_lora_adapter(lora_name, adapter_path)</code>.</td></tr>
+            <tr><td><code>python/tokenspeed/runtime/entrypoints/engine_base.py</code></td><td>Documents the abstract engine API and keeps request names separate from load-time disk paths.</td></tr>
+            <tr><td><code>python/tokenspeed/runtime/execution/context.py</code></td><td>Places <code>LoraManager</code>, <code>LoraBatchInfo</code>, and <code>MoeLoraContext</code> on <code>ForwardContext</code>.</td></tr>
+            <tr><td><code>python/tokenspeed/runtime/execution/model_runner.py</code></td><td>Calls <code>prepare_loras()</code> from scheduled request <code>lora_id</code> values before model forward.</td></tr>
+            <tr><td><code>python/tokenspeed/runtime/execution/cuda_graph_wrapper.py</code></td><td>Captures and replays separate graph variants for no-LoRA and with-LoRA decode batches.</td></tr>
+            <tr><td><code>python/tokenspeed/runtime/layers/moe/layer.py</code></td><td>Threads <code>MoeLoraContext</code> from runtime context into MoE backend calls.</td></tr>
+            <tr><td><code>python/tokenspeed/runtime/layers/moe/backends/base.py</code></td><td>Extends the backend interface with an optional MoE LoRA context.</td></tr>
+            <tr><td><code>python/tokenspeed/runtime/layers/moe/backends/*/triton.py</code></td><td>Supported Triton MoE backends consume the narrow context and apply expert LoRA deltas around fused MoE compute.</td></tr>
+          </tbody>
+        </table>
+
+        <h3>Scheduler - Modified</h3>
+        <table class="file-list">
+          <thead>
+            <tr><th>File</th><th>Role</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>tokenspeed-scheduler/csrc/scheduler/request_spec.h</code></td><td>Adds <code>RequestSpec.lora_id</code>. <code>0</code> is base model; positive ids identify registered adapters.</td></tr>
+            <tr><td><code>tokenspeed-scheduler/csrc/scheduler/request.h</code> / <code>request.cpp</code></td><td>Stores the request's <code>lora_id</code> and exposes it to scheduling and forward events.</td></tr>
+            <tr><td><code>tokenspeed-scheduler/csrc/fsm/forward_events.h</code> / <code>forward_events.cpp</code></td><td>Carries <code>lora_id</code> through prefill/decode FSM events so prefix-cache match/insert uses the right adapter namespace.</td></tr>
+            <tr><td><code>tokenspeed-scheduler/csrc/resource/kv_prefix_cache/kv_prefix_cache.h</code> / <code>.cpp</code></td><td>Creates per-adapter virtual roots keyed by <code>lora_id</code>, isolates KV reuse across adapters, and supports namespace eviction.</td></tr>
+            <tr><td><code>tokenspeed-scheduler/csrc/resource/hybrid_prefix_cache/hybrid_prefix_cache.h</code> / <code>.cpp</code></td><td>Forwards <code>lora_id</code> into the KV prefix cache for hybrid cache users.</td></tr>
+            <tr><td><code>tokenspeed-scheduler/csrc/scheduler/scheduler.h</code> / <code>.cpp</code></td><td>Adds <code>EvictLoraNamespace(lora_id)</code>, used when an adapter is unloaded.</td></tr>
+            <tr><td><code>tokenspeed-scheduler/bindings/python_module.cpp</code></td><td>Exposes <code>RequestSpec.lora_id</code> and scheduler namespace eviction to Python.</td></tr>
+            <tr><td><code>tokenspeed-scheduler/tests/cpp/test_lora_prefix_cache.cpp</code></td><td>Covers adapter-specific prefix-cache isolation, base-model isolation, and explicit namespace eviction.</td></tr>
+          </tbody>
+        </table>
+
+        <h3>Kernel Package - Added Or Modified</h3>
+        <table class="file-list">
+          <thead>
+            <tr><th>File</th><th>Role</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>tokenspeed-kernel/python/tokenspeed_kernel/ops/lora/triton/</code></td><td>Triton LoRA operator family: shrink, expand, prefill variants, decode grouping, QKV expand, gate/up expand, tuning helpers, and H100 tuned configs.</td></tr>
+            <tr><td><code>tokenspeed-kernel/python/tokenspeed_kernel/ops/lora/cutedsl.py</code></td><td>Public wrappers for CuTeDSL fast paths used by selected single-slot and batched-slot dense LoRA shapes.</td></tr>
+            <tr><td><code>tokenspeed-kernel/python/tokenspeed_kernel/thirdparty/cute_dsl/_provider.py</code></td><td>Provider boundary for optional CuTeDSL availability and import isolation.</td></tr>
+            <tr><td><code>tokenspeed-kernel/python/tokenspeed_kernel/thirdparty/cute_dsl/gemm_add.py</code></td><td>CuTeDSL GEMM-add helper used by dense LoRA expand paths.</td></tr>
+            <tr><td><code>tokenspeed-kernel/python/tokenspeed_kernel/thirdparty/cute_dsl/lora_gemm.py</code></td><td>CuTeDSL LoRA GEMM kernels for shrink/expand-style dense paths.</td></tr>
+            <tr><td><code>tokenspeed-kernel/python/tokenspeed_kernel/thirdparty/cute_dsl/lora_expand_direct.py</code></td><td>Direct expand helper for selected LoRA-B add paths.</td></tr>
+            <tr><td><code>tokenspeed-kernel/python/tokenspeed_kernel/thirdparty/cute_dsl/_vendor/</code></td><td>Vendored CuTeDSL support code kept inside <code>tokenspeed-kernel</code>, not imported directly by runtime code.</td></tr>
+            <tr><td><code>tokenspeed-kernel/python/tokenspeed_kernel/__init__.py</code></td><td>Exports the kernel package LoRA ops through the existing kernel boundary.</td></tr>
+            <tr><td><code>tokenspeed-kernel/python/tokenspeed_kernel/_triton.py</code></td><td>Centralizes direct Triton imports so LoRA ops follow the repository kernel dependency rule.</td></tr>
+          </tbody>
+        </table>
+
+        <h3>Tests, Benchmarks, And Docs</h3>
+        <table class="file-list">
+          <thead>
+            <tr><th>File</th><th>Role</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>test/runtime/lora/test_adapter_io.py</code></td><td>Parser tests for dense, MoE per-expert, and 3D MoE adapter formats.</td></tr>
+            <tr><td><code>test/runtime/lora/test_lora_manager.py</code></td><td>Lifecycle, packing, eviction, CPU cache, GPU slot, and metadata behavior.</td></tr>
+            <tr><td><code>test/runtime/lora/test_lora_request_naming.py</code></td><td>Request naming contract: <code>lora_name</code> only, unknown names fail, scalar names propagate across batches.</td></tr>
+            <tr><td><code>test/runtime/lora/test_moe_lora.py</code></td><td>MoE LoRA buffer/context behavior and routed expert-delta application.</td></tr>
+            <tr><td><code>tokenspeed-kernel/test/ops/test_lora_triton.py</code></td><td>Numerical coverage for Triton LoRA kernels.</td></tr>
+            <tr><td><code>tokenspeed-kernel/test/ops/test_lora_cutedsl.py</code></td><td>Numerical coverage for CuTeDSL LoRA fast paths.</td></tr>
+            <tr><td><code>benchmark/test_lora_*.py</code></td><td>Dynamic load/unload, mixed adapter batches, eviction latency, and E2E password-adapter checks.</td></tr>
+            <tr><td><code>docs/serving/lora.md</code></td><td>User-facing serving guide for adapter loading, request selection, and supported MoE adapter formats.</td></tr>
+            <tr><td><code>docs/lora_current_design.html</code></td><td>This current implementation design document.</td></tr>
+          </tbody>
+        </table>
       </section>
 
       <section id="kernels">
@@ -924,48 +966,6 @@ down_output[t, e] += down_delta[t, e]</code></pre>
         </div>
       </section>
 
-      <section id="cuda-graph">
-        <h2>CUDA Graph</h2>
-        <p>
-          The CUDA graph design relies on stable pointers. Adapter contents,
-          segment lengths, slot ids, ranks, and scalings can change between
-          replays, but the tensors holding those values do not move.
-        </p>
-
-        <h3>Capture</h3>
-        <ul>
-          <li>When LoRA is enabled, <code>CudaGraphWrapper.capture()</code> captures two graphs per batch size.</li>
-          <li>The with-LoRA graph sets <code>ctx.lora_manager</code> and calls <code>prepare_loras([0] * bs)</code> before capture so metadata tensors contain <code>NO_LORA_SLOT</code> while kernels capture stable pointers.</li>
-          <li>The no-LoRA graph leaves <code>ctx.lora_manager</code> unset, so model-layer branches skip LoRA calls entirely.</li>
-          <li>No-LoRA capture is safe because base-model dummy ids resolve to <code>NO_LORA_SLOT</code>; runtime LoRA paths skip work when no real adapter is active.</li>
-        </ul>
-
-        <h3>Replay</h3>
-        <ol>
-          <li><code>ModelExecutor</code> builds the real <code>lora_ids</code> list for the scheduled requests.</li>
-          <li><code>prepare_loras()</code> updates the persistent <code>LoraBatchInfo</code> tensors in place.</li>
-          <li>If any id is nonzero, <code>ctx.lora_manager</code> is set and LoRA-capable layers call apply methods.</li>
-          <li><code>CudaGraphWrapper</code> chooses the no-LoRA graph if <code>has_active_lora</code> is false, otherwise it replays the with-LoRA graph.</li>
-          <li>The captured kernels read the updated metadata and use the current slot-to-weight buffers.</li>
-        </ol>
-
-        <pre><code>capture time:
-  batch_info tensors allocated once
-  graph records pointers to batch_info, ranks, scalings, and weight buffers
-
-replay time:
-  prepare_loras() mutates tensor contents
-  graph.replay() reads new contents through old pointers</code></pre>
-
-        <h3>Why Two Graphs?</h3>
-        <p>
-          The with-LoRA graph includes LoRA kernel launches. That is necessary
-          when any request uses an adapter. For all-base batches, the no-LoRA
-          graph avoids those launches entirely and preserves base-model decode
-          performance.
-        </p>
-      </section>
-
       <section id="scheduler-namespace">
         <h2>Prefix Cache Namespace</h2>
         <p>
@@ -1113,6 +1113,7 @@ replay time:
           snapshot detach) runs without any adapter-specific special cases.
         </p>
       </section>
+    
     </main>
   </div>
 </body>
