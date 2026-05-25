@@ -227,6 +227,12 @@ class LoraManager:
         self._name_to_slot: dict[str, int] = {}
         self._gpu_lru: OrderedDict[str, None] = OrderedDict()  # alias of _lru
 
+        # Mid-decode unload safety: track which adapter names were active in
+        # the most recent prepare_loras call, and defer GPU weight eviction for
+        # any adapter that is unloaded while still in use.
+        self._active_names: set[str] = set()
+        self._pending_eviction: set[str] = set()  # names to evict when safe
+
         # ── Tier 2: pinned CPU pool ─────────────────────────────────────
         # ``_cpu_cache[name]`` holds parsed weights in pinned host memory.
         # ``_cpu_lru`` tracks LRU order for CPU eviction back to disk.  An
@@ -444,11 +450,32 @@ class LoraManager:
     def unload_adapter(self, name: str) -> None:
         if name not in self._name_to_id:
             raise KeyError(f"Adapter '{name}' is not loaded.")
-        self._evict_by_name(name)
-        self._cpu_store.remove(name)
+
+        # Remove from identity tables immediately so no NEW requests are assigned
+        # to this adapter.  GPU weight eviction may be deferred (see below).
         lora_id = self._name_to_id.pop(name)
         del self._id_to_name[lora_id]
-        logger.info("Unloaded adapter '%s'", name)
+
+        if name in self._active_names:
+            # The adapter was used in the most recent forward step; its GPU
+            # weights may still be needed if the scheduler is mid-decode for
+            # one of those requests.  Defer the weight zeroing until the next
+            # prepare_loras confirms the adapter is no longer in the batch.
+            logger.warning(
+                "Adapter '%s' (lora_id=%d) unloaded while potentially in-flight; "
+                "GPU slot eviction deferred until next batch that does not use it.",
+                name,
+                lora_id,
+            )
+            self._pending_eviction.add(name)
+            # Keep CPU weights alive so retracted requests can still reload.
+            # The CPU entry is removed when the deferred eviction fires.
+        else:
+            # Safe to evict immediately — not active in the current batch.
+            self._evict_by_name(name)
+            self._cpu_store.remove(name)
+
+        logger.info("Unloaded adapter '%s' (lora_id=%d)", name, lora_id)
 
     def get_id(self, name: str) -> int | None:
         return self._name_to_id.get(name)
@@ -487,6 +514,23 @@ class LoraManager:
                 f"max_loras={self.max_loras}. Reduce adapter diversity per "
                 "batch (use pack scheduling) or increase max_loras."
             )
+
+        # The previous forward step is now complete (prepare_loras is called
+        # synchronously before each forward).  Flush any deferred evictions for
+        # adapters that are NOT needed by the current batch.
+        current_batch_names = set(unique_names.values())
+        for pending_name in list(self._pending_eviction):
+            if pending_name not in current_batch_names:
+                logger.info(
+                    "Deferred eviction: removing adapter '%s' GPU weights now.",
+                    pending_name,
+                )
+                self._evict_by_name(pending_name)
+                self._cpu_store.remove(pending_name)
+                self._pending_eviction.discard(pending_name)
+
+        # Track which adapters are active in this batch for mid-decode unload safety.
+        self._active_names = current_batch_names
 
         # Promote all needed adapters before touching per_request_slots so that
         # LRU eviction only targets adapters NOT in this batch.  After each
