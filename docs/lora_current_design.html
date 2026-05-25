@@ -619,50 +619,159 @@ _gpu_lru:       OrderedDict[str, None]     # GPU eviction order</code></pre>
       <section id="eviction">
         <h2>Eviction</h2>
         <p>
-          This section describes how the GPU and CPU adapter pools shed adapters under
-          memory pressure. The two-tier design — GPU slots backed by a CPU pinned cache
-          backed by disk — ensures that eviction from one tier never loses weights; they
-          are always reloadable from the tier below.
+          Adapter weight eviction is managed entirely in Python by
+          <code>LoraManager</code>. The three-tier design — GPU slots → CPU pinned
+          cache → disk — ensures that evicting from one tier never destroys weights;
+          they are always reloadable from the tier below. Eviction is triggered
+          automatically by <code>prepare_loras()</code> whenever the GPU pool is
+          full and a new adapter is needed.
         </p>
         <div style="margin:12px 0 20px;padding:10px 14px;background:var(--panel-2);border-radius:6px;font-size:13px">
           <strong>Key files</strong> —
           <code>python/tokenspeed/runtime/lora/lora_manager.py</code> (added) ·
           <code>python/tokenspeed/runtime/lora/lora_cache.py</code> (added)
         </div>
-        <h3>GPU Pool</h3>
+
+        <h3>How it works — normal path</h3>
         <p>
-          The GPU pool has <code>max_loras</code> slots, all of them available
-          for real adapters. Base-model requests do not consume a GPU slot;
-          they write <code>NO_LORA_SLOT = -1</code> into per-step metadata.
+          Every call to <code>prepare_loras(lora_ids, ...)</code> calls
+          <code>_ensure_in_gpu(name)</code> for each unique adapter in the batch.
+          The method follows this sequence:
         </p>
-        <ul>
-          <li><code>_find_free_slot()</code> returns the first empty adapter slot.</li>
-          <li>If the pool is full, it scans <code>_gpu_lru</code> from least to most recently used.</li>
-          <li>The selected adapter is removed from <code>_name_to_slot</code>, <code>_slot_to_name</code>, and <code>_gpu_lru</code>.</li>
-          <li>The returned slot is reset before <code>_load_to_slot()</code> copies new weights, so partial adapters cannot inherit stale modules from the previous occupant.</li>
-          <li>Explicit unload also resets dense weights, clears MoE weights, and resets rank/scaling.</li>
-        </ul>
+        <ol>
+          <li>
+            <strong>Already on GPU?</strong> — <code>name in _name_to_slot</code> →
+            return the existing slot immediately.  No eviction, no disk I/O.
+          </li>
+          <li>
+            <strong>Find a free GPU slot.</strong>  <code>_find_free_slot()</code>
+            scans <code>_slot_to_name</code> for an empty entry first.  If the
+            pool is full it evicts the LRU adapter:
+            <ul>
+              <li>Iterate <code>_gpu_lru</code> from front (LRU) to back (MRU).</li>
+              <li>Call <code>_evict_by_name(candidate)</code>: removes from
+                <code>_name_to_slot</code>, sets <code>_slot_to_name[slot] = None</code>,
+                zeros CPU-side metadata (rank, scalings), removes from <code>_gpu_lru</code>.
+                GPU weight tensors are <em>not</em> zeroed — stale values are never
+                read because <code>weight_indices</code> never references an empty slot.</li>
+              <li>Return the freed slot.</li>
+            </ul>
+          </li>
+          <li>
+            <strong>Promote from CPU to GPU.</strong>  <code>_cpu_store.ensure(name)</code>
+            guarantees the weights are in CPU pinned memory (loading from disk if
+            needed).  <code>_load_to_slot(name, slot)</code> copies each weight tensor
+            to the GPU buffer slice for this slot.
+          </li>
+          <li>
+            <strong>Register and mark MRU.</strong>  <code>_name_to_slot[name] = slot</code>,
+            <code>_slot_to_name[slot] = name</code>, <code>_gpu_lru[name] = None</code>
+            (appended at end = MRU).
+          </li>
+        </ol>
+        <p>
+          After promoting all unique batch adapters, <code>prepare_loras</code> calls
+          <code>_gpu_lru.move_to_end(name)</code> for each one (phase 2 of the
+          two-phase design) to protect batch adapters from being evicted by a
+          subsequent <code>_ensure_in_gpu</code> call within the same step.
+        </p>
 
         <h3>CPU Pool</h3>
         <p>
-          The CPU pool is a second tier bounded by <code>max_loras_cpu</code>.
-          It keeps parsed, pinned weights to avoid repeated safetensors reads
-          and to allow non-blocking H2D copies when the platform supports
-          pinned memory. The default capacity is four times the GPU pool.
+          The CPU pool is bounded by <code>max_loras_cpu</code> (default 4×
+          <code>max_loras</code>).  It holds parsed, pinned-memory weight tensors so
+          that GPU promotion is a single non-blocking H2D copy rather than a
+          safetensors parse from disk.
         </p>
         <ul>
-          <li><code>prefetch(name)</code> starts a best-effort background disk read if the adapter is known and not already loading.</li>
-          <li><code>ensure(name)</code> blocks until a pending load finishes or loads synchronously from disk.</li>
-          <li>CPU eviction prefers adapters that are not currently GPU-resident.</li>
-          <li>If the pool cannot find an evictable entry, loading raises a runtime error with the current LRU state.</li>
+          <li><code>prefetch(name)</code> starts a background disk read so the next
+            <code>ensure(name)</code> finds the weights already in CPU memory.</li>
+          <li><code>ensure(name)</code> blocks until a pending load finishes, or
+            loads synchronously if no prefetch is in flight.</li>
+          <li>CPU eviction prefers adapters that are <em>not</em> currently GPU-resident
+            (those can be reloaded from CPU without a disk read).</li>
+          <li>If no CPU-evictable entry exists (all CPU-resident adapters are also
+            GPU-resident and the pool is at capacity), loading raises
+            <code>RuntimeError</code>.</li>
         </ul>
 
+        <h3>Explicit unload</h3>
+        <p>
+          <code>unload_adapter(name)</code> removes the adapter from both tiers and
+          blocks future requests from using it.  Because GPU kernels read weights
+          asynchronously, unload uses a <strong>deferred eviction</strong> pattern:
+        </p>
+        <ol>
+          <li>Remove <code>_name_to_id[name]</code> immediately so no new request
+            is assigned this adapter.</li>
+          <li>If the adapter was active in the most recent forward step
+            (<code>name in _active_names</code>), add <code>(name, lora_id)</code>
+            to <code>_pending_eviction</code> and log a warning.  The GPU slot
+            and CPU weights are preserved until a batch arrives that does not
+            include this adapter.</li>
+          <li>Otherwise, evict the GPU slot and remove CPU weights immediately.</li>
+          <li>The deferred entry is flushed at the top of the next
+            <code>prepare_loras</code> call for any batch that does not include
+            the adapter.</li>
+        </ol>
+
         <div class="callout">
-          GPU eviction does not unregister the adapter. It only removes the
-          temporary slot mapping. The adapter can be promoted again later from
-          CPU cache or disk using its stable <code>name</code> and
-          <code>lora_id</code>.
+          GPU eviction does not destroy the adapter registration.
+          <code>lora_id</code> and the disk path are preserved so the adapter can
+          be promoted again later without re-registering.  Only
+          <code>unload_adapter()</code> permanently removes the registration.
         </div>
+
+        <h3>Edge cases</h3>
+        <table>
+          <thead>
+            <tr><th>Scenario</th><th>Behaviour</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Batch needs more unique adapters than <code>max_loras</code></td>
+              <td><code>RuntimeError</code> raised at the start of <code>prepare_loras</code>
+                before any eviction occurs.  The error is clear and actionable rather
+                than silently producing wrong outputs.</td>
+            </tr>
+            <tr>
+              <td>Adapter A is LRU but also needed by the current batch</td>
+              <td>Phase 1 of <code>prepare_loras</code> calls <code>_ensure_in_gpu</code>
+                for all batch adapters first and calls <code>_gpu_lru.move_to_end</code>
+                after each promotion, so A is MRU before phase 2 begins.
+                <code>_find_free_slot</code> evicts non-batch adapters only.</td>
+            </tr>
+            <tr>
+              <td><code>unload_adapter</code> called while adapter is mid-decode</td>
+              <td>Eviction deferred into <code>_pending_eviction</code>.  GPU weights
+                and CPU copy kept alive so retracted requests can still resume with
+                correct weights.  Eviction fires on the next batch that does not
+                include this adapter.</td>
+            </tr>
+            <tr>
+              <td>Same adapter name re-registered before deferred eviction fires</td>
+              <td><code>_pending_eviction</code> stores <code>(name, old_lora_id)</code>
+                tuples.  <code>_flush_one_pending</code> checks whether
+                <code>_name_to_id[name]</code> still matches the recorded
+                <code>old_lora_id</code>; if the name was re-registered with a new id,
+                the GPU slot is left untouched.</td>
+            </tr>
+            <tr>
+              <td>LRU eviction races with an in-flight GPU graph kernel reading the slot</td>
+              <td>GPU weight tensors are never zeroed during eviction.  The slot is
+                marked logically empty by removing it from <code>_name_to_slot</code>
+                (CPU-only operation).  Stale GPU values are overwritten when
+                <code>_load_to_slot</code> reuses the slot.  No CUDA stream ordering
+                is required because no GPU write occurs at eviction time.</td>
+            </tr>
+            <tr>
+              <td>CPU pool has no evictable entry (all CPU adapters also on GPU)</td>
+              <td><code>RuntimeError</code> from <code>LoraCpuCache</code>.  The server
+                should increase <code>max_loras_cpu</code> or reduce concurrent
+                adapter diversity.</td>
+            </tr>
+          </tbody>
+        </table>
       </section>
 
       <section id="buffers">
@@ -1287,13 +1396,45 @@ lora_virtual_roots_[lora_id] = raw_ptr;</code></pre>
       <section id="scheduler-eviction">
         <h2>Eviction on Unload</h2>
         <p>
-          When Python calls <code>LoraManager.unload_adapter(name)</code>, it
-          sends an <code>EvictLoraNamespace(lora_id)</code> command to the C++
-          scheduler, which atomically prunes the adapter's entire radix subtree
-          and frees all its KV pages.
+          The C++ scheduler manages <strong>KV prefix-cache page eviction</strong> for
+          LoRA adapters — this is entirely separate from LoRA weight eviction handled by
+          Python.  When an adapter is unloaded, its virtual radix-tree subtree (and all
+          the KV pages pinned under it) must be freed so the pages can be reused for
+          other requests.  The scheduler also performs ongoing <strong>LRU eviction</strong>
+          of individual KV pages under any adapter's subtree when the device page pool
+          runs low.
         </p>
 
-        <h3>Steps inside <code>KVPrefixCache::EvictLoraNamespace(lora_id)</code></h3>
+        <h3>How it works — normal LRU eviction</h3>
+        <p>
+          KV page eviction happens continuously as the device page pool fills up.  The
+          scheduler's LRU machinery is adapter-oblivious: it evicts the
+          least-recently-used <code>TreeNode</code> regardless of which adapter's
+          virtual root it lives under.  The steps are identical for base-model and LoRA
+          subtrees:
+        </p>
+        <ol>
+          <li>Device page pool runs low; <code>EnsureCapacityByEvict(n_pages)</code> is called.</li>
+          <li>Walk the global LRU list of locked device nodes (oldest first).</li>
+          <li>For each candidate: detach device resource (frees KV pages), trigger
+            <code>OnKVEvict(node)</code> which releases Mamba slots and detaches any
+            paged-cache snapshot.</li>
+          <li>If the node is the virtual root of a LoRA adapter, <code>DetachPagedCacheSnapshotFromNode</code>
+            removes it from <code>paged_cache_snapshot_nodes_</code>.</li>
+        </ol>
+        <p>
+          No adapter-specific code runs during normal LRU eviction.  An adapter's
+          virtual root and its subtree are evicted the same way as any other node.
+        </p>
+
+        <h3>How it works — explicit unload via <code>EvictLoraNamespace</code></h3>
+        <p>
+          When Python calls <code>LoraManager.unload_adapter(name)</code>, after
+          deferring or immediately evicting the GPU weights, it sends
+          <code>EvictLoraNamespace(lora_id)</code> to the C++ scheduler.
+          <code>KVPrefixCache::EvictLoraNamespace(lora_id)</code> atomically
+          prunes the entire subtree:
+        </p>
         <ol>
           <li>
             <strong>Find virtual root</strong> — look up
@@ -1301,37 +1442,87 @@ lora_virtual_roots_[lora_id] = raw_ptr;</code></pre>
             If missing or already pruned, return immediately (idempotent).
           </li>
           <li>
-            <strong>Collect descendants</strong> — DFS over the subtree to build a
-            flat list of all <code>TreeNode*</code> children (excluding the virtual
-            root itself, which is removed last).
+            <strong>Collect all descendants</strong> — DFS over the subtree to build
+            a flat list of every <code>TreeNode*</code> below the virtual root.
           </li>
           <li>
             <strong>Evict device and host pages</strong> —
             <code>device_.EvictSubtree(descendants)</code> and
-            <code>host_.EvictSubtree(descendants)</code> trigger the normal LRU
-            eviction callbacks on each node. This fires Mamba slot release,
-            paged-cache snapshot detach, and KV page deallocation — the same path
-            as ordinary LRU pressure.
+            <code>host_.EvictSubtree(descendants)</code> trigger the normal eviction
+            callbacks on each node: Mamba slot release, paged-cache snapshot detach,
+            KV page deallocation — the exact same path as LRU pressure.
           </li>
           <li>
-            <strong>Remove virtual root from the real tree</strong> —
-            <code>tree_.Root()->RemoveChild(sentinel)</code> transfers the unique_ptr
-            out. The cascade destructor destroys every remaining node and attached
-            resource in the subtree.
+            <strong>Remove the virtual root</strong> —
+            <code>tree_.Root()-&gt;RemoveChild(sentinel_key)</code> transfers
+            ownership out via <code>unique_ptr</code>.  The cascade destructor walks
+            every remaining node and destroys all attached resources.
           </li>
           <li>
             <strong>Erase from map</strong> —
-            <code>lora_virtual_roots_.erase(lora_id)</code>. The adapter's namespace
-            is now completely gone.
+            <code>lora_virtual_roots_.erase(lora_id)</code>.  The adapter namespace
+            is gone; subsequent <code>Match</code> calls for this <code>lora_id</code>
+            will call <code>getOrCreateLoraRoot</code> and rebuild from scratch.
           </li>
         </ol>
 
         <div class="callout">
-          No adapter-specific eviction logic is needed. The virtual root is a
-          normal <code>TreeNode</code> so all existing eviction machinery —
-          LRU ordering, mamba L2 writeback, paged-cache snapshot detach — runs
-          identically for LoRA subtrees and base-model subtrees.
+          No adapter-specific eviction code exists. The virtual root is a normal
+          <code>TreeNode</code>, so LRU ordering, Mamba L2 writeback, and
+          paged-cache snapshot detach all run identically for LoRA and base-model
+          subtrees.
         </div>
+
+        <h3>Edge cases</h3>
+        <table>
+          <thead>
+            <tr><th>Scenario</th><th>Behaviour</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>EvictLoraNamespace</code> called on an already-evicted adapter</td>
+              <td>Idempotent — <code>lora_virtual_roots_[lora_id]</code> is missing or
+                the node's parent pointer is null (pruned by LRU) → early return,
+                no crash.</td>
+            </tr>
+            <tr>
+              <td>Virtual root's children were already LRU-evicted before explicit unload</td>
+              <td><code>EvictSubtree</code> is called on an empty descendant list — zero
+                pages to free.  <code>RemoveChild</code> still cleans up the virtual
+                root node itself.</td>
+            </tr>
+            <tr>
+              <td>Ongoing decode request still using this adapter's KV prefix cache</td>
+              <td>The request holds a <code>DeviceNodeRef</code> lock on its terminal
+                node.  Locked nodes are skipped by LRU eviction but are NOT protected
+                from <code>EvictLoraNamespace</code>, which forcibly detaches all
+                resources.  The in-flight request's next decode step will miss the
+                prefix cache (KV pages recomputed) but outputs remain correct.
+                This is the expected trade-off on explicit unload.</td>
+            </tr>
+            <tr>
+              <td>LRU evicts the virtual root node itself</td>
+              <td>The virtual root has an empty <code>DeviceResource</code> attached at
+                creation time specifically to prevent LRU from evicting it while the
+                adapter is loaded.  Once <code>EvictLoraNamespace</code> fires, the
+                root is removed from the tree via <code>RemoveChild</code>, not LRU.</td>
+            </tr>
+            <tr>
+              <td>Adapter reloaded after <code>EvictLoraNamespace</code></td>
+              <td><code>getOrCreateLoraRoot(lora_id)</code> is called on the next
+                <code>Insert</code> or <code>Match</code> with this
+                <code>lora_id</code>.  A fresh virtual root is created under the real
+                tree root with the sentinel key <code>[-lora_id, 0, …]</code>.
+                Prefix cache starts empty (cold) for the re-registered adapter.</td>
+            </tr>
+            <tr>
+              <td>Two adapters share the same <code>lora_id</code> (impossible in practice)</td>
+              <td>Protected by the Python side: <code>_next_id</code> is a monotonically
+                increasing counter; old ids are kept in <code>_id_to_name</code> until
+                the deferred GPU eviction fires, preventing reuse of a live id.</td>
+            </tr>
+          </tbody>
+        </table>
       </section>
 
       <section id="scheduler-gaps">
