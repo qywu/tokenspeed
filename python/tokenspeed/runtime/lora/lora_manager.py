@@ -516,13 +516,18 @@ class LoraManager:
         self._cpu_store.remove(name)
 
     def flush_pending_evictions(self) -> None:
-        """Evict all deferred adapter weights immediately, regardless of active state.
+        """Evict all deferred adapter weights immediately.
 
-        Call this when the server is idle (no in-flight requests) to reclaim GPU
-        slots that were deferred by unload_adapter() calls during active decodes.
-        It is safe to call at any time; if called mid-decode the behaviour is the
-        same as the original unload_adapter (slot zeroed while in-flight), so
-        only call this when you are certain no requests are running.
+        Safe to call at any time, including while the GPU is running a forward
+        pass.  Because _reset_slot no longer issues GPU zero operations, the
+        only side effects are CPU-side: removing the slot from _name_to_slot
+        and cleaning up CPU weight caches.  The GPU memory retains stale values
+        until the slot is reused, but no kernel ever reads from an evicted slot
+        (prepare_loras only assigns weight_indices to slots present in
+        _name_to_slot).
+
+        Call this when the server has no pending decode requests and you want
+        to reclaim GPU slots occupied by deferred-unloaded adapters.
         """
         for name, lora_id in list(self._pending_eviction):
             logger.info("Flushing deferred eviction for adapter '%s'.", name)
@@ -1125,8 +1130,25 @@ class LoraManager:
         self._gpu_lru.pop(name, None)
 
     def _reset_slot(self, slot: int) -> None:
-        self._weight_buffers.zero_slot(slot)
-        self._moe_lora_buffers.clear_slot(slot)
+        # GPU weight tensors are intentionally NOT zeroed here.
+        #
+        # Correctness argument: prepare_loras assigns weight_indices[i] only to
+        # slots present in _name_to_slot.  _evict_by_name removes the slot from
+        # _name_to_slot before calling _reset_slot, so no kernel ever reads from
+        # an evicted slot's GPU memory regardless of what values are there.
+        # _load_to_slot overwrites the stale values when the slot is reused.
+        #
+        # Skipping the GPU zeros removes potentially hundreds of kernel launches
+        # per eviction (one zero_() per buffer per layer) and — more critically —
+        # eliminates a CUDA stream race: graph.replay() uses a dedicated stream
+        # while tensor.zero_() runs on the default stream; without explicit
+        # inter-stream synchronisation, an immediate GPU zero could race with an
+        # in-flight graph kernel still reading the old weights.
+        #
+        # MoE buffers: _moe_lora_buffers.clear_slot does both GPU zeroing AND
+        # CPU dict cleanup (weights_by_layer.pop).  Keep the CPU cleanup, skip
+        # the GPU zeros.
+        self._moe_lora_buffers.clear_slot_cpu_only(slot)
         self._lora_ranks[slot] = 0
         self._slot_ranks[slot] = 0
         self._slot_scalings[slot] = 0.0

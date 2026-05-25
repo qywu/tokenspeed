@@ -1301,6 +1301,20 @@ class MoeLoraBuffers:
         for layer_slots in self.weights_by_layer.values():
             layer_slots.pop(slot, None)
 
+    def clear_slot_cpu_only(self, slot: int) -> None:
+        """Remove slot from CPU-side tracking without GPU zeroing.
+
+        The GPU weight tensors for this slot are NOT zeroed.  This is safe
+        because prepare_loras only assigns weight_indices[i] to slots present
+        in _name_to_slot, which is cleared before this method is called.
+        No kernel can read from an evicted slot.  Stale GPU values are
+        overwritten when _load_to_slot reuses the slot for a new adapter.
+        """
+        if not self.enabled:
+            return
+        for layer_slots in self.weights_by_layer.values():
+            layer_slots.pop(slot, None)
+
     def build_context(
         self,
         *,
