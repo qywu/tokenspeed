@@ -62,13 +62,31 @@
 
     nav a {
       display: block;
-      padding: 7px 0;
+      padding: 5px 0 5px 10px;
       color: #314158;
       text-decoration: none;
       font-size: 14px;
     }
 
     nav a:hover { color: var(--blue); }
+
+    nav .nav-group {
+      margin-top: 18px;
+    }
+
+    nav .nav-group-label {
+      display: block;
+      padding: 4px 0 2px;
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.07em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+
+    nav .nav-top-link {
+      padding-left: 0;
+    }
 
     main {
       max-width: 1180px;
@@ -264,18 +282,31 @@
     <nav>
       <h2>LoRA Design</h2>
       <p>Current TokenSpeed implementation, including dense LoRA, MoE LoRA, eviction, and CUDA graph replay.</p>
-      <a href="#overview">Overview</a>
-      <a href="#naming">Naming</a>
-      <a href="#files">Files</a>
-      <a href="#data-model">Data Model</a>
-      <a href="#lifecycle">Adapter Lifecycle</a>
-      <a href="#eviction">Eviction</a>
-      <a href="#buffers">GPU Buffers</a>
-      <a href="#batch-info">Batch Metadata</a>
-      <a href="#kernels">Kernel Routing</a>
-      <a href="#moe">MoE LoRA</a>
-      <a href="#cuda-graph">CUDA Graph</a>
-      <a href="#limitations">Limitations</a>
+      <a class="nav-top-link" href="#overview">Overview</a>
+
+      <div class="nav-group">
+        <span class="nav-group-label">🐍 Python Runtime</span>
+        <a href="#naming">Naming</a>
+        <a href="#files">Files</a>
+        <a href="#data-model">Data Model</a>
+        <a href="#lifecycle">Adapter Lifecycle</a>
+        <a href="#eviction">Eviction</a>
+        <a href="#buffers">GPU Buffers</a>
+        <a href="#batch-info">Batch Metadata</a>
+        <a href="#cuda-graph">CUDA Graph</a>
+      </div>
+
+      <div class="nav-group">
+        <span class="nav-group-label">⚡ Kernel</span>
+        <a href="#kernels">Kernel Routing</a>
+        <a href="#moe">MoE LoRA</a>
+      </div>
+
+      <div class="nav-group">
+        <span class="nav-group-label">🗂 Scheduler</span>
+        <a href="#scheduler-namespace">Prefix Cache Namespace</a>
+        <a href="#limitations">Limitations</a>
+      </div>
     </nav>
 
     <main>
@@ -932,6 +963,44 @@ replay time:
           graph avoids those launches entirely and preserves base-model decode
           performance.
         </p>
+      </section>
+
+      <section id="scheduler-namespace">
+        <h2>Prefix Cache Namespace</h2>
+        <p>
+          The C++ scheduler gives every LoRA adapter its own isolated subtree in
+          the KV prefix cache radix tree. Each request carries a
+          <code>lora_id</code> which is passed to <code>KVPrefixCache::Match</code>
+          and <code>InsertHybridCache</code>, so cached KV pages from one adapter
+          are never reused by a different adapter or the base model.
+        </p>
+        <table>
+          <thead>
+            <tr><th>Mechanism</th><th>Where</th><th>What it does</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>lora_id</code> on <code>RequestSpec</code></td>
+              <td><code>scheduler/request.h</code></td>
+              <td>Each request carries its adapter id into the scheduler FSM.</td>
+            </tr>
+            <tr>
+              <td><code>Match(tokens, lora_id)</code></td>
+              <td><code>kv_prefix_cache.h</code>, <code>hybrid_prefix_cache.h</code></td>
+              <td>Prefix lookup is scoped to the adapter's virtual root node.</td>
+            </tr>
+            <tr>
+              <td><code>InsertHybridCache(…, lora_id)</code></td>
+              <td><code>forward_events.cpp</code></td>
+              <td>Newly computed KV pages are inserted under the adapter's namespace.</td>
+            </tr>
+            <tr>
+              <td><code>EvictLoraNamespace(lora_id)</code></td>
+              <td><code>scheduler.h</code></td>
+              <td>On adapter unload, prunes the adapter's radix subtree and frees its KV pages.</td>
+            </tr>
+          </tbody>
+        </table>
       </section>
 
       <section id="limitations">
