@@ -307,7 +307,7 @@
         <a href="#scheduler-namespace">Prefix Cache Namespace</a>
         <a href="#scheduler-flow">Request Flow</a>
         <a href="#scheduler-eviction">Eviction on Unload</a>
-        <a href="#scheduler-gaps">Open Gaps</a>
+        <a href="#scheduler-gaps">Gaps &amp; Status</a>
       </div>
     </nav>
 
@@ -1526,133 +1526,150 @@ lora_virtual_roots_[lora_id] = raw_ptr;</code></pre>
       </section>
 
       <section id="scheduler-gaps">
-        <h2>Open Gaps</h2>
+        <h2>Gaps &amp; Status</h2>
         <p>
-          Two of the original five gaps have been addressed. Three performance
-          gaps remain open.
+          Two of the original five gaps have been fixed. Three performance gaps
+          remain open.
         </p>
 
-        <h3>1 — Adapter-aware co-scheduling
-          <span class="tag" style="background:#f0fdf4;color:var(--green);border-color:#86efac">✅ Fixed</span>
-        </h3>
+        <!-- ── Fixed ─────────────────────────────────────────── -->
+        <div style="margin:20px 0 6px;font-size:11px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;color:var(--green)">
+          ✅ Fixed
+        </div>
+
+        <h3>1 — Adapter-aware co-scheduling</h3>
         <p>
           <strong>Was:</strong> <code>newForwardOperation()</code> ignored
-          <code>lora_id</code>, allowing batches with more unique adapters than
-          <code>max_loras</code>. This caused silent wrong outputs — evicted
-          adapters fell back to <code>NO_LORA_SLOT</code> with no error.
+          <code>lora_id</code>, allowing batches requiring more unique adapters than
+          <code>max_loras</code>.  When <code>prepare_loras()</code> then evicted one
+          batch adapter to promote another, the evicted adapter's requests silently
+          fell back to <code>NO_LORA_SLOT</code> and ran as the base model — wrong
+          outputs with no error raised.
         </p>
         <p>
           <strong>Fix:</strong> <code>max_loras</code> is now a field on
-          <code>SchedulerConfig</code> (passed from <code>server_args.max_loras</code>).
-          <code>newForwardOperation()</code> tracks a
-          <code>batch_lora_ids</code> set and skips any request whose
-          <code>lora_id</code> would push the count over the cap — deferring it
-          to the next step instead.  As a side effect, requests for the same
-          adapter naturally cluster into the same batch step, reducing GPU slot
-          thrashing.  The <code>prepare_loras()</code>
-          <code>RuntimeError</code> for <code>n_unique &gt; max_loras</code> is
-          now unreachable in normal operation.
+          <code>SchedulerConfig</code>, set from <code>server_args.max_loras</code>.
+          <code>newForwardOperation()</code> maintains a
+          <code>batch_lora_ids</code> set and defers any request whose
+          <code>lora_id</code> would push the count past the cap.  As a
+          side-effect, requests for the same adapter cluster into the same step,
+          reducing GPU slot thrashing.
         </p>
-        <pre><code>// scheduler/operations/forward.cpp
+        <pre><code>// scheduler/operations/forward.cpp  (forward.h, types.h, bindings)
 std::unordered_set&lt;int32_t&gt; batch_lora_ids;
 for (Request* request : candidates) {
     if (config_.max_loras > 0 &amp;&amp; request-&gt;lora_id() != kLoraNone) {
         bool is_new = !batch_lora_ids.count(request-&gt;lora_id());
         if (is_new &amp;&amp; (int)batch_lora_ids.size() &gt;= config_.max_loras)
-            continue;  // defer
+            continue;   // defer to next step
         batch_lora_ids.insert(request-&gt;lora_id());
     }
-    // ... schedule request
+    // ... schedule request normally
 }</code></pre>
 
-        <h3>2 — GPU slot exhaustion crash
-          <span class="tag" style="background:#f0fdf4;color:var(--green);border-color:#86efac">✅ Fixed (by Gap 1)</span>
-        </h3>
+        <h3>2 — GPU slot exhaustion crash</h3>
         <p>
-          <strong>Was:</strong> if all <code>max_loras</code> slots were occupied
-          by in-flight adapters, <code>_find_free_slot()</code> raised
-          <code>RuntimeError</code> mid-batch.
+          <strong>Was:</strong> if every <code>max_loras</code> GPU slot was held
+          by an in-flight adapter, <code>_find_free_slot()</code> raised
+          <code>RuntimeError: LoRA GPU pool is full and no evictable adapter was
+          found</code> mid-batch, surfacing as a batch failure instead of a clean
+          deferral.
         </p>
         <p>
-          <strong>Fix:</strong> because the scheduler now caps
-          <code>n_unique ≤ max_loras</code> at batch-build time, the pool
-          always has room for every adapter in the batch.  The crash path in
-          <code>_find_free_slot()</code> is now only reachable if the
-          scheduler invariant is violated externally (e.g., a manually
-          constructed batch), and <code>prepare_loras()</code> still raises a
-          clear error rather than producing wrong outputs.
+          <strong>Fix (consequence of Gap 1):</strong> the scheduler now guarantees
+          <code>n_unique ≤ max_loras</code> before building the batch, so the pool
+          always has room for every adapter.  The crash path in
+          <code>_find_free_slot()</code> is unreachable under normal operation.
+          <code>prepare_loras()</code> still raises a clear error if the invariant
+          is violated externally (defence-in-depth).
         </p>
+
+        <!-- ── Open ──────────────────────────────────────────── -->
+        <div style="margin:28px 0 6px;font-size:11px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;color:var(--muted)">
+          🔲 Open — performance only
+        </div>
 
         <h3>3 — No per-adapter KV page accounting</h3>
         <p>
           KV page eviction is global LRU across all adapters and the base model.
-          A frequently-used adapter can lose its cached prefix pages to a
-          one-shot base-model request, forcing full recomputation on the next
-          step. The simulated-free admission tracking that exists for
-          paged-cache groups operates per <em>group</em>, not per
-          <em>adapter</em>.
+          A hot adapter can lose its cached prefix pages to a one-shot
+          base-model request, forcing full KV recomputation on the next step.
+          The simulated-free admission tracking operates per paged-cache
+          <em>group</em>, not per <em>adapter</em>.
         </p>
         <div class="callout">
           <strong>Where to fix:</strong> add an adapter-priority weight to the
-          LRU eviction comparator, or a minimum-pages reservation per active
-          adapter slot.
+          LRU eviction comparator in <code>KVPrefixCache</code>, or a
+          minimum-pages reservation per active adapter slot in
+          <code>SchedulerConfig</code>.
         </div>
 
         <h3>4 — No KV prefix warming signal</h3>
         <p>
           The scheduler can issue a <code>PrefetchOperation</code> to move KV
-          pages from host to device before a request runs. But there is no
-          mechanism to trigger <em>adapter-level</em> prefix warming — i.e.,
-          pre-populating the KV prefix cache for an adapter's common system
-          prompts before any request for that adapter is scheduled. The warming
-          would need to be driven externally (e.g., a dedicated warmup request
-          at adapter load time).
+          pages from host to device before a request runs, but there is no
+          adapter-level counterpart: common system prompts cannot be
+          pre-populated into the KV prefix cache at adapter load time.  The
+          first request for a freshly loaded adapter always incurs a cold-start
+          KV computation cost.
         </p>
+        <div class="callout">
+          <strong>Where to fix:</strong> at <code>load_lora_adapter()</code> time,
+          submit a synthetic warmup request with the adapter's canonical system
+          prompt so the scheduler fills the prefix cache before real traffic
+          arrives.  No C++ changes required.
+        </div>
 
         <h3>5 — KV eviction does not distinguish active from idle adapters</h3>
         <p>
-          When an adapter is loaded but has no in-flight requests, its KV prefix
-          pages compete on equal terms with actively-serving adapters in the LRU
-          order. There is no "pinning" signal to protect an adapter's prefix
-          cache during a burst gap. The existing virtual-root mechanism makes
-          eviction <em>safe</em> (pages are always returned correctly) but not
-          <em>smart</em>.
+          An adapter with no in-flight requests has its KV prefix pages compete
+          on equal terms in the global LRU.  A burst of base-model or
+          other-adapter traffic can evict all of an adapter's prefix pages
+          during a quiet period, so the next request for that adapter starts
+          cold even though the adapter is still loaded and ready.
         </p>
+        <div class="callout">
+          <strong>Where to fix:</strong> introduce an LRU priority weight per
+          adapter — e.g., boost the last-access time of an adapter's virtual
+          root each time it serves a request.  Alternatively, reserve a
+          minimum number of KV pages per loaded adapter slot in
+          <code>SchedulerConfig</code>.
+        </div>
 
-        <table style="margin-top:24px">
+        <table style="margin-top:28px">
           <thead>
-            <tr><th>Gap</th><th>Severity</th><th>Impact</th><th>Difficulty</th></tr>
+            <tr><th>Gap</th><th>Status</th><th>Impact</th><th>Fix location</th></tr>
           </thead>
           <tbody>
             <tr>
               <td>Adapter-aware co-scheduling</td>
               <td class="good">✅ Fixed</td>
-              <td>Scheduler caps unique lora_ids at max_loras; excess requests deferred to next step</td>
-              <td>Done — scheduler/types.h + forward.cpp + event_loop.py</td>
+              <td>Defers excess-adapter requests rather than producing wrong outputs</td>
+              <td><code>scheduler/types.h</code>, <code>forward.cpp</code>, <code>event_loop.py</code></td>
             </tr>
             <tr>
-              <td>Slot validation / crash on exhaustion</td>
-              <td class="good">✅ Fixed (by Gap 1)</td>
-              <td>n_unique ≤ max_loras guaranteed at schedule time; _find_free_slot crash path now unreachable</td>
-              <td>Done — resolved as side-effect of Gap 1 fix</td>
+              <td>Slot exhaustion crash</td>
+              <td class="good">✅ Fixed (Gap 1)</td>
+              <td><code>_find_free_slot</code> crash path now unreachable</td>
+              <td>Resolved as side-effect of Gap 1</td>
             </tr>
             <tr>
               <td>Per-adapter KV page accounting</td>
-              <td class="good">🟢 Perf only</td>
-              <td>Hot adapter loses prefix cache to base-model requests; recomputes</td>
-              <td>Medium — LRU comparator or per-adapter page reservation</td>
+              <td class="muted">🔲 Open</td>
+              <td>Hot adapter loses prefix cache under cross-adapter LRU pressure</td>
+              <td><code>kv_prefix_cache.cpp</code> LRU comparator</td>
             </tr>
             <tr>
-              <td>KV prefix warming signal</td>
-              <td class="good">🟢 Perf only</td>
-              <td>Cold-start latency for first request after adapter load</td>
-              <td>Low — warmup request at adapter load time</td>
+              <td>KV prefix warming</td>
+              <td class="muted">🔲 Open</td>
+              <td>Cold-start KV cost on first request after adapter load</td>
+              <td>Python-only — warmup request at <code>load_lora_adapter()</code></td>
             </tr>
             <tr>
-              <td>Active vs idle adapter KV pinning</td>
-              <td class="good">🟢 Perf only</td>
-              <td>Prefix cache churn during burst gaps between requests</td>
-              <td>Medium — LRU priority weight per adapter activity</td>
+              <td>Active/idle adapter KV pinning</td>
+              <td class="muted">🔲 Open</td>
+              <td>Prefix cache evicted during quiet periods between request bursts</td>
+              <td><code>kv_prefix_cache.cpp</code> LRU weight or page reservation</td>
             </tr>
           </tbody>
         </table>
