@@ -1528,68 +1528,60 @@ lora_virtual_roots_[lora_id] = raw_ptr;</code></pre>
       <section id="scheduler-gaps">
         <h2>Open Gaps</h2>
         <p>
-          The current scheduler changes cover only KV prefix cache namespace
-          isolation and cleanup. Several LoRA-aware scheduling improvements are
-          not yet implemented.
+          Two of the original five gaps have been addressed. Three performance
+          gaps remain open.
         </p>
 
-        <h3>1 — No adapter-aware co-scheduling
-          <span class="tag" style="background:#fef2f2;color:var(--red);border-color:#fca5a5">🔴 Can produce wrong outputs</span>
+        <h3>1 — Adapter-aware co-scheduling
+          <span class="tag" style="background:#f0fdf4;color:var(--green);border-color:#86efac">✅ Fixed</span>
         </h3>
         <p>
-          <code>newForwardOperation()</code> sorts candidates by FSM state
-          priority (decode &gt; prefill &gt; retracted) but ignores
-          <code>lora_id</code>. When the batch requires more unique adapters than
-          <code>max_loras</code> GPU slots allow simultaneously,
-          <code>prepare_loras()</code> must evict some adapters to promote others.
+          <strong>Was:</strong> <code>newForwardOperation()</code> ignored
+          <code>lora_id</code>, allowing batches with more unique adapters than
+          <code>max_loras</code>. This caused silent wrong outputs — evicted
+          adapters fell back to <code>NO_LORA_SLOT</code> with no error.
         </p>
         <p>
-          The eviction order is LRU across all <em>currently idle</em> adapters
-          (<code>_gpu_lru</code>). If every adapter needed by the current batch is
-          also the LRU candidate, the code will evict adapter A to promote adapter
-          B — then adapter A's requests fall back to <code>NO_LORA_SLOT</code>
-          silently (treated as base model, no error raised) because
-          <code>_ensure_in_gpu(A)</code> is now called with A already evicted.
-          <strong>Those requests produce base-model outputs instead of
-          adapter-A outputs, with no error.</strong>
+          <strong>Fix:</strong> <code>max_loras</code> is now a field on
+          <code>SchedulerConfig</code> (passed from <code>server_args.max_loras</code>).
+          <code>newForwardOperation()</code> tracks a
+          <code>batch_lora_ids</code> set and skips any request whose
+          <code>lora_id</code> would push the count over the cap — deferring it
+          to the next step instead.  As a side effect, requests for the same
+          adapter naturally cluster into the same batch step, reducing GPU slot
+          thrashing.  The <code>prepare_loras()</code>
+          <code>RuntimeError</code> for <code>n_unique &gt; max_loras</code> is
+          now unreachable in normal operation.
         </p>
-        <p>
-          In practice this is avoided by setting <code>max_loras</code> ≥ the
-          number of unique adapters in any single batch, or by using the Python
-          pack scheduling policy to never co-schedule more adapters than
-          <code>max_loras</code>. But neither is enforced in the C++ scheduler.
-        </p>
-        <div class="callout">
-          <strong>Where to fix:</strong> the C++ scheduler should cap the number of
-          unique <code>lora_id</code> values in a single batch to
-          <code>max_loras</code>, deferring excess requests to the next step.
-          Alternatively, enforce this in Python's <code>prepare_loras()</code>
-          by raising an error (rather than silently falling back to base model)
-          when an adapter cannot be promoted.
-        </div>
+        <pre><code>// scheduler/operations/forward.cpp
+std::unordered_set&lt;int32_t&gt; batch_lora_ids;
+for (Request* request : candidates) {
+    if (config_.max_loras > 0 &amp;&amp; request-&gt;lora_id() != kLoraNone) {
+        bool is_new = !batch_lora_ids.count(request-&gt;lora_id());
+        if (is_new &amp;&amp; (int)batch_lora_ids.size() &gt;= config_.max_loras)
+            continue;  // defer
+        batch_lora_ids.insert(request-&gt;lora_id());
+    }
+    // ... schedule request
+}</code></pre>
 
-        <h3>2 — GPU slot exhaustion raises a hard crash
-          <span class="tag" style="background:#fff7ed;color:var(--amber);border-color:#fcd34d">🟠 RuntimeError</span>
+        <h3>2 — GPU slot exhaustion crash
+          <span class="tag" style="background:#f0fdf4;color:var(--green);border-color:#86efac">✅ Fixed (by Gap 1)</span>
         </h3>
         <p>
-          If all <code>max_loras</code> GPU slots are occupied by adapters that
-          are currently in-flight in other requests and therefore not in the LRU
-          eviction pool, <code>_find_free_slot()</code> raises:
+          <strong>Was:</strong> if all <code>max_loras</code> slots were occupied
+          by in-flight adapters, <code>_find_free_slot()</code> raised
+          <code>RuntimeError</code> mid-batch.
         </p>
-        <pre><code>RuntimeError: LoRA GPU pool is full and no evictable adapter was found.
-Increase max_loras (current: N).</code></pre>
         <p>
-          This happens mid-forward rather than at schedule time, meaning the
-          scheduler already committed to running those requests. The error
-          surfaces as a batch failure rather than a clean deferral.
+          <strong>Fix:</strong> because the scheduler now caps
+          <code>n_unique ≤ max_loras</code> at batch-build time, the pool
+          always has room for every adapter in the batch.  The crash path in
+          <code>_find_free_slot()</code> is now only reachable if the
+          scheduler invariant is violated externally (e.g., a manually
+          constructed batch), and <code>prepare_loras()</code> still raises a
+          clear error rather than producing wrong outputs.
         </p>
-        <div class="callout">
-          <strong>Where to fix:</strong> expose a
-          <code>lora_slot_available(lora_id)</code> query from
-          <code>LoraManager</code> so the C++ scheduler can defer requests
-          whose adapter cannot be promoted before building the batch, rather
-          than crashing mid-execution.
-        </div>
 
         <h3>3 — No per-adapter KV page accounting</h3>
         <p>
@@ -1634,15 +1626,15 @@ Increase max_loras (current: N).</code></pre>
           <tbody>
             <tr>
               <td>Adapter-aware co-scheduling</td>
-              <td class="bad">🔴 Wrong outputs</td>
-              <td>Requests silently run as base model when adapter slot cannot be promoted</td>
-              <td>Medium — cap unique lora_ids per batch to max_loras in scheduler</td>
+              <td class="good">✅ Fixed</td>
+              <td>Scheduler caps unique lora_ids at max_loras; excess requests deferred to next step</td>
+              <td>Done — scheduler/types.h + forward.cpp + event_loop.py</td>
             </tr>
             <tr>
-              <td>Slot validation at schedule time</td>
-              <td class="warn">🟠 RuntimeError</td>
-              <td>Hard crash mid-batch if all slots occupied by in-flight requests</td>
-              <td>Low — expose lora_slot_available() query from Python</td>
+              <td>Slot validation / crash on exhaustion</td>
+              <td class="good">✅ Fixed (by Gap 1)</td>
+              <td>n_unique ≤ max_loras guaranteed at schedule time; _find_free_slot crash path now unreachable</td>
+              <td>Done — resolved as side-effect of Gap 1 fix</td>
             </tr>
             <tr>
               <td>Per-adapter KV page accounting</td>
