@@ -35,6 +35,8 @@ from typing import (
 import zmq
 
 from tokenspeed.runtime.engine.io_struct import (
+    ContinueGenerationReqInput,
+    ContinueGenerationReqOutput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     FlushCacheReqInput,
@@ -47,6 +49,8 @@ from tokenspeed.runtime.engine.io_struct import (
     GetWeightsByNameReqOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
+    PauseGenerationReqInput,
+    PauseGenerationReqOutput,
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
@@ -178,6 +182,12 @@ class SchedulerControlClient:
             server_args.mapping.attn.dp_size,
             mode="watching",
         )
+        self.pause_generation_communicator = _Communicator(
+            self.engine_core_client.send_to_scheduler, server_args.mapping.attn.dp_size
+        )
+        self.continue_generation_communicator = _Communicator(
+            self.engine_core_client.send_to_scheduler, server_args.mapping.attn.dp_size
+        )
 
         self._result_dispatcher += self._get_communicator_dispatcher()
 
@@ -231,6 +241,14 @@ class SchedulerControlClient:
                 (
                     GetLoadReqOutput,
                     self.get_load_communicator.handle_recv,
+                ),
+                (
+                    PauseGenerationReqOutput,
+                    self.pause_generation_communicator.handle_recv,
+                ),
+                (
+                    ContinueGenerationReqOutput,
+                    self.continue_generation_communicator.handle_recv,
                 ),
             ]
         )
@@ -374,3 +392,19 @@ class SchedulerControlClient:
     async def get_load(self: AsyncLLM) -> list[GetLoadReqOutput]:
         req = GetLoadReqInput()
         return await self.get_load_communicator(req)
+
+    async def pause_generation(
+        self: AsyncLLM, mode: str = "abort"
+    ) -> PauseGenerationReqOutput:
+        self.auto_create_handle_loop()
+        if mode == "abort":
+            for rid in list(self.rid_to_state.keys()):
+                self.abort_request(rid)
+        obj = PauseGenerationReqInput(mode=mode)
+        return (await self.pause_generation_communicator(obj))[0]
+
+    async def continue_generation(self: AsyncLLM) -> ContinueGenerationReqOutput:
+        self.auto_create_handle_loop()
+        return (
+            await self.continue_generation_communicator(ContinueGenerationReqInput())
+        )[0]

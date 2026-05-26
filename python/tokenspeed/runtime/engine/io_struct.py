@@ -833,6 +833,28 @@ class WatchLoadUpdateReq(BaseReq):
     loads: list[GetLoadReqOutput] = field(default_factory=list)
 
 
+@dataclass
+class PauseGenerationReqInput:
+    mode: str = "abort"  # "abort" | "retract" | "in_place"
+
+
+@dataclass
+class PauseGenerationReqOutput:
+    success: bool
+    message: str
+
+
+@dataclass
+class ContinueGenerationReqInput:
+    pass
+
+
+@dataclass
+class ContinueGenerationReqOutput:
+    success: bool
+    message: str
+
+
 class BlockReqType(Enum):
     BLOCK = 1
     UNBLOCK = 2

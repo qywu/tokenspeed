@@ -35,12 +35,16 @@ from tokenspeed.runtime.distributed.process_group_manager import (
 from tokenspeed.runtime.engine.generation_output_processor import RequestState
 from tokenspeed.runtime.engine.io_struct import (
     AbortReq,
+    ContinueGenerationReqInput,
+    ContinueGenerationReqOutput,
     FlushCacheReqInput,
     FlushCacheReqOutput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
     GetLoadReqInput,
     GetLoadReqOutput,
+    PauseGenerationReqInput,
+    PauseGenerationReqOutput,
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
@@ -84,6 +88,7 @@ class RequestHandler:
     ) -> None:
 
         self.forward_ct = 0
+        self.is_paused: bool = False
         self.server_args = server_args
 
         mapping = server_args.mapping
@@ -181,6 +186,16 @@ class RequestHandler:
                     self.send_func.send_pyobj(self.get_load_fn())
                 else:
                     self.send_func.send_pyobj(GetLoadReqOutput())
+            elif isinstance(recv_req, PauseGenerationReqInput):
+                self.is_paused = True
+                self.send_func.send_pyobj(
+                    PauseGenerationReqOutput(success=True, message="")
+                )
+            elif isinstance(recv_req, ContinueGenerationReqInput):
+                self.is_paused = False
+                self.send_func.send_pyobj(
+                    ContinueGenerationReqOutput(success=True, message="")
+                )
             else:
                 raise NotImplementedError(f"Unsupported request type: {type(recv_req)}")
         return new_req_specs, req_states, bootstrap_infos, abort_rids
