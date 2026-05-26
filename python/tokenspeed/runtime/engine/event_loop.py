@@ -212,6 +212,7 @@ class EventLoop:
         # _commit_cache_results entirely when nothing is in flight.
         self._num_inflight_cache_ops = 0
         self._retracting = False
+        self._retract_needs_clear = False
         self.dp_rank = dp_rank
         self.dp_size = mapping.attn.dp_size
         self.has_dp = mapping.has_attn_dp
@@ -1023,6 +1024,7 @@ class EventLoop:
         from tokenspeed.runtime.engine.io_struct import PauseGenerationReqOutput
 
         self._retracting = False
+        self._retract_needs_clear = True
         self.request_handler.is_paused = True
         self.request_handler.send_func.send_pyobj(
             PauseGenerationReqOutput(success=True, message="")
@@ -1041,6 +1043,10 @@ class EventLoop:
 
             if self.request_handler.is_paused:
                 continue
+
+            if self._retract_needs_clear:
+                self.scheduler.clear_bulk_retract()
+                self._retract_needs_clear = False
 
             execution_plan = self.scheduler.next_execution_plan()
             self._publish_scheduler_kv_events()
@@ -1189,6 +1195,11 @@ class EventLoop:
                     prev_results = None
                     prev_forward_op = None
                 continue
+
+            if self._retract_needs_clear:
+                self.scheduler.clear_bulk_retract()
+                self._retract_needs_clear = False
+
             execution_plan = self.scheduler.next_execution_plan()
             self._publish_scheduler_kv_events()
 

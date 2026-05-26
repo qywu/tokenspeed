@@ -220,7 +220,14 @@ std::size_t Scheduler::BulkRetractRunning() {
             pending_retract_ops_.push_back(std::move(*op));
         }
     }
+    if (!to_retract.empty()) {
+        bulk_retract_active_ = true;
+    }
     return to_retract.size();
+}
+
+void Scheduler::ClearBulkRetract() {
+    bulk_retract_active_ = false;
 }
 
 std::size_t Scheduler::AvailableKvPages() const {
@@ -338,7 +345,8 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
     std::vector<Request*> candidates;
     for (auto& [id, req] : requests_) {
         if (!req->Is<fsm::Draining>() && !req->Is<fsm::Prefetching>() && !req->Is<fsm::Retracting>() &&
-            !req->Is<fsm::WritingBack>()) {
+            !req->Is<fsm::WritingBack>() &&
+            !(bulk_retract_active_ && req->Is<fsm::Retracted>())) {
             candidates.push_back(req.get());
         }
     }

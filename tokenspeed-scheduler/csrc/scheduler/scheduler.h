@@ -68,6 +68,8 @@ public:
     // Their WriteBack ops are staged and emitted by the next NextExecutionPlan() call.
     // Returns the number of requests queued for retraction.
     std::size_t BulkRetractRunning();
+    // Clear the bulk-retract guard so retracted requests resume normal scheduling.
+    void ClearBulkRetract();
     std::size_t AvailableKvPages() const;
     std::size_t ActiveKvPages() const;
     std::size_t PrefillSize() const;
@@ -148,6 +150,7 @@ private:
     std::unordered_map<cache_op_id, CacheOpSpec> cache_op_tracker_;
     std::vector<KvCacheEvent> kv_events_;
     std::vector<WriteBackOperation> pending_retract_ops_;
+    bool bulk_retract_active_{false};
     // Stats
     SchedulerStats stats_;
 };
