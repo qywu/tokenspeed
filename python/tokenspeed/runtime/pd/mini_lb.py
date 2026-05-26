@@ -491,6 +491,40 @@ async def stop_profile():
     return await load_balancer.profile(prefill_server, decode_server, "stop_profile")
 
 
+@app.post("/pause_generation")
+async def pause_generation(request: Request):
+    body = await request.json()
+    mode = body.get("mode", "abort")
+    prefill_servers, decode_servers = (
+        load_balancer.prefill_servers,
+        load_balancer.decode_servers,
+    )
+    async with aiohttp.ClientSession() as session:
+        tasks = []
+        for server in chain(prefill_servers, decode_servers):
+            tasks.append(
+                session.post(f"{server}/pause_generation", json={"mode": mode})
+            )
+        for response in asyncio.as_completed(tasks):
+            await response
+    return ORJSONResponse({"success": True})
+
+
+@app.post("/continue_generation")
+async def continue_generation():
+    prefill_servers, decode_servers = (
+        load_balancer.prefill_servers,
+        load_balancer.decode_servers,
+    )
+    async with aiohttp.ClientSession() as session:
+        tasks = []
+        for server in chain(prefill_servers, decode_servers):
+            tasks.append(session.post(f"{server}/continue_generation"))
+        for response in asyncio.as_completed(tasks):
+            await response
+    return ORJSONResponse({"success": True})
+
+
 @app.post("/generate")
 async def handle_generate_request(request_data: dict, raw_request: Request):
     # Log incoming request

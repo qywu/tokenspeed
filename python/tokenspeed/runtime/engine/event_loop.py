@@ -935,6 +935,8 @@ class EventLoop:
         while True:
             self._process_new_requests()
             self._commit_cache_results()
+            if self.request_handler.is_paused:
+                continue
             execution_plan = self.scheduler.next_execution_plan()
             self._publish_scheduler_kv_events()
             self._submit_cache_ops(execution_plan)
@@ -1049,6 +1051,17 @@ class EventLoop:
             )
             self._process_new_requests()
             self._commit_cache_results()
+            if self.request_handler.is_paused:
+                if prev_results is not None:
+                    request_changes = self._commit_forward_results(
+                        prev_forward_op, prev_results
+                    )
+                    if request_changes:
+                        advance_forward(self.scheduler, request_changes)
+                        self._publish_scheduler_kv_events()
+                    prev_results = None
+                    prev_forward_op = None
+                continue
             execution_plan = self.scheduler.next_execution_plan()
             self._publish_scheduler_kv_events()
 

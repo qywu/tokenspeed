@@ -65,6 +65,7 @@ from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.engine.io_struct import (
     CloseSessionReqInput,
     ConfigureLoggingReq,
+    ContinueGenerationReqOutput,
     EmbeddingReqInput,
     FlushCacheReqOutput,
     GenerateReqInput,
@@ -72,6 +73,7 @@ from tokenspeed.runtime.engine.io_struct import (
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
     OpenSessionReqInput,
+    PauseGenerationReqOutput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     SetInternalStateReq,
@@ -216,3 +218,9 @@ class EngineClient(Protocol):
     async def set_internal_state(self, obj: SetInternalStateReq) -> list[bool]: ...
 
     async def get_load(self) -> list[GetLoadReqOutput]: ...
+
+    async def pause_generation(
+        self, mode: str = "abort"
+    ) -> PauseGenerationReqOutput: ...
+
+    async def continue_generation(self) -> ContinueGenerationReqOutput: ...

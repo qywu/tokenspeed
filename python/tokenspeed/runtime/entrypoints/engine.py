@@ -319,6 +319,12 @@ class Engine(EngineBase):
     def stop_profile(self):
         self.llm.run(self.tokenizer_manager.stop_profile())
 
+    def pause_generation(self, mode: str = "abort"):
+        return self.llm.run(self.tokenizer_manager.pause_generation(mode))
+
+    def continue_generation(self):
+        return self.llm.run(self.tokenizer_manager.continue_generation())
+
     def start_expert_distribution_record(self):
         self.llm.run(self.tokenizer_manager.start_expert_distribution_record())
 
