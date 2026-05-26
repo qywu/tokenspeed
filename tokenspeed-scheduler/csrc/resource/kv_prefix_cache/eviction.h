@@ -189,7 +189,7 @@ void ResourceManager<RType>::EvictSubtree(const std::vector<TreeNode*>& nodes) {
 
         auto it = node_time_.find(node);
         if (it != node_time_.end()) {
-            lru_leaves_.erase({it->second, node});
+            lru_leaves_.erase({it->second, node->SeqId(), node});
             node_time_.erase(it);
             GetResource<RType>(node).ClearEvictableNotifier();
         }
