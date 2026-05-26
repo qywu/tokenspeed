@@ -577,11 +577,23 @@ _id_to_name:    dict[int, str]        # stable lora_id -> user name
 _adapter_paths: dict[str, str]        # user name -> durable adapter directory</code></pre>
 
         <h3>Residency State</h3>
-        <pre><code>_cpu_cache:     dict[str, AdapterWeights]  # parsed host weights
-_cpu_lru:       OrderedDict[str, None]     # CPU eviction order
-_name_to_slot:  dict[str, int]             # GPU-resident name -> slot
-_slot_to_name:  list[str | None]           # slot -> GPU-resident name
-_gpu_lru:       OrderedDict[str, None]     # GPU eviction order</code></pre>
+        <pre><code>_cpu_cache:          dict[str, AdapterWeights]    # parsed host weights
+_cpu_lru:            OrderedDict[str, None]        # CPU eviction order
+_name_to_slot:       dict[str, int]                # GPU-resident name -> slot
+_slot_to_name:       list[str | None]              # slot -> GPU-resident name
+_gpu_lru:            OrderedDict[str, None]        # GPU LRU eviction order
+_active_names:       set[str]                      # adapters in the most recent batch
+_pending_eviction:   set[tuple[str, int]]          # (name, lora_id) deferred unloads</code></pre>
+        <p style="font-size:14px;color:var(--muted)">
+          <code>_active_names</code> is refreshed at the start of every
+          <code>prepare_loras()</code> call.  <code>_pending_eviction</code>
+          accumulates <code>(name, lora_id)</code> pairs when
+          <code>unload_adapter()</code> is called while the adapter may still
+          be in-flight; each entry is flushed on the next batch that does not
+          include that adapter.  The tuple form lets
+          <code>_flush_one_pending</code> detect same-name re-registrations
+          and skip GPU eviction if the slot now belongs to a new adapter.
+        </p>
       </section>
 
       <section id="lifecycle">
