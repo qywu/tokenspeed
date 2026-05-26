@@ -89,6 +89,7 @@ class RequestHandler:
 
         self.forward_ct = 0
         self.is_paused: bool = False
+        self.retract_pending: bool = False
         self.server_args = server_args
 
         mapping = server_args.mapping
@@ -187,10 +188,15 @@ class RequestHandler:
                 else:
                     self.send_func.send_pyobj(GetLoadReqOutput())
             elif isinstance(recv_req, PauseGenerationReqInput):
-                self.is_paused = True
-                self.send_func.send_pyobj(
-                    PauseGenerationReqOutput(success=True, message="")
-                )
+                if recv_req.mode == "retract":
+                    # Deferred: EventLoop kicks off bulk_retract_running() and
+                    # sends PauseGenerationReqOutput when all requests are retracted.
+                    self.retract_pending = True
+                else:
+                    self.is_paused = True
+                    self.send_func.send_pyobj(
+                        PauseGenerationReqOutput(success=True, message="")
+                    )
             elif isinstance(recv_req, ContinueGenerationReqInput):
                 self.is_paused = False
                 self.send_func.send_pyobj(

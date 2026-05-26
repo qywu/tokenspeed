@@ -211,6 +211,7 @@ class EventLoop:
         # rank has anything pending. Lets us skip the TP collective in
         # _commit_cache_results entirely when nothing is in flight.
         self._num_inflight_cache_ops = 0
+        self._retracting = False
         self.dp_rank = dp_rank
         self.dp_size = mapping.attn.dp_size
         self.has_dp = mapping.has_attn_dp
@@ -1010,13 +1011,37 @@ class EventLoop:
     # Event loops
     # ------------------------------------------------------------------
 
+    def _check_retract_complete(self) -> bool:
+        """True when all bulk-retracted requests have finished writing back to host."""
+        return (
+            self.scheduler.decoding_size() == 0
+            and self.scheduler.prefilling_size() == 0
+            and self._num_inflight_cache_ops == 0
+        )
+
+    def _finish_retract(self) -> None:
+        from tokenspeed.runtime.engine.io_struct import PauseGenerationReqOutput
+
+        self._retracting = False
+        self.request_handler.is_paused = True
+        self.request_handler.send_func.send_pyobj(
+            PauseGenerationReqOutput(success=True, message="")
+        )
+
     def event_loop(self):
         """Non-overlapping scheduler loop."""
         while True:
             self._process_new_requests()
             self._commit_cache_results()
+
+            if self.request_handler.retract_pending:
+                self.request_handler.retract_pending = False
+                self.scheduler.bulk_retract_running()
+                self._retracting = True
+
             if self.request_handler.is_paused:
                 continue
+
             execution_plan = self.scheduler.next_execution_plan()
             self._publish_scheduler_kv_events()
             self._submit_cache_ops(execution_plan)
@@ -1028,6 +1053,12 @@ class EventLoop:
             num_iter_tokens = (
                 sum(forward_op.input_lengths) if forward_op is not None else 0
             )
+
+            if self._retracting:
+                if self._check_retract_complete():
+                    self._finish_retract()
+                self._record_scheduler_iteration_metrics(stats, num_iter_tokens)
+                continue
 
             # DP sync: all ranks must participate even when idle.
             dp_metadata = None
@@ -1131,6 +1162,22 @@ class EventLoop:
             )
             self._process_new_requests()
             self._commit_cache_results()
+
+            if self.request_handler.retract_pending:
+                self.request_handler.retract_pending = False
+                # Drain in-flight results before retracting so GPU tensors aren't held.
+                if prev_results is not None:
+                    request_changes = self._commit_forward_results(
+                        prev_forward_op, prev_results
+                    )
+                    if request_changes:
+                        advance_forward(self.scheduler, request_changes)
+                        self._publish_scheduler_kv_events()
+                    prev_results = None
+                    prev_forward_op = None
+                self.scheduler.bulk_retract_running()
+                self._retracting = True
+
             if self.request_handler.is_paused:
                 if prev_results is not None:
                     request_changes = self._commit_forward_results(
@@ -1154,6 +1201,13 @@ class EventLoop:
             num_iter_tokens = (
                 sum(forward_op.input_lengths) if forward_op is not None else 0
             )
+
+            if self._retracting:
+                if self._check_retract_complete():
+                    self._finish_retract()
+                self._record_scheduler_iteration_metrics(stats, num_iter_tokens)
+                # prev_results cleared when retract_pending fired; nothing to dispatch.
+                continue
 
             grammar_inputs = None
             if forward_op is not None:

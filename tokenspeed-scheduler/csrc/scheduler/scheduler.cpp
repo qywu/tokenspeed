@@ -208,6 +208,21 @@ std::size_t Scheduler::RetractedSize() const {
     return count;
 }
 
+std::size_t Scheduler::BulkRetractRunning() {
+    std::vector<Request*> to_retract;
+    for (auto& [id, req] : requests_) {
+        if (req->Is<fsm::Decoding>() || req->Is<fsm::PrefillDone>()) {
+            to_retract.push_back(req.get());
+        }
+    }
+    for (auto* req : to_retract) {
+        if (auto op = newRetractOperation(req)) {
+            pending_retract_ops_.push_back(std::move(*op));
+        }
+    }
+    return to_retract.size();
+}
+
 std::size_t Scheduler::AvailableKvPages() const {
     return device_allocator_.AvailablePages();
 }
@@ -304,6 +319,12 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
 
     std::vector<WriteBackOperation> write_back_ops;
     write_back_ops = std::move(newWriteBackOperation(requests_));
+    if (!pending_retract_ops_.empty()) {
+        write_back_ops.insert(write_back_ops.end(),
+                              std::make_move_iterator(pending_retract_ops_.begin()),
+                              std::make_move_iterator(pending_retract_ops_.end()));
+        pending_retract_ops_.clear();
+    }
 
     if (hybrid_prefix_cache_) {
         for (const auto& [id, req] : requests_) {

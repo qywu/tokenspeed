@@ -64,6 +64,10 @@ public:
     std::size_t WaitingSize() const;
     std::size_t DecodingSize() const;
     std::size_t RetractedSize() const;
+    // Retract all currently running (Decoding/PrefillDone) requests.
+    // Their WriteBack ops are staged and emitted by the next NextExecutionPlan() call.
+    // Returns the number of requests queued for retraction.
+    std::size_t BulkRetractRunning();
     std::size_t AvailableKvPages() const;
     std::size_t ActiveKvPages() const;
     std::size_t PrefillSize() const;
@@ -143,6 +147,7 @@ private:
     std::unordered_map<std::string, std::unique_ptr<Request>> requests_;
     std::unordered_map<cache_op_id, CacheOpSpec> cache_op_tracker_;
     std::vector<KvCacheEvent> kv_events_;
+    std::vector<WriteBackOperation> pending_retract_ops_;
     // Stats
     SchedulerStats stats_;
 };
