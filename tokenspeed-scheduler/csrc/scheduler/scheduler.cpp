@@ -209,6 +209,9 @@ std::size_t Scheduler::RetractedSize() const {
 }
 
 std::size_t Scheduler::BulkRetractRunning() {
+    // Always set the guard, even when there are no decoding/done requests yet
+    // (Prefilling requests will be caught on subsequent calls as they reach PrefillDone).
+    bulk_retract_active_ = true;
     std::vector<Request*> to_retract;
     for (auto& [id, req] : requests_) {
         if (req->Is<fsm::Decoding>() || req->Is<fsm::PrefillDone>()) {
@@ -219,9 +222,6 @@ std::size_t Scheduler::BulkRetractRunning() {
         if (auto op = newRetractOperation(req)) {
             pending_retract_ops_.push_back(std::move(*op));
         }
-    }
-    if (!to_retract.empty()) {
-        bulk_retract_active_ = true;
     }
     return to_retract.size();
 }
@@ -327,8 +327,7 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
     std::vector<WriteBackOperation> write_back_ops;
     write_back_ops = std::move(newWriteBackOperation(requests_));
     if (!pending_retract_ops_.empty()) {
-        write_back_ops.insert(write_back_ops.end(),
-                              std::make_move_iterator(pending_retract_ops_.begin()),
+        write_back_ops.insert(write_back_ops.end(), std::make_move_iterator(pending_retract_ops_.begin()),
                               std::make_move_iterator(pending_retract_ops_.end()));
         pending_retract_ops_.clear();
     }
@@ -346,7 +345,8 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
     for (auto& [id, req] : requests_) {
         if (!req->Is<fsm::Draining>() && !req->Is<fsm::Prefetching>() && !req->Is<fsm::Retracting>() &&
             !req->Is<fsm::WritingBack>() &&
-            !(bulk_retract_active_ && req->Is<fsm::Retracted>())) {
+            !(bulk_retract_active_ &&
+              (req->Is<fsm::Submitted>() || req->Is<fsm::Retracted>() || req->Is<fsm::PrefillDone>()))) {
             candidates.push_back(req.get());
         }
     }

@@ -1061,6 +1061,9 @@ class EventLoop:
             )
 
             if self._retracting:
+                # Re-run on each iteration to catch requests that completed prefill
+                # after the initial bulk_retract_running() call.
+                self.scheduler.bulk_retract_running()
                 if self._check_retract_complete():
                     self._finish_retract()
                 self._record_scheduler_iteration_metrics(stats, num_iter_tokens)
@@ -1214,6 +1217,7 @@ class EventLoop:
             )
 
             if self._retracting:
+                self.scheduler.bulk_retract_running()
                 if self._check_retract_complete():
                     self._finish_retract()
                 self._record_scheduler_iteration_metrics(stats, num_iter_tokens)
