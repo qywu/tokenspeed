@@ -42,8 +42,6 @@ enum class DisaggregationMode {
     kPrefill,
     kDecode,
 };
-// `PagedCacheGroupFamily` and `StateRestorePolicy` are defined in
-// resource/allocator/paged_cache_group.h (transitively included above).
 
 template <ResourceType>
 class NodeRef;
@@ -84,7 +82,6 @@ struct SchedulerConfig {
     } device_allocator;
 
     std::vector<PagedCacheGroupConfig> paged_cache_groups{};
-
     // Unset means paged-cache groups are transport-only.
     std::optional<PrefixCacheAdjunctSpec> prefix_cache_adjunct{};
 
@@ -106,6 +103,12 @@ struct SchedulerConfig {
     std::int32_t mamba_pool_total_chunks{0};
     bool enable_mamba_l2{false};
     std::int32_t mamba_l2_host_slots{0};
+
+    // Maximum number of unique LoRA adapter ids allowed in a single batch.
+    // 0 means LoRA is disabled (no cap enforced).  When set, newForwardOperation
+    // defers requests that would push the batch over this limit to the next step,
+    // guaranteeing that prepare_loras() never sees n_unique > max_loras.
+    std::int32_t max_loras{0};
 };
 
 }  // namespace tokenspeed
