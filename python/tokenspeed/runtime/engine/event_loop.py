@@ -19,7 +19,6 @@
 # SOFTWARE.
 
 import faulthandler
-import os
 import signal
 import time
 from collections import OrderedDict
@@ -300,11 +299,8 @@ class EventLoop:
                 f"(ratio={server_args.mamba_full_memory_ratio})."
             )
 
-        enable_mixed_prefill_decode = (
-            server_args.enable_mixed_batch and server_args.speculative_algorithm is None
-        )
-
         # Adjunct enabled only when pool opts in AND prefix-caching switch is on.
+
         paged_cache_groups = pool_to_paged_cache_groups(token_to_kv_pool)
         prefix_cache_adjunct = None
         required_groups = token_to_kv_pool.prefix_cache_required_group_ids
@@ -333,9 +329,9 @@ class EventLoop:
             enable_mamba_l2=server_args.enable_mamba_l2,
             mamba_l2_host_slots=mamba_l2_host_slots,
             paged_cache_groups=paged_cache_groups,
-            enable_mixed_prefill_decode=enable_mixed_prefill_decode,
+            enable_mixed_prefill_decode=server_args.enable_mixed_batch,
             prefix_cache_adjunct=prefix_cache_adjunct,
-            max_loras=server_args.max_loras if server_args.enable_lora else 0,
+            max_loras=0,
         )
         logger.info(
             "Scheduler config: page_size=%s num_device_pages=%s "
@@ -386,8 +382,6 @@ class EventLoop:
             send_func=self.send_to_tokenizer,
             get_load_fn=self._get_load,
             architectures=self.model_config.hf_config.architectures,
-            load_lora_fn=self.load_lora_adapter,
-            unload_lora_fn=self.unload_lora_adapter,
         )
 
         self.output_processor = OutputProcesser(
@@ -442,60 +436,6 @@ class EventLoop:
             )
         else:
             self.pd_kv_transfer = None
-
-        # ── LoRA ─────────────────────────────────────────────────────────────
-        self._lora_manager = None  # LoraManager (lazy init)
-        self._lora_name_to_id: dict[str, int] = {}  # name → integer lora_id
-        self._request_lora_ids: dict[str, int] = {}  # rid → lora_id
-
-        if server_args.enable_lora:
-            self._init_lora_manager()
-
-    def _init_lora_manager(self) -> None:
-        """Bind to the LoraManager owned by the model executor.
-
-        The model executor creates the manager during its own ``__init__`` so
-        that the CUDA-graph capture sees a live manager (and bakes the LoRA
-        delta path into the captured graphs).  The event loop only borrows
-        the reference and shares its request-id → lora-id map.
-        """
-        self._lora_manager = self.model_executor.lora_manager
-        if self._lora_manager is None:
-            raise RuntimeError(
-                "Model executor was not configured with --enable-lora; "
-                "cannot initialize LoRA support."
-            )
-        self.model_executor.request_lora_ids = self._request_lora_ids
-        logger.info("LoraManager bound (max_loras=%d)", self.server_args.max_loras)
-
-    def load_lora_adapter(self, lora_name: str, adapter_path: str) -> int:
-        """Load a PEFT LoRA adapter and make it available for serving.
-
-        Returns the integer lora_id assigned to this adapter.
-        """
-        if not self.server_args.enable_lora:
-            raise ValueError(
-                "Server was not started with --enable-lora. "
-                "Restart with --enable-lora to use LoRA adapters."
-            )
-        if self._lora_manager is None:
-            self._init_lora_manager()
-        lora_id = self._lora_manager.load_adapter(lora_name, adapter_path)
-        self._lora_name_to_id[lora_name] = lora_id
-        logger.info("Loaded LoRA adapter '%s' → lora_id=%d", lora_name, lora_id)
-        return lora_id
-
-    def unload_lora_adapter(self, lora_name: str) -> None:
-        """Unload a LoRA adapter and free its GPU slot."""
-        if self._lora_manager is None:
-            raise KeyError(f"No LoRA adapters loaded; '{lora_name}' not found.")
-        lora_id = self._lora_name_to_id.get(lora_name)
-        self._lora_manager.unload_adapter(lora_name)
-        self._lora_name_to_id.pop(lora_name, None)
-        # Proactively evict the KV cache namespace for this adapter so pages
-        # are freed immediately rather than waiting for LRU eviction pressure.
-        if lora_id is not None:
-            self.scheduler.evict_lora_namespace(lora_id)
 
     def _setup_pd_layerwise_transfer(self, interval: int) -> None:
         if not isinstance(self.pd_kv_transfer, DisaggPrefillExecutor):
@@ -928,42 +868,8 @@ class EventLoop:
                     spec.rolling_hashes = hashes
                     spec.storage_hit_pages = hit_pages
             admitted_specs.append(spec)
-            # Track lora_id per request for forward-pass injection
-            if spec.lora_id != 0:
-                self._request_lora_ids[spec.request_id] = spec.lora_id
-                # Async-prefetch the adapter into the CPU pool so the
-                # disk read is overlapped with the previous forward step
-                # rather than blocking ``prepare_loras`` of the step that
-                # actually consumes it.  No-op when already CPU-resident.
-                if (
-                    self._lora_manager is not None
-                    and os.environ.get("TOKENSPEED_LORA_PREFETCH", "1") == "1"
-                ):
-                    name = self._lora_manager._id_to_name.get(spec.lora_id)
-                    if name is not None:
-                        self._lora_manager.prefetch(name)
 
         if admitted_specs:
-            # Optional ``pack`` policy: cluster admissions by lora_id so
-            # adapter-shared requests batch together at the C++ scheduler.
-            # Reduces GPU/CPU eviction churn under heavy mixed-adapter
-            # traffic (multiple distinct adapters > max_loras).
-            #
-            # Sort is stable: requests for the same adapter keep their
-            # arrival order, base-model (lora_id == 0) requests stay
-            # together at the front (their slot is the no-op sentinel).
-            #
-            # The benchmark in benchmark/test_lora_eviction_latency.py
-            # shows that CPU↔GPU promotion is essentially free; the
-            # only meaningful eviction cost is CPU→disk re-read (~30 ms).
-            # ``pack`` therefore mainly helps when ``working_set >
-            # max_loras_cpu`` and incoming traffic is bursty enough that
-            # multiple cold requests arrive in one event-loop iteration.
-            if (
-                self._lora_manager is not None
-                and self.server_args.lora_scheduling_policy == "pack"
-            ):
-                admitted_specs.sort(key=lambda s: s.lora_id)
             self.scheduler.submit_requests(admitted_specs)
 
     @nvtx_range("loop:commit", color="rapids")
