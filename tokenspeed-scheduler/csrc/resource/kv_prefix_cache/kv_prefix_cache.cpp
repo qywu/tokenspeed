@@ -146,6 +146,14 @@ TreeNode* KVPrefixCache::getOrCreateLoraRoot(std::int32_t lora_id) {
     // IsEmpty() stays true on both, so the root never enters lru_leaves_.
     raw->AttachResource<ResourceType::Device>(std::make_unique<NodeResource<ResourceType::Device>>(OwnedPages{}));
     raw->AttachResource<ResourceType::Host>(std::make_unique<NodeResource<ResourceType::Host>>(OwnedPages{}));
+    // Seed the virtual root's block hash so adapter-namespaced KV events never
+    // collide with the base model or other adapters in published_device_blocks_
+    // (or any external L3/KV-event consumer keyed by block hash). The sentinel
+    // tokens [-lora_id, 0, ...] guarantee a per-adapter hash; descendants chain
+    // off it via ParentBlockHash() -> virtual_root->BlockHash() and inherit
+    // the namespace boundary in their published block_hashes.
+    std::span<const std::int32_t> sentinel_span{sentinel.data(), sentinel.size()};
+    raw->SetBlockHashes({HashKvBlock(sentinel_span, /*parent_hash=*/std::nullopt)});
     token_vec_t key(sentinel.begin(), sentinel.begin() + page_size);
     tree_.Root()->AddChild(key, std::move(node));
     slot = raw;
