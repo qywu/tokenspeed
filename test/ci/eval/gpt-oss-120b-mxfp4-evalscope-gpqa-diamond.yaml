@@ -45,6 +45,9 @@ eval:
   install:
     - python3 -m uv venv --seed --clear /tmp/evalscope-perf && python3 -m uv pip install --python /tmp/evalscope-perf/bin/python 'evalscope[perf]'
   # Expected GPQA-Diamond AveragePass@1 bar: 0.74 +- 0.03 (gpt-oss-120b reasoning).
+  # --repeats 3 samples each of the 198 questions 3x and averages, shrinking the
+  # per-run stddev by ~sqrt(3). At the 0.7 threshold this drops the noise-only
+  # failure rate from ~11% to ~2%, at the cost of ~4 extra GPU-min per commit.
   command: >-
     /tmp/evalscope-perf/bin/evalscope eval
     --model ${GPT_OSS_EVAL_MODEL}
@@ -52,6 +55,7 @@ eval:
     --api-key EMPTY_TOKEN
     --datasets gpqa_diamond
     --eval-batch-size 16
+    --repeats 3
 report:
   github_step_summary: true
 score_threshold: 0.7
