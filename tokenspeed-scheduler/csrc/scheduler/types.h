@@ -43,6 +43,9 @@ enum class DisaggregationMode {
     kDecode,
 };
 
+// `PagedCacheGroupFamily` and `StateRestorePolicy` are defined in
+// resource/allocator/paged_cache_group.h (transitively included above).
+
 template <ResourceType>
 class NodeRef;
 using HostNodeRef = NodeRef<ResourceType::Host>;
