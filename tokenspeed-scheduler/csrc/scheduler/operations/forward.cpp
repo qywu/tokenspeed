@@ -321,7 +321,8 @@ std::optional<fsm::ScheduleRetractEvent> Scheduler::scheduleRetract(Request* req
 
     OwnedPages alloc_pages = request->TakeFirstPages(alloc_count);
 
-    kv_prefix_cache_.Insert<ResourceType::Device>(full_paged_tokens, prefix_pages, std::move(alloc_pages));
+    kv_prefix_cache_.Insert<ResourceType::Device>(full_paged_tokens, prefix_pages, std::move(alloc_pages),
+                                                  /*page_hashs=*/{}, /*start_node=*/nullptr, request->LoraId());
 
     MatchResult match_result = kv_prefix_cache_.Match(full_paged_tokens, request->LoraId(), MatchIntent::StateRecovery);
 
@@ -598,13 +599,19 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
         if (token_budget <= 0 || config_.max_batch_size == ops.size()) break;
 
         // LoRA adapter cap: skip requests that would exceed max_loras unique ids.
-        if (config_.max_loras > 0 && request->LoraId() != kLoraNone) {
-            bool is_new = batch_lora_ids.find(request->LoraId()) == batch_lora_ids.end();
+        // The cap is enforced up-front, but the lora_id is only counted after a
+        // schedule call actually pushes an op — failed schedules (e.g. capacity
+        // pressure) must not consume a slot, or other adapters get starved.
+        const std::int32_t request_lora_id = request->LoraId();
+        const bool lora_cap_active = config_.max_loras > 0 && request_lora_id != kLoraNone;
+        if (lora_cap_active) {
+            bool is_new = batch_lora_ids.find(request_lora_id) == batch_lora_ids.end();
             if (is_new && static_cast<std::int32_t>(batch_lora_ids.size()) >= config_.max_loras) {
                 continue;  // defer to next step
             }
-            batch_lora_ids.insert(request->LoraId());
         }
+
+        const std::size_t ops_before = ops.size();
 
         if (request->Is<fsm::Prefilling>() && config_.role != Role::kD) {
             std::int32_t reserver_num_tokens = config_.role == Role::kP ? 0 : config_.decode_input_tokens;
@@ -647,6 +654,10 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
                     loadback_ops.push_back(GenerateLoadBackOp(loadback_diff, mamba_loadback_nodes, op_id));
                 }
             }
+        }
+
+        if (lora_cap_active && ops.size() > ops_before) {
+            batch_lora_ids.insert(request_lora_id);
         }
     }
 

@@ -139,10 +139,13 @@ TreeNode* KVPrefixCache::getOrCreateLoraRoot(std::int32_t lora_id) {
     sentinel[0] = -lora_id;
     auto node = std::make_unique<TreeNode>(sentinel, std::chrono::steady_clock::now());
     TreeNode* raw = node.get();
-    // Attach an empty DeviceResource so OnDevice() returns true.
-    // This prevents PruneEmptyByNode from removing the virtual root even when
-    // all adapter sequences have been evicted.
+    // Attach empty Device and Host resources so OnDevice()/OnHost() return true.
+    // - Prevents PruneEmptyByNode from removing the virtual root.
+    // - Lets HostNodeRef safely lock the root if match.host.last_node ends up
+    //   pointing at it (no real pages matched in the adapter namespace).
+    // IsEmpty() stays true on both, so the root never enters lru_leaves_.
     raw->AttachResource<ResourceType::Device>(std::make_unique<NodeResource<ResourceType::Device>>(OwnedPages{}));
+    raw->AttachResource<ResourceType::Host>(std::make_unique<NodeResource<ResourceType::Host>>(OwnedPages{}));
     token_vec_t key(sentinel.begin(), sentinel.begin() + page_size);
     tree_.Root()->AddChild(key, std::move(node));
     slot = raw;
@@ -446,8 +449,21 @@ void KVPrefixCache::EvictLoraNamespace(std::int32_t lora_id) {
     collect(vroot);
 
     // Evict device and host pages. OwnedPages RAII returns them to the allocator.
+    // EvictSubtree skips nodes whose resource is currently locked by an in-flight
+    // request; their OnDevice()/OnHost() flag stays true.
     device_.EvictSubtree(descendants);
     host_.EvictSubtree(descendants);
+
+    // If any descendant is still locked, leave the virtual root in the tree.
+    // RemoveChild would unique_ptr-cascade-destroy those still-locked nodes
+    // while live NodeRefs point at them — a use-after-free. The locked pages
+    // are freed when their requests finish; a subsequent EvictLoraNamespace
+    // call (or natural LRU pressure) will complete the cleanup.
+    for (TreeNode* node : descendants) {
+        if (node->OnDevice() || node->OnHost()) {
+            return;
+        }
+    }
 
     // Remove the virtual root from the tree. The unique_ptr cascade destroys the
     // entire subtree (including any mamba slots attached to those nodes).
