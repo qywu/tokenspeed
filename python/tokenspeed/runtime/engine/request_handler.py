@@ -35,18 +35,24 @@ from tokenspeed.runtime.distributed.process_group_manager import (
 from tokenspeed.runtime.engine.generation_output_processor import RequestState
 from tokenspeed.runtime.engine.io_struct import (
     AbortReq,
+    DestroyWeightsUpdateGroupReqInput,
+    DestroyWeightsUpdateGroupReqOutput,
     FlushCacheReqInput,
     FlushCacheReqOutput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
     GetLoadReqInput,
     GetLoadReqOutput,
+    InitWeightsUpdateGroupReqInput,
+    InitWeightsUpdateGroupReqOutput,
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
     SetInternalStateReq,
     SetInternalStateReqOutput,
     TokenizedGenerateReqInput,
+    UpdateWeightsFromDistributedReqInput,
+    UpdateWeightsFromDistributedReqOutput,
 )
 from tokenspeed.runtime.engine.request_types import FINISH_ABORT
 from tokenspeed.runtime.engine.scheduler_utils import make_spec
@@ -80,6 +86,7 @@ class RequestHandler:
         recv_func,
         send_func,
         get_load_fn=None,
+        weight_updater=None,
         architectures: list[str] | None = None,
     ) -> None:
 
@@ -98,6 +105,7 @@ class RequestHandler:
         self.max_req_len = max_req_len
         self.vocab_size = vocab_size
         self.get_load_fn = get_load_fn
+        self.weight_updater = weight_updater
 
         self.tokenizer = get_tokenizer(
             server_args.tokenizer,
@@ -181,9 +189,66 @@ class RequestHandler:
                     self.send_func.send_pyobj(self.get_load_fn())
                 else:
                     self.send_func.send_pyobj(GetLoadReqOutput())
+            elif isinstance(recv_req, InitWeightsUpdateGroupReqInput):
+                self.send_func.send_pyobj(
+                    self._handle_init_weights_update_group(recv_req)
+                )
+            elif isinstance(recv_req, UpdateWeightsFromDistributedReqInput):
+                self.send_func.send_pyobj(
+                    self._handle_update_weights_from_distributed(recv_req)
+                )
+            elif isinstance(recv_req, DestroyWeightsUpdateGroupReqInput):
+                self.send_func.send_pyobj(
+                    self._handle_destroy_weights_update_group(recv_req)
+                )
             else:
                 raise NotImplementedError(f"Unsupported request type: {type(recv_req)}")
         return new_req_specs, req_states, bootstrap_infos, abort_rids
+
+    # ---- Weight-update dispatch ------------------------------------
+
+    def _handle_init_weights_update_group(
+        self, req: InitWeightsUpdateGroupReqInput
+    ) -> InitWeightsUpdateGroupReqOutput:
+        if self.weight_updater is None:
+            return InitWeightsUpdateGroupReqOutput(
+                success=False, message="weight_updater not configured on this worker"
+            )
+        success, message = self.weight_updater.init_process_group(
+            master_address=req.master_address,
+            master_port=req.master_port,
+            rank_offset=req.rank_offset,
+            world_size=req.world_size,
+            group_name=req.group_name,
+            backend=req.backend,
+        )
+        return InitWeightsUpdateGroupReqOutput(success=success, message=message)
+
+    def _handle_update_weights_from_distributed(
+        self, req: UpdateWeightsFromDistributedReqInput
+    ) -> UpdateWeightsFromDistributedReqOutput:
+        if self.weight_updater is None:
+            return UpdateWeightsFromDistributedReqOutput(
+                success=False, message="weight_updater not configured on this worker"
+            )
+        success, message = self.weight_updater.update_from_distributed(
+            names=req.names,
+            dtypes=req.dtypes,
+            shapes=req.shapes,
+            group_name=req.group_name,
+            flush_cache=req.flush_cache,
+        )
+        return UpdateWeightsFromDistributedReqOutput(success=success, message=message)
+
+    def _handle_destroy_weights_update_group(
+        self, req: DestroyWeightsUpdateGroupReqInput
+    ) -> DestroyWeightsUpdateGroupReqOutput:
+        if self.weight_updater is None:
+            return DestroyWeightsUpdateGroupReqOutput(
+                success=False, message="weight_updater not configured on this worker"
+            )
+        success, message = self.weight_updater.destroy_process_group(req.group_name)
+        return DestroyWeightsUpdateGroupReqOutput(success=success, message=message)
 
     def handle_generate_request(
         self,

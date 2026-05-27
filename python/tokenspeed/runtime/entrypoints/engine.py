@@ -62,6 +62,7 @@ from tokenspeed.runtime.engine.data_parallel_controller import (
 )
 from tokenspeed.runtime.engine.event_loop import run_event_loop
 from tokenspeed.runtime.engine.io_struct import (
+    DestroyWeightsUpdateGroupReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
@@ -352,7 +353,12 @@ class Engine(EngineBase):
         group_name: str = "weight_update_group",
         flush_cache: bool = True,
     ):
-        """Update weights from distributed source."""
+        """Update weights via the named distributed group.
+
+        Trainer rank ``0`` broadcasts each tensor in ``names`` order; engine
+        workers receive into pre-allocated buffers (sized by ``shapes`` /
+        ``dtypes``) and ``load_weights`` them into the live model.
+        """
         obj = UpdateWeightsFromDistributedReqInput(
             names=names,
             dtypes=dtypes,
@@ -361,6 +367,14 @@ class Engine(EngineBase):
             flush_cache=flush_cache,
         )
         return self.llm.run(self.tokenizer_manager.update_weights_from_distributed(obj))
+
+    def destroy_weights_update_group(
+        self,
+        group_name: str = "weight_update_group",
+    ):
+        """Tear down the named weight-update process group."""
+        obj = DestroyWeightsUpdateGroupReqInput(group_name=group_name)
+        return self.llm.run(self.tokenizer_manager.destroy_weights_update_group(obj))
 
     def update_weights_from_tensor(
         self,
