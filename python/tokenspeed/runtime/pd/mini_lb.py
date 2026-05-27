@@ -447,18 +447,44 @@ async def flush_cache():
 
 
 async def _broadcast_memory_control(endpoint: str, body: dict | None = None):
-    """POST ``endpoint`` to all prefill and decode servers in parallel."""
-    prefill_servers, decode_servers = (
-        load_balancer.prefill_servers,
-        load_balancer.decode_servers,
-    )
+    """POST ``endpoint`` to every prefill + decode server in parallel.
+
+    Raises ``HTTPException(502)`` when any backend errors out or replies
+    non-2xx — otherwise the orchestrator would see ``200`` even though some
+    nodes (e.g. an older server without the new endpoint) silently skipped
+    the release/resume.
+    """
+    targets = list(chain(load_balancer.prefill_servers, load_balancer.decode_servers))
     async with aiohttp.ClientSession() as session:
-        tasks = [
-            session.post(f"{server}{endpoint}", json=body)
-            for server in chain(prefill_servers, decode_servers)
-        ]
-        for coro in asyncio.as_completed(tasks):
-            await coro
+        results = await asyncio.gather(
+            *(session.post(f"{srv}{endpoint}", json=body) for srv in targets),
+            return_exceptions=True,
+        )
+
+        failures = []
+        for srv, result in zip(targets, results):
+            if isinstance(result, BaseException):
+                failures.append({"server": srv, "error": repr(result)})
+                continue
+            try:
+                if result.status >= 400:
+                    # Cap the body so a misbehaving node can't dump megabytes
+                    # into our response.
+                    detail = (await result.text())[:500]
+                    failures.append(
+                        {"server": srv, "status": result.status, "detail": detail}
+                    )
+            finally:
+                result.release()
+
+    if failures:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": f"{endpoint} failed on {len(failures)}/{len(targets)} nodes",
+                "failures": failures,
+            },
+        )
 
 
 @app.post("/release_memory_occupation")
