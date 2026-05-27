@@ -114,7 +114,7 @@ def make_config(
 
 def pool_to_paged_cache_groups(pool: Any) -> list:
     """Convert a KV pool's paged_cache_group_specs to scheduler configs."""
-    specs = getattr(pool, "paged_cache_group_specs", ())
+    specs = pool.paged_cache_group_specs
     if not specs:
         return []
     counts = pool.paged_cache_group_page_counts
@@ -129,23 +129,24 @@ def pool_to_paged_cache_groups(pool: Any) -> list:
                 f"pool_to_paged_cache_groups: unsupported retention "
                 f"{spec.retention!r} for group {spec.group_id!r}"
             )
+        family_str = getattr(spec, "family", "history")
+        if family_str == "history":
+            family = PagedCacheGroupFamily.History
+        elif family_str == "state":
+            family = PagedCacheGroupFamily.State
+        else:
+            raise ValueError(
+                f"pool_to_paged_cache_groups: unsupported family "
+                f"{family_str!r} for group {spec.group_id!r}"
+            )
         kwargs = dict(
             group_id=spec.group_id,
             rows_per_page=int(spec.rows_per_page),
             entry_stride_tokens=int(spec.entry_stride_tokens),
             total_pages=int(counts[spec.group_id]),
             retention=retention,
+            family=family,
         )
-        family_str = getattr(spec, "family", "history")
-        if family_str == "history":
-            kwargs["family"] = PagedCacheGroupFamily.History
-        elif family_str == "state":
-            kwargs["family"] = PagedCacheGroupFamily.State
-        else:
-            raise ValueError(
-                f"pool_to_paged_cache_groups: unsupported family "
-                f"{family_str!r} for group {spec.group_id!r}"
-            )
         if spec.retention == "sliding_window":
             kwargs["sliding_window_tokens"] = int(spec.sliding_window_tokens)
         out.append(PagedCacheGroupConfig(**kwargs))
@@ -161,7 +162,7 @@ def pool_to_prefix_cache_adjunct_spec(
             "pool_to_prefix_cache_adjunct_spec: required_group_ids must be non-empty"
         )
     spec = PrefixCacheAdjunctSpec()
-    spec.required_groups = list(required_group_ids)
+    spec.required_groups = [str(gid) for gid in required_group_ids]
     return spec
 
 
