@@ -161,7 +161,7 @@ def pool_to_prefix_cache_adjunct_spec(
             "pool_to_prefix_cache_adjunct_spec: required_group_ids must be non-empty"
         )
     spec = PrefixCacheAdjunctSpec()
-    spec.required_groups = [str(gid) for gid in required_group_ids]
+    spec.required_groups = list(required_group_ids)
     return spec
 
 
