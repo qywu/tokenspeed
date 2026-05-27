@@ -82,8 +82,14 @@ void HybridPrefixCache::augmentMatch(MatchResult& match) const {
             if (aligned_seqlen > 0) {
                 match.mamba_branching_seqlen = aligned_seqlen;
             }
+            // Truncating to the real root drops out of the LoRA namespace, so the
+            // sentinel-page depth offset no longer applies. Without this reset
+            // DepthInPage() would return -1 (real_root depth 0 minus offset 1) for
+            // a no-hit LoRA match and inflate ``unscheduled``/break window math.
             match.device.last_node = root;
+            match.device.namespace_depth_offset = 0;
             match.host.last_node = root;
+            match.host.namespace_depth_offset = 0;
             return;
         }
 
@@ -120,7 +126,10 @@ void HybridPrefixCache::augmentMatch(MatchResult& match) const {
         }
         mamba_depth = std::max(mamba_depth, device_mamba_depth);
     } else {
+        // Truncating to the real root leaves the LoRA namespace; clear the
+        // sentinel-page offset so DepthInPage() returns 0, not -1.
         match.device.last_node = root;
+        match.device.namespace_depth_offset = 0;
     }
 
     if (host_mamba_node != nullptr) {
@@ -131,7 +140,9 @@ void HybridPrefixCache::augmentMatch(MatchResult& match) const {
         }
         mamba_depth = std::max(mamba_depth, host_mamba_depth);
     } else {
+        // Same as the device branch: clear the LoRA offset when truncating to root.
         match.host.last_node = root;
+        match.host.namespace_depth_offset = 0;
     }
 
     if (kv_depth > mamba_depth) {

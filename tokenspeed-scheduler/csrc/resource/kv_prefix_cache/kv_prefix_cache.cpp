@@ -456,11 +456,28 @@ void KVPrefixCache::EvictLoraNamespace(std::int32_t lora_id) {
     };
     collect(vroot);
 
+    // Snapshot device-evictable descendants before EvictSubtree so we can emit
+    // BlockRemoved events for them. Without this, kv_event_sink_ consumers never
+    // see the adapter's pages disappear, and published_device_blocks_ keeps the
+    // hashes — suppressing the next BlockStored when the adapter is reloaded.
+    std::vector<TreeNode*> device_unpublish;
+    if (kv_event_sink_) {
+        for (TreeNode* node : descendants) {
+            if (node->OnDevice() && GetResource<ResourceType::Device>(node).IsEvictable()) {
+                device_unpublish.push_back(node);
+            }
+        }
+    }
+
     // Evict device and host pages. OwnedPages RAII returns them to the allocator.
     // EvictSubtree skips nodes whose resource is currently locked by an in-flight
     // request; their OnDevice()/OnHost() flag stays true.
     device_.EvictSubtree(descendants);
     host_.EvictSubtree(descendants);
+
+    for (TreeNode* node : device_unpublish) {
+        recordDeviceBlockRemoved(node);
+    }
 
     // If any descendant is still locked, leave the virtual root in the tree.
     // RemoveChild would unique_ptr-cascade-destroy those still-locked nodes
