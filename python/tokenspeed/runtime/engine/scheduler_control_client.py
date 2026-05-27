@@ -35,6 +35,7 @@ from typing import (
 import zmq
 
 from tokenspeed.runtime.engine.io_struct import (
+    AbortReq,
     ContinueGenerationReqInput,
     ContinueGenerationReqOutput,
     ExpertDistributionReq,
@@ -398,8 +399,12 @@ class SchedulerControlClient:
     ) -> PauseGenerationReqOutput:
         self.auto_create_handle_loop()
         if mode == "abort":
+            # Send AbortReq directly without removing from rid_to_state so the
+            # scheduler's finish event flows back through handle_batch_output and
+            # wakes _wait_one_response coroutines cleanly instead of leaving
+            # them stuck on state.event.wait() after the state was deleted.
             for rid in list(self.rid_to_state.keys()):
-                self.abort_request(rid)
+                self.engine_core_client.send_to_scheduler.send_pyobj(AbortReq(rid))
         obj = PauseGenerationReqInput(mode=mode)
         return (await self.pause_generation_communicator(obj))[0]
 
