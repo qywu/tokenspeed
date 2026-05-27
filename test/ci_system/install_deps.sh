@@ -91,7 +91,10 @@ python3 -m pip install --upgrade pip setuptools wheel
 # ============================================================
 echo "=== Step 3: Install tokenspeed-kernel ==="
 cd ${WORKSPACE}
-export PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/cu${CUINDEX}"
+# Two extra index URLs:
+#   - download.pytorch.org for torch
+#   - flashinfer.ai/whl/cu*/ for flashinfer-jit-cache (not on PyPI)
+export PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/cu${CUINDEX} https://flashinfer.ai/whl/cu${CUINDEX}"
 TOKENSPEED_KERNEL_BACKEND=cuda FLASHINFER_CUDA_ARCH_LIST="${FI_ARCH}" \
 pip_install_with_retry pip3 install tokenspeed-kernel/python/ --no-build-isolation -v
 
