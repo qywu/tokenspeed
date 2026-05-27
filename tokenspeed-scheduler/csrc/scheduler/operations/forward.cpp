@@ -598,12 +598,12 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
         if (token_budget <= 0 || config_.max_batch_size == ops.size()) break;
 
         // LoRA adapter cap: skip requests that would exceed max_loras unique ids.
-        if (config_.max_loras > 0 && request->lora_id() != kLoraNone) {
-            bool is_new = batch_lora_ids.find(request->lora_id()) == batch_lora_ids.end();
+        if (config_.max_loras > 0 && request->LoraId() != kLoraNone) {
+            bool is_new = batch_lora_ids.find(request->LoraId()) == batch_lora_ids.end();
             if (is_new && static_cast<std::int32_t>(batch_lora_ids.size()) >= config_.max_loras) {
                 continue;  // defer to next step
             }
-            batch_lora_ids.insert(request->lora_id());
+            batch_lora_ids.insert(request->LoraId());
         }
 
         if (request->Is<fsm::Prefilling>() && config_.role != Role::kD) {
