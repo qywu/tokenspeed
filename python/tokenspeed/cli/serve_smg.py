@@ -281,6 +281,24 @@ def _gateway_args_with_defaults(gateway_args: list[str]) -> list[str]:
     return _gateway_args_with_default_prometheus_port(gateway_args)
 
 
+def _start_control_server(*, gateway_url: str, host: str, port: int) -> None:
+    """Start the control HTTP server in a daemon thread.
+
+    Runs uvicorn alongside smg without blocking the orchestrator event loop.
+    """
+    import threading
+
+    from tokenspeed.runtime.entrypoints.http_server import start as _http_start
+
+    t = threading.Thread(
+        target=_http_start,
+        kwargs={"gateway_url": gateway_url, "host": host, "port": port},
+        daemon=True,
+        name="ts-control-http-server",
+    )
+    t.start()
+
+
 async def _stream_to(proc, tag: str) -> None:
     await asyncio.gather(
         tag_stream(proc.stdout, tag, sys.stdout),
@@ -392,6 +410,17 @@ async def run_smg(
 
         sys.stdout.write(f"ts serve ready on http://{user_host}:{user_port}\n")
         sys.stdout.flush()
+
+        if opts.control_port is not None:
+            _start_control_server(
+                gateway_url=f"http://{user_host}:{user_port}",
+                host=user_host,
+                port=opts.control_port,
+            )
+            sys.stdout.write(
+                f"ts control server ready on http://{user_host}:{opts.control_port}\n"
+            )
+            sys.stdout.flush()
 
         engine_wait = asyncio.create_task(engine.wait())
         gateway_wait = asyncio.create_task(gateway.wait())

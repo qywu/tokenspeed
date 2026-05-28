@@ -30,12 +30,6 @@ def _serve(args: argparse.Namespace, raw_argv: list[str]) -> None:
     run_smg_from_args(args, raw_argv)
 
 
-def _http_server(args: argparse.Namespace, raw_argv: list[str]) -> None:
-    from tokenspeed.runtime.entrypoints.http_server import main as http_main
-
-    http_main(raw_argv)
-
-
 def _bench(args: argparse.Namespace) -> None:
     from tokenspeed.bench import main as bench_main
 
@@ -70,13 +64,6 @@ def main() -> None:
     )
     serve_parser.set_defaults(func=_serve)
 
-    http_server_parser = subparsers.add_parser(
-        "http-server",
-        add_help=False,
-        help="Launch the TokenSpeed HTTP server (no smg gateway).",
-    )
-    http_server_parser.set_defaults(func=_http_server)
-
     bench_parser = subparsers.add_parser(
         "bench",
         add_help=False,
@@ -108,11 +95,6 @@ def main() -> None:
         return
 
     if args.func is _serve:
-        raw = list(sys.argv[2:])
-        args.func(args, raw)
-        return
-
-    if args.func is _http_server:
         raw = list(sys.argv[2:])
         args.func(args, raw)
         return

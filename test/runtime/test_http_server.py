@@ -1,120 +1,129 @@
-"""Tests for the direct HTTP server (no smg gateway)."""
+"""Tests for the control-plane HTTP server sidecar."""
 
-import json
-import multiprocessing as mp
 import os
 import sys
 import time
 import unittest
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import requests
 
 sys.path.insert(
     0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 )
-from test.test_utils import (
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    DEFAULT_URL_FOR_TEST,
-    kill_process_tree,
-)
 
-HOST = "127.0.0.1"
-PORT = 21100
-BASE_URL = f"http://{HOST}:{PORT}"
-MODEL = "meta-llama/Llama-3.1-8B-Instruct"
+CONTROL_HOST = "127.0.0.1"
+CONTROL_PORT = 21101
+BASE_URL = f"http://{CONTROL_HOST}:{CONTROL_PORT}"
+FAKE_GATEWAY = "http://127.0.0.1:29999"
 
 
-def _launch_server():
-    from tokenspeed.runtime.entrypoints.http_server import main
+def _start_control_server():
+    """Start the control server against a fake gateway URL."""
+    from tokenspeed.runtime.entrypoints.http_server import start
 
-    main(
-        [
-            "--host",
-            HOST,
-            "--port",
-            str(PORT),
-            "--model",
-            MODEL,
-            "--dtype",
-            "bfloat16",
-            "--gpu-memory-utilization",
-            "0.7",
-            "--max-model-len",
-            "4096",
-        ]
-    )
+    start(gateway_url=FAKE_GATEWAY, host=CONTROL_HOST, port=CONTROL_PORT)
 
 
-def _wait_ready(
-    base_url: str, timeout: float = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
-) -> bool:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            r = requests.get(f"{base_url}/readiness", timeout=2)
-            if r.status_code == 200:
-                return True
-        except Exception:
-            pass
-        time.sleep(2)
-    return False
+class TestControlHttpServer(unittest.TestCase):
+    """Unit-level tests for the control HTTP server endpoints.
 
+    These tests mock aiohttp so no real gateway or engine is needed.
+    """
 
-class TestHttpServer(unittest.TestCase):
+    def _make_mock_resp(self, payload: dict, status: int = 200):
+        mock_resp = AsyncMock()
+        mock_resp.status = status
+        mock_resp.json = AsyncMock(return_value=payload)
+        mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_resp.__aexit__ = AsyncMock(return_value=None)
+        return mock_resp
 
-    @classmethod
-    def setUpClass(cls):
-        mp.set_start_method("spawn", force=True)
-        cls.proc = mp.Process(target=_launch_server, daemon=True)
-        cls.proc.start()
-        if not _wait_ready(BASE_URL):
-            cls.proc.kill()
-            raise RuntimeError("HTTP server failed to start")
+    def _make_mock_session(self, payload: dict, status: int = 200):
+        session = MagicMock()
+        session.__aenter__ = AsyncMock(return_value=session)
+        session.__aexit__ = AsyncMock(return_value=None)
+        session.post = MagicMock(return_value=self._make_mock_resp(payload, status))
+        session.get = MagicMock(return_value=self._make_mock_resp(payload, status))
+        return session
 
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.proc.pid)
+    def test_health_always_ok(self):
+        """GET /health returns 200 without hitting the gateway."""
+        import threading
 
-    def test_health(self):
-        r = requests.get(f"{BASE_URL}/health")
-        self.assertEqual(r.status_code, 200)
-        self.assertEqual(r.json()["status"], "ok")
+        import uvicorn
 
-    def test_readiness(self):
-        r = requests.get(f"{BASE_URL}/readiness")
-        self.assertEqual(r.status_code, 200)
+        from tokenspeed.runtime.entrypoints import http_server as hs
 
-    def test_v1_models(self):
-        r = requests.get(f"{BASE_URL}/v1/models")
-        self.assertEqual(r.status_code, 200)
-        data = r.json()
-        self.assertIn("data", data)
-        self.assertGreater(len(data["data"]), 0)
-
-    def test_v1_completions(self):
-        r = requests.post(
-            f"{BASE_URL}/v1/completions",
-            json={
-                "model": MODEL,
-                "prompt": "The capital of France is",
-                "max_tokens": 8,
-                "temperature": 0,
-            },
+        hs._gateway_url = FAKE_GATEWAY
+        config = uvicorn.Config(
+            hs.app, host=CONTROL_HOST, port=CONTROL_PORT + 1, log_level="error"
         )
-        self.assertEqual(r.status_code, 200)
-        data = r.json()
-        self.assertIn("choices", data)
-        self.assertTrue(len(data["choices"][0]["text"]) > 0)
+        server = uvicorn.Server(config)
 
-    def test_pause_continue_not_available(self):
-        """pause/continue return 501 until PR #270 is merged."""
-        r = requests.post(f"{BASE_URL}/pause_generation", json={"mode": "abort"})
-        # Either 200 (PR #270 merged) or 501 (not yet available)
-        self.assertIn(r.status_code, (200, 501))
+        t = threading.Thread(target=server.run, daemon=True)
+        t.start()
+        time.sleep(1)
 
-    def test_flush_cache(self):
-        r = requests.post(f"{BASE_URL}/flush_cache")
-        self.assertEqual(r.status_code, 200)
+        try:
+            r = requests.get(
+                f"http://{CONTROL_HOST}:{CONTROL_PORT + 1}/health", timeout=5
+            )
+            self.assertEqual(r.status_code, 200)
+            self.assertEqual(r.json()["status"], "ok")
+        finally:
+            server.should_exit = True
+
+    def test_readiness_always_ok(self):
+        """GET /readiness returns 200 without hitting the gateway."""
+        import threading
+
+        import uvicorn
+
+        from tokenspeed.runtime.entrypoints import http_server as hs
+
+        hs._gateway_url = FAKE_GATEWAY
+        config = uvicorn.Config(
+            hs.app, host=CONTROL_HOST, port=CONTROL_PORT + 2, log_level="error"
+        )
+        server = uvicorn.Server(config)
+
+        t = threading.Thread(target=server.run, daemon=True)
+        t.start()
+        time.sleep(1)
+
+        try:
+            r = requests.get(
+                f"http://{CONTROL_HOST}:{CONTROL_PORT + 2}/readiness", timeout=5
+            )
+            self.assertEqual(r.status_code, 200)
+        finally:
+            server.should_exit = True
+
+
+class TestOrchestratorControlPort(unittest.TestCase):
+    """Test that --control-port is parsed by split_argv."""
+
+    def test_control_port_parsed(self):
+        from tokenspeed.cli._argsplit import split_argv
+
+        result = split_argv(
+            ["--model", "meta-llama/Llama-3.1-8B-Instruct", "--control-port", "8081"]
+        )
+        self.assertEqual(result.opts.control_port, 8081)
+
+    def test_control_port_not_in_engine_or_gateway_args(self):
+        from tokenspeed.cli._argsplit import split_argv
+
+        result = split_argv(["--model", "m", "--control-port", "8081"])
+        self.assertNotIn("--control-port", result.engine)
+        self.assertNotIn("--control-port", result.gateway)
+
+    def test_no_control_port_defaults_none(self):
+        from tokenspeed.cli._argsplit import split_argv
+
+        result = split_argv(["--model", "m"])
+        self.assertIsNone(result.opts.control_port)
 
 
 if __name__ == "__main__":

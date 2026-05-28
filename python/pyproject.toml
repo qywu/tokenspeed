@@ -81,7 +81,6 @@ dependencies = [
 [project.scripts]
 tokenspeed = "tokenspeed.cli:main"
 ts = "tokenspeed.cli:main"
-tokenspeed-http-server = "tokenspeed.runtime.entrypoints.http_server:main"
 
 [project.urls]
 "Homepage" = "https://github.com/lightseekorg/tokenspeed"
