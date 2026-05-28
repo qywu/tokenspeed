@@ -411,16 +411,18 @@ async def run_smg(
         sys.stdout.write(f"ts serve ready on http://{user_host}:{user_port}\n")
         sys.stdout.flush()
 
-        if opts.control_port is not None:
-            _start_control_server(
-                gateway_url=f"http://{user_host}:{user_port}",
-                host=user_host,
-                port=opts.control_port,
-            )
-            sys.stdout.write(
-                f"ts control server ready on http://{user_host}:{opts.control_port}\n"
-            )
-            sys.stdout.flush()
+        control_port = (
+            opts.control_port if opts.control_port is not None else user_port + 1
+        )
+        _start_control_server(
+            gateway_url=f"http://{user_host}:{user_port}",
+            host=user_host,
+            port=control_port,
+        )
+        sys.stdout.write(
+            f"ts control server ready on http://{user_host}:{control_port}\n"
+        )
+        sys.stdout.flush()
 
         engine_wait = asyncio.create_task(engine.wait())
         gateway_wait = asyncio.create_task(gateway.wait())
