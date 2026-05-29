@@ -111,7 +111,7 @@ async def abort(request: Request):
 # ---------------------------------------------------------------------------
 
 
-async def _proxy_request(request: Request) -> StreamingResponse | JSONResponse:
+async def _proxy_request(request: Request) -> StreamingResponse | Response:
     url = f"{_gateway_url.rstrip('/')}{request.url.path}"
     if request.url.query:
         url = f"{url}?{request.url.query}"
@@ -122,11 +122,13 @@ async def _proxy_request(request: Request) -> StreamingResponse | JSONResponse:
         if k.lower() not in ("host", "content-length")
     }
 
-    async def _iter(resp):
-        async for chunk in resp.content.iter_chunked(_STREAM_CHUNK_SIZE):
-            yield chunk
-
-    async with aiohttp.ClientSession() as session:
+    # NOTE: the session must outlive the response. For streaming, FastAPI
+    # consumes the body iterator *after* this function returns, so we cannot
+    # close the session in an `async with` block here — it would close the
+    # upstream connection mid-stream. Instead the session is closed in the
+    # generator's `finally` (streaming) or after `read()` (non-streaming).
+    session = aiohttp.ClientSession()
+    try:
         resp = await session.request(
             method=request.method,
             url=url,
@@ -134,19 +136,36 @@ async def _proxy_request(request: Request) -> StreamingResponse | JSONResponse:
             data=body,
             timeout=aiohttp.ClientTimeout(total=600),
         )
-        content_type = resp.headers.get("content-type", "")
-        if "text/event-stream" in content_type:
-            return StreamingResponse(
-                _iter(resp),
-                status_code=resp.status,
-                media_type="text/event-stream",
-            )
+    except Exception:
+        await session.close()
+        raise
+
+    content_type = resp.headers.get("content-type", "")
+    if "text/event-stream" in content_type:
+
+        async def _iter():
+            try:
+                async for chunk in resp.content.iter_chunked(_STREAM_CHUNK_SIZE):
+                    yield chunk
+            finally:
+                resp.release()
+                await session.close()
+
+        return StreamingResponse(
+            _iter(),
+            status_code=resp.status,
+            media_type="text/event-stream",
+        )
+
+    try:
         data = await resp.read()
         return Response(
             content=data,
             status_code=resp.status,
             media_type=content_type or "application/json",
         )
+    finally:
+        await session.close()
 
 
 @app.api_route("/generate", methods=["GET", "POST"])
