@@ -41,6 +41,31 @@ async def health():
 
 
 # ---------------------------------------------------------------------------
+# Control — stubs (direct engine wiring to be added)
+# ---------------------------------------------------------------------------
+
+
+@app.post("/flush_cache")
+async def flush_cache():
+    return JSONResponse({"status": "ok"})
+
+
+@app.get("/get_server_info")
+async def get_server_info():
+    return JSONResponse({})
+
+
+@app.api_route("/start_profile", methods=["GET", "POST"])
+async def start_profile():
+    return JSONResponse({"status": "ok"})
+
+
+@app.api_route("/stop_profile", methods=["GET", "POST"])
+async def stop_profile():
+    return JSONResponse({"status": "ok"})
+
+
+# ---------------------------------------------------------------------------
 # Passthrough proxy
 # ---------------------------------------------------------------------------
 
