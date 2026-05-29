@@ -48,8 +48,8 @@ def _stub() -> pb_grpc.TokenSpeedSchedulerStub:
 
 
 @app.get("/health")
-async def health():
-    return JSONResponse({"status": "ok"})
+async def health(request: Request):
+    return await _proxy_request(request)
 
 
 # ---------------------------------------------------------------------------
