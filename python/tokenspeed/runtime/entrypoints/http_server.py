@@ -33,17 +33,25 @@ app = FastAPI()
 # Set by start() before uvicorn.run().
 _gateway_url: str = ""
 _engine_grpc_addr: str = ""
+_grpc_channel: grpc.aio.Channel | None = None
+_grpc_stub: pb_grpc.TokenSpeedSchedulerStub | None = None
 
 _STREAM_CHUNK_SIZE = 8192
 
 
 def _stub() -> pb_grpc.TokenSpeedSchedulerStub:
-    channel = grpc.aio.insecure_channel(_engine_grpc_addr)
-    return pb_grpc.TokenSpeedSchedulerStub(channel)
+    # Lazily create a single shared channel/stub. gRPC channels are expensive
+    # (HTTP/2 connection + background threads) and must be reused, not created
+    # per request, to avoid leaking sockets and file descriptors.
+    global _grpc_channel, _grpc_stub
+    if _grpc_stub is None:
+        _grpc_channel = grpc.aio.insecure_channel(_engine_grpc_addr)
+        _grpc_stub = pb_grpc.TokenSpeedSchedulerStub(_grpc_channel)
+    return _grpc_stub
 
 
 # ---------------------------------------------------------------------------
-# Health (local)
+# Health (proxied to smg → engine)
 # ---------------------------------------------------------------------------
 
 
@@ -57,34 +65,45 @@ async def health(request: Request):
 # ---------------------------------------------------------------------------
 
 
+async def _grpc_call(coro) -> JSONResponse:
+    """Await a gRPC unary call and serialize the response, mapping engine
+    errors to a clean 503 instead of an unhandled 500 + stack trace."""
+    try:
+        resp = await coro
+    except grpc.aio.AioRpcError as e:
+        return JSONResponse(
+            {"error": "engine unavailable", "detail": e.details()},
+            status_code=503,
+        )
+    return JSONResponse(MessageToDict(resp, preserving_proto_field_name=True))
+
+
 @app.get("/get_server_info")
 async def get_server_info():
-    resp = await _stub().GetServerInfo(pb.GetServerInfoRequest())
-    return JSONResponse(MessageToDict(resp, preserving_proto_field_name=True))
+    return await _grpc_call(_stub().GetServerInfo(pb.GetServerInfoRequest()))
 
 
 @app.get("/get_model_info")
 async def get_model_info():
-    resp = await _stub().GetModelInfo(pb.GetModelInfoRequest())
-    return JSONResponse(MessageToDict(resp, preserving_proto_field_name=True))
+    return await _grpc_call(_stub().GetModelInfo(pb.GetModelInfoRequest()))
 
 
 @app.get("/health_check")
 async def health_check():
-    resp = await _stub().HealthCheck(pb.HealthCheckRequest())
-    return JSONResponse(MessageToDict(resp, preserving_proto_field_name=True))
+    return await _grpc_call(_stub().HealthCheck(pb.HealthCheckRequest()))
 
 
 @app.post("/abort")
 async def abort(request: Request):
     body = await request.json()
-    resp = await _stub().Abort(
-        pb.AbortRequest(
-            request_id=body.get("request_id", ""),
-            reason=body.get("reason", ""),
+    return await _grpc_call(
+        _stub().Abort(
+            pb.AbortRequest(
+                request_id=body.get("request_id", ""),
+                reason=body.get("reason", ""),
+            )
         )
     )
-    return JSONResponse(MessageToDict(resp, preserving_proto_field_name=True))
 
 
 # ---------------------------------------------------------------------------
