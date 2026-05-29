@@ -36,11 +36,6 @@ async def health():
     return JSONResponse({"status": "ok"})
 
 
-@app.get("/readiness")
-async def readiness():
-    return JSONResponse({"status": "ready"})
-
-
 # ---------------------------------------------------------------------------
 # Server lifecycle
 # ---------------------------------------------------------------------------

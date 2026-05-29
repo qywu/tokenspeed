@@ -48,11 +48,6 @@ class TestControlHttpServerEndpoints(unittest.TestCase):
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.json()["status"], "ok")
 
-    def test_readiness(self):
-        r = requests.get(f"http://{CONTROL_HOST}:{self.port}/readiness", timeout=5)
-        self.assertEqual(r.status_code, 200)
-        self.assertEqual(r.json()["status"], "ready")
-
 
 class TestOrchestratorControlPort(unittest.TestCase):
     """Test that --control-port is parsed by split_argv."""
