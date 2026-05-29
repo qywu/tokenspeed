@@ -19,7 +19,7 @@ import grpc
 import grpc.aio
 import uvicorn
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from google.protobuf.json_format import MessageToDict
 from smg_grpc_proto.generated import tokenspeed_scheduler_pb2 as pb
 from smg_grpc_proto.generated import tokenspeed_scheduler_pb2_grpc as pb_grpc
@@ -123,8 +123,8 @@ async def _proxy_request(request: Request) -> StreamingResponse | JSONResponse:
                 media_type="text/event-stream",
             )
         data = await resp.read()
-        return JSONResponse(
-            content=data.decode(),
+        return Response(
+            content=data,
             status_code=resp.status,
             media_type=content_type or "application/json",
         )
