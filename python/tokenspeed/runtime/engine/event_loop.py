@@ -53,6 +53,7 @@ from tokenspeed.runtime.engine.scheduler_utils import (
     pool_to_prefix_cache_adjunct_spec,
     pop_common_cache_event_payloads,
 )
+from tokenspeed.runtime.engine.weight_updater import WeightUpdater
 from tokenspeed.runtime.execution.distributed_initializer import (
     DistributedConfig,
     DistributedInitializer,
@@ -372,6 +373,8 @@ class EventLoop:
             ),
         )
 
+        self.weight_updater = WeightUpdater(self.model_executor)
+
         self.request_handler = RequestHandler(
             server_args=self.server_args,
             hf_eos_token_id=self.model_config.hf_eos_token_id,
@@ -380,6 +383,7 @@ class EventLoop:
             recv_func=self.recv_from_tokenizer,
             send_func=self.send_to_tokenizer,
             get_load_fn=self._get_load,
+            weight_updater=self.weight_updater,
             architectures=self.model_config.hf_config.architectures,
         )
 

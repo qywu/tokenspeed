@@ -634,13 +634,34 @@ class UpdateWeightFromDiskReqOutput:
 
 @dataclass
 class UpdateWeightsFromDistributedReqInput:
-    name: str
-    dtype: str
-    shape: list[int]
+    # Parameter names to broadcast, ordered by NCCL broadcast order.
+    names: list[str]
+    # Per-parameter dtype strings (e.g. "torch.float16", "torch.bfloat16").
+    dtypes: list[str]
+    # Per-parameter shapes (each a list of ints).
+    shapes: list[list[int]]
+    # Process group created by ``init_weights_update_group``.
+    group_name: str = "weight_update_group"
+    # Drop prefix-cache pages after the update so subsequent requests use the
+    # new weights. Set False when chaining multiple update calls.
+    flush_cache: bool = True
 
 
 @dataclass
 class UpdateWeightsFromDistributedReqOutput:
+    success: bool
+    message: str
+
+
+@dataclass
+class DestroyWeightsUpdateGroupReqInput:
+    # Process group to tear down. Must match the ``group_name`` used in
+    # ``InitWeightsUpdateGroupReqInput``.
+    group_name: str = "weight_update_group"
+
+
+@dataclass
+class DestroyWeightsUpdateGroupReqOutput:
     success: bool
     message: str
 
