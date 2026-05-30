@@ -446,6 +446,82 @@ async def flush_cache():
     return Response(status_code=200)
 
 
+# Per-call timeout for the release/resume fan-out. release_memory_occupation
+# with stage_to_cpu=true on a 72B-class model takes ~6-10 s of host-side
+# memcpy, so we want a generous-but-bounded ceiling — a wedged backend must
+# not hang the orchestrator forever. Override at import time for tests.
+_FANOUT_TIMEOUT_SECONDS: float = 120.0
+
+
+async def _broadcast_memory_control(endpoint: str, body: dict | None = None):
+    """POST ``endpoint`` to every prefill + decode server in parallel.
+
+    Raises ``HTTPException(502)`` when any backend errors out, times out, or
+    replies non-2xx — otherwise the orchestrator would see ``200`` even
+    though some nodes (e.g. an older server without the new endpoint, or a
+    wedged one that never finishes) silently skipped the release/resume.
+    """
+    targets = list(chain(load_balancer.prefill_servers, load_balancer.decode_servers))
+    timeout = aiohttp.ClientTimeout(total=_FANOUT_TIMEOUT_SECONDS)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        results = await asyncio.gather(
+            *(session.post(f"{srv}{endpoint}", json=body) for srv in targets),
+            return_exceptions=True,
+        )
+
+        failures = []
+        for srv, result in zip(targets, results):
+            if isinstance(result, BaseException):
+                failures.append({"server": srv, "error": repr(result)})
+                continue
+            try:
+                if result.status >= 400:
+                    # Cap the body so a misbehaving node can't dump megabytes
+                    # into our response, and decode defensively so a backend
+                    # that returns binary / non-UTF-8 bytes on error doesn't
+                    # propagate a UnicodeDecodeError out of the helper.
+                    raw = await result.read()
+                    detail = raw[:500].decode("utf-8", errors="replace")
+                    failures.append(
+                        {"server": srv, "status": result.status, "detail": detail}
+                    )
+            finally:
+                result.release()
+
+    if failures:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": f"{endpoint} failed on {len(failures)}/{len(targets)} nodes",
+                "failures": failures,
+            },
+        )
+
+
+@app.post("/release_memory_occupation")
+async def release_memory_occupation(request: Request):
+    """Offload weights/KV cache/CUDA graphs to CPU on all prefill and decode nodes."""
+    body = (
+        await request.json()
+        if request.headers.get("content-length", "0") != "0"
+        else None
+    )
+    await _broadcast_memory_control("/release_memory_occupation", body)
+    return Response(status_code=200)
+
+
+@app.post("/resume_memory_occupation")
+async def resume_memory_occupation(request: Request):
+    """Restore previously offloaded memory regions to GPU on all prefill and decode nodes."""
+    body = (
+        await request.json()
+        if request.headers.get("content-length", "0") != "0"
+        else None
+    )
+    await _broadcast_memory_control("/resume_memory_occupation", body)
+    return Response(status_code=200)
+
+
 @app.get("/get_server_info")
 async def get_server_info():
     prefill_servers, decode_servers = (
