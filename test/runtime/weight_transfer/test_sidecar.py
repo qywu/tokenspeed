@@ -9,7 +9,7 @@ import uvicorn
 from fastapi.testclient import TestClient
 
 from tokenspeed.cli.serve_smg import _add_rl_control_port
-from tokenspeed.runtime.entrypoints import http_server
+from tokenspeed.runtime.entrypoints import control_server
 from tokenspeed.runtime.entrypoints.weight_transfer_http import (
     build_weight_transfer_app,
 )
@@ -53,7 +53,7 @@ class TestAddWeightTransferPort:
 
 def test_sidecar_exposes_weight_routes():
     found = set()
-    for route in http_server.app.routes:
+    for route in control_server.app.routes:
         for method in getattr(route, "methods", set()):
             if method in ("GET", "POST"):
                 found.add((route.path, method))
@@ -61,13 +61,13 @@ def test_sidecar_exposes_weight_routes():
 
 
 def test_disabled_weight_routes_return_503():
-    http_server.build_server(
+    control_server.build_control_server(
         gateway_url="http://127.0.0.1:1",
         engine_grpc_addr="127.0.0.1:1",
         rl_control_url="",
         port=0,
     )
-    client = TestClient(http_server.app)
+    client = TestClient(control_server.app)
     assert client.get("/get_world_size").status_code == 503
     assert client.post("/resume").status_code == 503
 
@@ -128,13 +128,13 @@ def upstream_engine_app():
 
 
 def test_sidecar_proxies_full_lifecycle(upstream_engine_app):
-    http_server.build_server(
+    control_server.build_control_server(
         gateway_url="http://127.0.0.1:1",
         engine_grpc_addr="127.0.0.1:1",
         rl_control_url=upstream_engine_app,
         port=0,
     )
-    client = TestClient(http_server.app)
+    client = TestClient(control_server.app)
 
     r = client.get("/get_world_size")
     assert r.status_code == 200 and r.json() == {"world_size": 8}
