@@ -64,7 +64,7 @@ def test_disabled_weight_routes_return_503():
     http_server.build_server(
         gateway_url="http://127.0.0.1:1",
         engine_grpc_addr="127.0.0.1:1",
-        engine_http_url="",
+        rl_control_url="",
         port=0,
     )
     client = TestClient(http_server.app)
@@ -131,7 +131,7 @@ def test_sidecar_proxies_full_lifecycle(upstream_engine_app):
     http_server.build_server(
         gateway_url="http://127.0.0.1:1",
         engine_grpc_addr="127.0.0.1:1",
-        engine_http_url=upstream_engine_app,
+        rl_control_url=upstream_engine_app,
         port=0,
     )
     client = TestClient(http_server.app)
