@@ -41,7 +41,7 @@ tokenspeed serve <model> --host 0.0.0.0 --port 8000 \
 | Endpoint | Method | Request | Success response |
 |---|---|---|---|
 | `/init_weight_transfer_engine` | POST | `{"init_info": {…}}` | `{"message": "Weight transfer initialized"}` |
-| `/start_weight_update` | POST | `{"is_checkpoint_format": bool}` (default `true`) | `{"message": "Weight update started"}` |
+| `/start_weight_update` | POST | `{}` (optional `is_checkpoint_format` accepted but ignored) | `{"message": "Weight update started"}` |
 | `/update_weights` | POST | `{"update_info": {…}}` | `{"message": "Weights updated"}` |
 | `/finish_weight_update` | POST | `{}` | `{"message": "Weight update finished"}` |
 | `/pause` | POST | query `mode=abort\|wait\|keep`, `clear_cache=true` | `{"status": "paused"}` |
@@ -75,7 +75,7 @@ Sending `ipc_handles_pickled` (base64 of a Python pickle) requires
 init_weight_transfer_engine          # once per run (nccl: build group; ipc: no-op)
   └─ loop each RL step:
        pause(mode=keep)               # stop scheduling new requests
-       start_weight_update(is_checkpoint_format)
+       start_weight_update()          # is_checkpoint_format accepted but ignored
        update_weights(update_info)    # ×N chunks
        finish_weight_update()
        resume()

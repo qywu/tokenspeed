@@ -124,7 +124,7 @@ class TestLifecycleOrdering:
 
         async def body():
             await mgr.init_engine(_nccl_init())
-            await mgr.start_update(is_checkpoint_format=False)
+            await mgr.start_update()
             await mgr.update(_nccl_update())
             await mgr.finish_update()
             # a second cycle is allowed after finishing

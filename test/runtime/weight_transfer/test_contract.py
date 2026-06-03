@@ -41,8 +41,8 @@ class RecordingManager:
     async def init_engine(self, init_info):
         self.calls.append(("init_engine", init_info))
 
-    async def start_update(self, is_checkpoint_format=True):
-        self.calls.append(("start_update", is_checkpoint_format))
+    async def start_update(self):
+        self.calls.append(("start_update",))
 
     async def update(self, update_info):
         self.calls.append(("update", update_info))
@@ -103,17 +103,18 @@ def test_init_weight_transfer_engine(client, manager):
     assert manager.calls == [("init_engine", info)]
 
 
-def test_start_weight_update_default_is_checkpoint_format(client, manager):
+def test_start_weight_update(client, manager):
     r = client.post("/start_weight_update", json={})
     assert r.status_code == 200
     assert r.json() == {"message": "Weight update started"}
-    # Default: is_checkpoint_format=True
-    assert manager.calls == [("start_update", True)]
+    assert manager.calls == [("start_update",)]
 
 
-def test_start_weight_update_explicit_flag(client, manager):
-    client.post("/start_weight_update", json={"is_checkpoint_format": False})
-    assert manager.calls == [("start_update", False)]
+def test_start_weight_update_ignores_checkpoint_flag(client, manager):
+    # is_checkpoint_format is accepted for API compatibility and ignored.
+    r = client.post("/start_weight_update", json={"is_checkpoint_format": False})
+    assert r.status_code == 200
+    assert manager.calls == [("start_update",)]
 
 
 def test_update_weights(client, manager):

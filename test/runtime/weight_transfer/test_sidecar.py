@@ -84,7 +84,7 @@ class _FakeManager:
     async def init_engine(self, init_info):
         pass
 
-    async def start_update(self, is_checkpoint_format=True):
+    async def start_update(self):
         pass
 
     async def update(self, update_info):
