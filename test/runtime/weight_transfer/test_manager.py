@@ -15,7 +15,6 @@ from tokenspeed.runtime.engine.weight_transfer.manager import (
     WeightTransferManager,
     WeightTransferStateError,
 )
-from tokenspeed.runtime.utils.env import envs
 
 
 class FakeAsyncLLM:
@@ -258,12 +257,6 @@ class TestIpcParsing:
         with pytest.raises(ValueError, match="update_kind"):
             asyncio.run(mgr.update(upd))
 
-    def test_pickled_requires_insecure_optin(self):
-        _, mgr = self._started()
-        upd = _nccl_update(ipc_handles_pickled="x")
-        with pytest.raises(ValueError, match="INSECURE_SERIALIZATION"):
-            asyncio.run(mgr.update(upd))
-
     def test_packed_requires_tensor_sizes(self):
         _, mgr = self._started()
         upd = _nccl_update(ipc_handles=[{"u": ()}], packed=True)
@@ -276,13 +269,14 @@ class TestIpcParsing:
         with pytest.raises(NotImplementedError):
             asyncio.run(mgr.update(upd))
 
-    def test_pickled_with_optin_reaches_load(self):
+    def test_pickled_reaches_load(self):
+        # The pickled-handles form is accepted by the parser and (with no
+        # insecure-serialization gate) falls through to the deferred
+        # worker-side receive.
         _, mgr = self._started()
         upd = _nccl_update(ipc_handles_pickled="x")
-        with envs.TOKENSPEED_ALLOW_INSECURE_SERIALIZATION.override(True):
-            # gate passes; load is deferred
-            with pytest.raises(NotImplementedError):
-                asyncio.run(mgr.update(upd))
+        with pytest.raises(NotImplementedError):
+            asyncio.run(mgr.update(upd))
 
 
 class TestPauseResume:
