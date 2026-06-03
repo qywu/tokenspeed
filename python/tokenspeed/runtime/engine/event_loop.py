@@ -385,6 +385,7 @@ class EventLoop:
             send_func=self.send_to_tokenizer,
             get_load_fn=self._get_load,
             architectures=self.model_config.hf_config.architectures,
+            model_runner=target,
         )
 
         self.output_processor = OutputProcesser(
